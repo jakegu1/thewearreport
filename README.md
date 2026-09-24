@@ -49,6 +49,31 @@ tools/       Repository checks (public guard)
 .github/     CI and the scheduled sweep
 ```
 
+## Developer setup
+
+Requires Linux x86_64 (CI runs `ubuntu-24.04`), `make`, `curl` and `git`.
+
+```bash
+make setup   # installs uv 0.12.18 if missing, Python 3.12, dependencies and gitleaks
+make check   # everything CI runs: lint, format, types, tests, licences, privacy, secrets, public guard
+make test    # tests only
+make help    # list all targets
+```
+
+`make setup` installs uv with Astral's standalone installer into `~/.local/bin` when it
+is not already on `PATH`, and gitleaks into `.tools/bin/` (checksum-verified).
+
+Configuration comes from environment variables, listed in [.env.example](./.env.example).
+Copy it to `.env` (never committed) and fill in the values you need.
+
+| Check | Command | Enforces |
+|---|---|---|
+| Static privacy guard | `make privacy` | engine code never writes images (INV-1) |
+| Licence check | `make licenses` | runtime dependencies are permissively licensed (INV-2) |
+| Secret scan | `make secrets` | no credentials in git history (INV-3) |
+| Public guard | `make public-guard` | no private material in the repository (INV-9) |
+| Schema validation | `make schemas` | `data/schema/` is valid JSON Schema and samples validate |
+
 ## License
 
 Code: [Apache-2.0](./LICENSE). Data: see [DATA-LICENSE.md](./DATA-LICENSE.md).

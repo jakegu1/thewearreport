@@ -1,0 +1,58 @@
+name: ci
+
+# Lint, types, tests, licences, privacy guard, schemas and secret scan.
+# Mirrors `make check` (the public guard runs in public-guard.yml). See AGENTS.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: ruff check
+        run: uv run --locked ruff check engine scripts
+      - name: ruff format --check
+        run: uv run --locked ruff format --check engine scripts
+      - name: mypy --strict
+        run: uv run --locked mypy --strict engine scripts
+      - name: pytest
+        run: uv run --locked pytest
+      - name: Schema validation
+        run: uv run --locked pytest engine/tests/unit/test_schemas.py
+      - name: Licence check (runtime dependencies)
+        run: uv run --locked python scripts/license_check.py
+      - name: Privacy guard
+        run: uv run --locked python scripts/privacy_guard.py
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: sh scripts/install_gitleaks.sh
+      - name: gitleaks (full history)
+        run: .tools/bin/gitleaks git --no-banner --redact .
