@@ -72,8 +72,8 @@ for `PATH` until the timeout. Write one entry per image, keyed by image number:
 ```
 
 `not_person` and `in_vehicle` list box numbers on that image (default: none; a box cannot
-be in both). `missed` is required in frames mode and not allowed in crops mode. An invalid
-file is rejected with a message; fix it and save it again. The file holds only numbers
+be in both). `missed` is required in frames mode and not allowed in crops mode. A key may
+appear only once in each object. An invalid file is rejected with a message; fix it and save it again. The file holds only numbers
 and is left in place.
 
 ## Statistics file

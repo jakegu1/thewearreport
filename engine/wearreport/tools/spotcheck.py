@@ -670,6 +670,15 @@ def _reject_constant(name: str) -> object:
     raise JudgementError(f"{name} is not a number")
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise JudgementError(f"the key {key[:20]!r} appears twice in one object")
+        seen[key] = value
+    return seen
+
+
 def _box_list(value: object, key: str, image: str) -> frozenset[int]:
     if not isinstance(value, list) or not all(type(b) is int for b in value):
         raise JudgementError(f"image {image}: {key} must be a list of box numbers")
@@ -683,7 +692,13 @@ def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dic
     if len(raw) > MAX_JUDGEMENTS_BYTES:
         raise JudgementError(f"the file is larger than {MAX_JUDGEMENTS_BYTES} bytes")
     try:
-        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        data = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_constant,
+            object_pairs_hook=_no_duplicate_keys,
+        )
+    except JudgementError:
+        raise
     except json.JSONDecodeError as exc:
         raise JudgementError(f"not valid JSON: {exc.msg} (line {exc.lineno})") from None
     except UnicodeDecodeError:

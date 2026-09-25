@@ -167,6 +167,29 @@ def test_parse_judgements_rejects_hostile_input(raw: bytes) -> None:
         spotcheck.parse_judgements(raw, _items("frames"), "frames")
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The review's case: the last "1" would win and hide the first judgement.
+        b'{"1": {"not_person": [1, 2, 3], "missed": 0}, "1": {"missed": 0},'
+        b' "2": {"missed": 0}, "3": {"missed": 0}}',
+        b'{"1": {"missed": 0, "missed": 1}, "2": {"missed": 0}, "3": {"missed": 0}}',
+        b'{"1": {"missed": 0, "not_person": [1], "not_person": []},'
+        b' "2": {"missed": 0}, "3": {"missed": 0}}',
+    ],
+)
+def test_parse_judgements_rejects_duplicate_keys(raw: bytes) -> None:
+    with pytest.raises(spotcheck.JudgementError, match="appears twice"):
+        spotcheck.parse_judgements(raw, _items("frames"), "frames")
+
+
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_parse_judgements_names_the_bad_number(constant: bytes) -> None:
+    raw = b'{"1": {"missed": ' + constant + b'}, "2": {"missed": 0}, "3": {"missed": 0}}'
+    with pytest.raises(spotcheck.JudgementError, match="is not a number"):
+        spotcheck.parse_judgements(raw, _items("frames"), "frames")
+
+
 def test_parse_judgements_messages_do_not_echo_long_input() -> None:
     key = "x" * 10_000
     with pytest.raises(spotcheck.JudgementError) as exc:
