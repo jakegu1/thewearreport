@@ -132,7 +132,9 @@ def open_session(model_path: Path) -> Session:
     The bytes that are hashed are the bytes that are loaded, so the file cannot be swapped
     between the check and the load. onnxruntime's default logger, which writes warnings
     to stderr whatever the session options say, is set to errors only before the session
-    is created.
+    is created. onnxruntime may still print device-discovery warnings (such as
+    `GetPciBusId` on hosts without a PCI bus path) when its environment is first created,
+    which can happen before that severity applies; they carry no frame data.
     """
     data = _read_model(model_path)
     if hashlib.sha256(data).hexdigest() not in MODEL_SHA256.values():
