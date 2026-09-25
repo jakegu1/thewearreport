@@ -103,7 +103,7 @@ def test_part_files_are_removed_even_when_the_model_is_already_verified(tmp_path
     shutil.copyfile(_model(), dest / "yolox_s.onnx")
     for name in (".yolox_s.onnx.a1B2c3", ".yolox_s.onnx.zzzzzz"):
         (dest / name).write_bytes(b"half a model")
-    (dest / ".yolox_s.onnx.link").symlink_to(tmp_path / "missing")
+    (dest / ".yolox_s.onnx.l1nk00").symlink_to(tmp_path / "missing")
     proc = _fetch(_env(tmp_path, "printf unused"), dest)
     assert proc.returncode == 0, proc.stderr
     assert sorted(p.name for p in dest.iterdir()) == ["yolox_s.onnx"]
@@ -111,10 +111,19 @@ def test_part_files_are_removed_even_when_the_model_is_already_verified(tmp_path
 
 
 def test_part_file_cleanup_is_narrow(tmp_path: Path) -> None:
-    """Only this model's part files: not other models', not directories, not other names."""
+    """Only this model's part files, named exactly as mktemp names them: not other
+    models', not directories, not a backup or any other suffix length."""
     dest = tmp_path / "models"
     dest.mkdir()
-    keep = [".yolox_m.onnx.a1B2c3", "yolox_s.onnx.a1B2c3", ".yolox_s.onnx", "notes.txt"]
+    keep = [
+        ".yolox_m.onnx.a1B2c3",
+        "yolox_s.onnx.a1B2c3",
+        ".yolox_s.onnx",
+        ".yolox_s.onnx.bak",
+        ".yolox_s.onnx.a1B2c",
+        ".yolox_s.onnx.a1B2c3d",
+        "notes.txt",
+    ]
     for name in keep:
         (dest / name).write_bytes(b"keep")
     (dest / ".yolox_s.onnx.dir").mkdir()
@@ -125,6 +134,7 @@ def test_part_file_cleanup_is_narrow(tmp_path: Path) -> None:
         [*keep, ".yolox_s.onnx.dir", "yolox_s.onnx"]
     )
     assert _calls(tmp_path) == 1
+    assert (dest / ".yolox_s.onnx.bak").read_bytes() == b"keep"
 
 
 def test_a_failed_download_after_cleanup_leaves_nothing(tmp_path: Path) -> None:
