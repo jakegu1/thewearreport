@@ -25,7 +25,7 @@ brands). At 352×288 pixels they are not reliable, and the product does not need
 |---|---|---|
 | Camera registry | Download the current list of TfL JamCam cameras | Refreshed every sweep; only cameras TfL lists as available are used (787 in a September 2026 test) |
 | Fetch | Download the latest still from each camera | In memory only; one attempt per camera with a hard time limit; a failed camera is counted and skipped, never retried; only complete JPEG images are decoded |
-| Detect | YOLOX-s (Apache-2.0) on CPU via ONNX Runtime; classes *person* and *umbrella* | About 80 ms per frame in early tests |
+| Detect | YOLOX-m (Apache-2.0) on CPU via ONNX Runtime; classes *person* and *umbrella* | About 190 ms per frame on a 4-core machine; chosen over YOLOX-s, which found about a quarter fewer people on the same frames |
 | Classify | Coarse attributes per person crop | Method chosen in a later milestone; see Changelog |
 | Aggregate | Counts per sweep, joined to weather | Published on the `data` branch as one JSON record per sweep (concatenates into JSON Lines) |
 
@@ -49,7 +49,8 @@ CI enforces rule 1 in two ways. A static check blocks image-writing calls in `en
 An end-to-end test runs a full sweep against a local fake camera server and checks that
 it creates no files except the aggregate output and leaves no image bytes in its working,
 home or temporary directories. Deliberate leaks in the test suite prove that these checks
-catch them.
+catch them. The detector's runtime library (ONNX Runtime) has its built-in telemetry
+switched off, and a test checks that loading it writes nothing.
 
 ## Sampling and known biases
 
@@ -58,6 +59,8 @@ catch them.
   over-represented.
 - **Distant people are missed.** In a manual check of one frame every detection was a
   real person, but about half of the visible (mostly distant) people were not detected.
+  That check used the earlier YOLOX-s model; YOLOX-m, used since September 2026, detects
+  30–40% more people on the same frames, and its precision is measured by the spot-checks.
   This lowers the count but should not bias the share wearing a coat, because detection
   depends on distance, not on clothing. We will test this assumption with spot-checks.
 - **One city.** London's population is not everyone's. Clothing norms at a given
@@ -95,3 +98,5 @@ Results will be published here with dates and sample sizes.
 - 2026-09 — Method drafted; feasibility tested with two full sweeps (822 and 931 people).
 - 2026-09 — Fetcher and weather adapter built. Facts updated: one attempt per camera per
   sweep (no retries), feels-like temperature recorded, weather point described exactly.
+- 2026-09 — Detector switched from YOLOX-s to YOLOX-m after a same-frame comparison on 200
+  live frames (30–40% more people detected, about 190 ms per frame).
