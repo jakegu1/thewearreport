@@ -12,6 +12,9 @@ dependencies = [
     "opencv-python-headless>=5.0.0.93",
 ]
 
+[project.scripts]
+wearreport = "wearreport.cli:main"
+
 [dependency-groups]
 dev = [
     "jsonschema>=4.26.0",

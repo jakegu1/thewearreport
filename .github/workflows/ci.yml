@@ -32,8 +32,8 @@ jobs:
           enable-cache: false
       - name: Install dependencies
         run: uv sync --locked
-      - name: Fetch the YOLOX-s model (SHA-256 verified)
-        run: sh scripts/fetch_model.sh
+      - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
+        run: sh scripts/fetch_model.sh --with-m
       - name: ruff check
         run: uv run --locked ruff check engine scripts
       - name: ruff format --check
