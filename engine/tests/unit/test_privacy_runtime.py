@@ -499,9 +499,15 @@ def test_sweep_creates_no_files_and_no_image_bytes(
 # installed until the interpreter exits; each event is written straight to fd 2, so events
 # from atexit callbacks and shutdown are reported as well. It never opens a file.
 # It also reports an escape if onnxruntime is first imported without
-# ORT_DISABLE_TELEMETRY=1.
+# ORT_DISABLE_TELEMETRY=1, in both os.environ and the C process environment.
 CHILD = r"""
-import os, sys
+import ctypes, os, sys
+
+# onnxruntime reads the variable through C getenv(), which os.unsetenv() or native code can
+# change without os.environ noticing. Bound before the hook, which then imports nothing.
+getenv = ctypes.CDLL(None).getenv
+getenv.argtypes = [ctypes.c_char_p]
+getenv.restype = ctypes.c_char_p
 
 WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 FILE_EVENTS = {"os.mkdir", "os.rename", "os.replace", "os.link", "os.symlink",
@@ -523,9 +529,13 @@ def audit(event, args):
         name = args[0]
         if not ort_imported and (name == "onnxruntime" or name.startswith("onnxruntime.")):
             value = os.environ.get("ORT_DISABLE_TELEMETRY")
+            native = getenv(b"ORT_DISABLE_TELEMETRY")
             ort_imported.append(value)
             if value != "1":
                 report("escape", f"onnxruntime imported with ORT_DISABLE_TELEMETRY={value!r}")
+            elif native != b"1":
+                report("escape", "onnxruntime imported with ORT_DISABLE_TELEMETRY="
+                       f"{native!r} in the process environment")
     elif event == "open":
         path, mode, flags = args
         writing = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
@@ -643,6 +653,9 @@ def test_dry_sweep_process_catches_an_atexit_writer(tmp_path: Path) -> None:
 
 
 TELEMETRY_ESCAPE = "escape: onnxruntime imported with ORT_DISABLE_TELEMETRY=None"
+NATIVE_TELEMETRY_ESCAPE = (
+    "escape: onnxruntime imported with ORT_DISABLE_TELEMETRY=None in the process environment"
+)
 
 
 def test_child_hook_reports_onnxruntime_imported_without_the_telemetry_variable(
@@ -652,6 +665,23 @@ def test_child_hook_reports_onnxruntime_imported_without_the_telemetry_variable(
     the engine does must be reported, on any host (whether or not files are written)."""
     report = _run_dry_sweep_process(tmp_path, "import onnxruntime\n")
     assert TELEMETRY_ESCAPE in report.escapes, report.escapes
+    with pytest.raises(AssertionError):
+        report.assert_clean()
+
+
+def test_child_hook_reports_the_variable_missing_from_the_process_environment(
+    tmp_path: Path,
+) -> None:
+    """Control: os.environ says "1" but os.unsetenv() removed it from the C environment,
+    which is what onnxruntime reads. The hook must see that, on any host."""
+    prelude = (
+        "import os\n"
+        "os.environ['ORT_DISABLE_TELEMETRY'] = '1'\n"
+        "os.unsetenv('ORT_DISABLE_TELEMETRY')\n"
+        "import onnxruntime\n"
+    )
+    report = _run_dry_sweep_process(tmp_path, prelude)
+    assert NATIVE_TELEMETRY_ESCAPE in report.escapes, report.escapes
     with pytest.raises(AssertionError):
         report.assert_clean()
 
