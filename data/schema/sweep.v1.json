@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jakegu1/thewearreport/blob/main/data/schema/sweep.v1.json",
   "title": "Sweep record (v1)",
-  "description": "Aggregate counts from one sweep of the TfL JamCams. One record per file at sweeps/YYYY/MM/DD/<sweep_id>.json on the data branch. Counts only: no images, boxes or coordinates of people. Rules the schema cannot express, enforced by wearreport.aggregate.check_record: sweep_id is the minute of started_at; finished_at is not before started_at; frames_ok plus every frames_failed count equals cameras_listed; persons_total and umbrellas_total are the sums over per_camera; per_camera has at most frames_ok entries.",
+  "description": "Aggregate counts from one sweep of the TfL JamCams. One record per file at sweeps/YYYY/MM/DD/<sweep_id>.json on the data branch. Counts only: no images, boxes or coordinates of people. Rules the schema cannot express, enforced by wearreport.aggregate.check_record: sweep_id is the minute of started_at; finished_at is not before started_at; frames_ok plus every frames_failed count equals cameras_listed; persons_total and umbrellas_total are the sums over per_camera; per_camera has at most frames_ok entries. check_record is authoritative and stricter than this schema (for example on calendar dates, integer counts written as floats and trailing newlines): a consumer that must reject every invalid record uses it.",
   "type": "object",
   "required": [
     "schema",
