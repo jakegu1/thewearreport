@@ -83,7 +83,7 @@ Results will be published here with dates and sample sizes.
 ## Sources and attribution
 
 - Camera images: Transport for London JamCam feed. Powered by TfL Open Data.
-- Weather (UK): Met Office Weather DataHub. Contains Met Office data.
+- Weather (UK): Met Office Weather DataHub. Powered by Met Office data.
 - Weather (US visitors): National Weather Service (public domain).
 - Detector: YOLOX by Megvii, Apache-2.0.
 
