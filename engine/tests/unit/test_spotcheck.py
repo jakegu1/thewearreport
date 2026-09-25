@@ -683,6 +683,28 @@ def test_encoding_failure_while_writing_leaves_nothing(
     assert written and _leftovers(env) == []
 
 
+@pytest.mark.parametrize("step", ["mkdtemp", "write_image", "write_numbering"])
+def test_filesystem_errors_are_reported_without_a_traceback(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    step: str,
+) -> None:
+    def full(*args: Any, **kwargs: Any) -> Any:
+        raise OSError(28, "No space left on device")
+
+    if step == "mkdtemp":
+        monkeypatch.setattr(tempfile, "mkdtemp", full)
+    else:
+        monkeypatch.setattr(spotcheck.ReviewDirectory, step, full)
+    args = ["--n", "1", "--min-persons", "1"]
+    assert _run(args, tmp_path / "out", pipeline=_pipeline([2]), reviewer=Scripted()) == 1
+    assert "cannot write the review directory: No space left" in capsys.readouterr().err
+    assert _leftovers(env) == []
+    assert not (tmp_path / "out").exists()
+
+
 def test_write_image_refuses_names_outside_the_directory(env: Path) -> None:
     directory = spotcheck.ReviewDirectory()
     blank = np.zeros((4, 4, 3), dtype=np.uint8)

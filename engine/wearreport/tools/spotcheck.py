@@ -1112,11 +1112,15 @@ def _review(
     """Render to the review directory, collect the judgements, delete the directory."""
     directory = ReviewDirectory()
     try:
-        with guard.critical():
-            workdir = directory.create()
-        for item in items:
-            directory.write_image(item)
-        directory.write_numbering(items, mode)
+        try:
+            with guard.critical():
+                workdir = directory.create()
+            for item in items:
+                directory.write_image(item)
+            directory.write_numbering(items, mode)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            raise SpotcheckError(f"cannot write the review directory: {reason}") from None
         _print_numbering(workdir, items)
         deadline = time.monotonic() + timeout_s
         guard.alarm(timeout_s)
