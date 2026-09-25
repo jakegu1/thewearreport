@@ -40,10 +40,13 @@ brands). At 352×288 pixels they are not reliable, and the product does not need
 4. If a vision model is used for attribute labelling, it receives person crops only
    (never full frames), from a provider with data-processing terms, within a fixed
    monthly budget, and only the resulting labels are kept.
-5. Accuracy checks are done live. A local tool shows current frames with detection
-   boxes, a reviewer marks each box right or wrong, and **only the tallies are kept**.
-   The tool writes its annotated frames to a temporary folder it deletes on exit, and it
-   refuses to run in CI.
+5. Accuracy checks are done live, on a sample of current frames. A vision-language model
+   with open weights, running on the same machine as the detector, judges a small crop
+   around each detection in memory, and **only the tallies are kept**. Crops with known
+   answers, cut from openly licensed photos, are mixed in to check the judge itself. The
+   spot-check tool also has a manual mode in which a person marks each box right or wrong.
+   That mode writes its images to a temporary folder it deletes on exit, and it refuses to
+   run in CI.
 
 CI enforces rule 1 in two ways. A static check blocks image-writing calls in `engine/`.
 An end-to-end test runs a full sweep against a local fake camera server and checks that
@@ -100,3 +103,6 @@ Results will be published here with dates and sample sizes.
   sweep (no retries), feels-like temperature recorded, weather point described exactly.
 - 2026-09 — Detector switched from YOLOX-s to YOLOX-m after a same-frame comparison on 200
   live frames (30–40% more people detected, about 190 ms per frame).
+- 2026-09 — Accuracy checks redesigned: an open-weights vision model on the same machine
+  judges detection crops in memory, with known-answer crops mixed in as controls. The
+  manual mode remains.
