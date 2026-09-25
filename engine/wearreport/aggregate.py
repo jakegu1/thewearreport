@@ -368,7 +368,9 @@ def run_sweep(
     The weather is read first, for the minute the sweep starts, so that a
     WeatherConfigError (the dev-only flag set in production) stops the sweep before any
     camera is contacted. Raises SweepError when the registry cannot be used, and lets
-    WeatherConfigError and detect.DetectorError from a broken model propagate.
+    WeatherConfigError propagate. A detector that fails on a frame (DetectorError or
+    ValueError) does not stop the sweep: that frame is counted under "detect", so a model
+    that fails at inference yields a record with every usable frame failed as "detect".
     """
     started_at = (now or _utc_now)().astimezone(UTC).replace(microsecond=0)
     clock_start = monotonic()
