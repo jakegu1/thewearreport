@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "fixtures" / "detect"
 FETCH_MODEL = ROOT / "scripts" / "fetch_model.sh"
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
-PEOPLE = FIXTURES / "people_aldgate.jpg"
+PEOPLE = FIXTURES / "people_street.jpg"
 UMBRELLA = FIXTURES / "umbrella_rain.jpg"
 
 
