@@ -54,6 +54,8 @@ MAX_RECORD_BYTES: Final = 1024 * 1024
 WINDOW: Final = timedelta(hours=24)
 # A sweep succeeds when at least 90% of the cameras listed gave a usable frame.
 SUCCESS_NUMERATOR, SUCCESS_DENOMINATOR = 9, 10
+SUCCESS_RULE: Final = "frames_ok >= 90% of cameras_listed, and cameras_listed > 0"
+MEDIAN_RULE: Final = "median persons_total over successful sweeps started in London daytime"
 LONDON_TZ: Final = "Europe/London"
 DAY_START, DAY_END = time(7, 0), time(21, 0)  # London local time, end excluded
 STATUS_ATTRIBUTION: Final = (aggregate.TFL_ATTRIBUTION, weather.METOFFICE_ATTRIBUTION)
@@ -347,8 +349,10 @@ def compute_status(data_dir: Path, *, now: datetime) -> dict[str, Any]:
     - last sweep: the newest record that started at or before `now`;
     - the 24 h window is (now - 24 h, now], by started_at;
     - success rate: successful sweeps / sweeps in the window (null when there are none);
-    - median persons_total over the window's sweeps that started in London daytime,
-      07:00 to 21:00 local time (null when there are none);
+    - daytime sweeps: the window's sweeps that started in London daytime, 07:00 to 21:00
+      local time, successful or not;
+    - median persons_total over the daytime sweeps that succeeded (null when none did):
+      a failed sweep saw too few cameras for its count to stand for the street;
     - consecutive failures: failed sweeps since the newest success, however far back.
 
     Records that start after `now` are ignored. Reading stops once it is past the window
@@ -385,11 +389,10 @@ def compute_status(data_dir: Path, *, now: datetime) -> dict[str, Any]:
         elif not streak_open:
             break
     successes = sum(is_success(r) for r in in_window)
-    daytime = [
-        r["persons_total"]
-        for r in in_window
-        if is_london_daytime(aggregate.parse_utc(r["started_at"]))
-    ]
+    daytime = [r for r in in_window if is_london_daytime(aggregate.parse_utc(r["started_at"]))]
+    # A failed sweep's persons_total counts what little was seen, not the street: leave
+    # it out of the median rather than report an outage as an empty London (INV-6).
+    persons = [r["persons_total"] for r in daytime if is_success(r)]
     return {
         "schema": STATUS_SCHEMA,
         "generated_at": aggregate.format_utc(now),
@@ -398,9 +401,10 @@ def compute_status(data_dir: Path, *, now: datetime) -> dict[str, Any]:
         "sweeps_24h": len(in_window),
         "successful_sweeps_24h": successes,
         "success_rate_24h": successes / len(in_window) if in_window else None,
-        "success_rule": "frames_ok >= 90% of cameras_listed, and cameras_listed > 0",
+        "success_rule": SUCCESS_RULE,
         "daytime_sweeps_24h": len(daytime),
-        "median_persons_daytime_24h": statistics.median(daytime) if daytime else None,
+        "median_persons_daytime_24h": statistics.median(persons) if persons else None,
+        "median_rule": MEDIAN_RULE,
         "daytime": f"{DAY_START:%H:%M}-{DAY_END:%H:%M} {LONDON_TZ}",
         "consecutive_failures": consecutive,
         "records_invalid": invalid,

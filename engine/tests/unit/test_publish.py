@@ -324,6 +324,34 @@ def test_status_median_of_an_even_count(tmp_path: Path) -> None:
     assert publish.compute_status(tmp_path, now=T0)["median_persons_daytime_24h"] == 3.5
 
 
+def test_status_median_leaves_out_failed_daytime_sweeps(tmp_path: Path) -> None:
+    rows = [
+        (T0.replace(hour=12, minute=0), 10, 10, 6),
+        (T0.replace(hour=12, minute=10), 10, 10, 8),
+        (T0.replace(hour=12, minute=20), 10, 0, 0),  # nothing usable
+        (T0.replace(hour=12, minute=30), 10, 0, 0),
+        (T0.replace(hour=12, minute=40), 0, 0, 0),  # no cameras listed
+        (T0.replace(hour=12, minute=50), 10, 8, 1),  # partial: 80%
+    ]
+    for started, listed, ok, persons in rows:
+        _put(tmp_path, _record(started, ok=ok, listed=listed, persons=persons))
+    status = publish.compute_status(tmp_path, now=T0.replace(hour=13))
+    assert status["daytime_sweeps_24h"] == 6 and status["successful_sweeps_24h"] == 2
+    assert status["median_persons_daytime_24h"] == 7
+    assert status["median_rule"] == (
+        "median persons_total over successful sweeps started in London daytime"
+    )
+
+
+def test_status_median_is_null_when_no_daytime_sweep_succeeded(tmp_path: Path) -> None:
+    _put(tmp_path, _record(T0.replace(hour=3), persons=40))  # a success, but at night
+    for minute in (0, 10):
+        _put(tmp_path, _record(T0.replace(minute=minute), ok=5, persons=2))
+    status = publish.compute_status(tmp_path, now=T0)
+    assert status["daytime_sweeps_24h"] == 2
+    assert status["median_persons_daytime_24h"] is None
+
+
 def test_status_ignores_records_from_the_future(tmp_path: Path) -> None:
     _put(tmp_path, _record(T0 - timedelta(hours=1)))
     _put(tmp_path, _record(T0 + timedelta(days=1), ok=0))
