@@ -60,15 +60,16 @@ make test    # tests only
 make help    # list all targets
 ```
 
-`make setup` installs uv with Astral's standalone installer into `~/.local/bin` when it
-is not already on `PATH`, and gitleaks into `.tools/bin/` (checksum-verified).
+`make setup` installs the pinned uv release into `~/.local/bin` when it is not already
+on `PATH`, and gitleaks into `.tools/bin/`. Both downloads are verified against pinned
+SHA-256 checksums.
 
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
 
 | Check | Command | Enforces |
 |---|---|---|
-| Static privacy guard | `make privacy` | engine code never writes images (INV-1) |
+| Static privacy guard | `make privacy` | engine code never writes images or binary files (INV-1) |
 | Licence check | `make licenses` | runtime dependencies are permissively licensed (INV-2) |
 | Secret scan | `make secrets` | no credentials in git history (INV-3) |
 | Public guard | `make public-guard` | no private material in the repository (INV-9) |
