@@ -34,7 +34,8 @@ asserts that a sweep creates no files except its aggregate output.
 
 ## Data
 
-Aggregates will be published on the `data` branch as JSON Lines, with a JSON Schema.
+Aggregates will be published on the `data` branch as one JSON record per sweep, with a
+JSON Schema. The records concatenate into JSON Lines.
 The data license is in [DATA-LICENSE.md](./DATA-LICENSE.md).
 
 Powered by TfL Open Data. Powered by Met Office data. US weather from the National
