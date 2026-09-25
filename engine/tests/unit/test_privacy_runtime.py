@@ -57,7 +57,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from wearreport import fetch
+from wearreport import benchmark, detect, fetch
 from wearreport._cv import cv2
 from wearreport.testing.fake_cameras import FakeCameraServer, synthetic_jpeg
 
@@ -697,3 +697,106 @@ def test_media_kind_recognises_formats(data: bytes, kind: str) -> None:
 )
 def test_media_kind_ignores_text_and_zeros(data: bytes) -> None:
     assert media_kind(data) is None
+
+
+# The detector benchmark (T-004) ----------------------------------------------------------
+#
+# The benchmark runs the model on fetched frames, so it gets the same treatment as a sweep:
+# in process under `guarded`, and as a child process from start to exit. It uses the real
+# models when they are downloaded; without them, and with WEARREPORT_REQUIRE_MODEL unset, a
+# blank stand-in model keeps the fetch, pre-processing and reporting path covered.
+
+REQUIRE_MODEL_ENV = "WEARREPORT_REQUIRE_MODEL"
+PEOPLE_FIXTURE = REPO_ROOT / "fixtures" / "detect" / "people_aldgate.jpg"
+
+
+class _BlankModel:
+    """A stand-in for YOLOX that finds nothing."""
+
+    def run(self, tensor: np.ndarray) -> list[np.ndarray]:
+        return [np.zeros(detect.OUTPUT_SHAPE, dtype=np.float32)]
+
+
+def _benchmark_models(tmp_path: Path) -> Path | None:
+    """A directory holding yolox_s and yolox_m (a link to yolox_s when -m is not
+    downloaded), or None when the model is missing and not required."""
+    s, m = detect.model_path("yolox_s.onnx"), detect.model_path("yolox_m.onnx")
+    if not s.is_file():
+        if os.environ.get(REQUIRE_MODEL_ENV):
+            pytest.fail(f"yolox_s.onnx is missing and {REQUIRE_MODEL_ENV} is set")
+        return None
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "yolox_s.onnx").symlink_to(s)
+    (models / "yolox_m.onnx").symlink_to(m if m.is_file() else s)
+    return models
+
+
+def _benchmark_run(models: Path) -> None:
+    """The synthetic benchmark, then the model comparison on fake-server frames that
+    exercise every fetch outcome, some of them showing people."""
+    assert benchmark.main(["--synthetic", "3", "--model-dir", str(models)]) == 0
+    with FakeCameraServer() as server:
+        cams = server.cameras(6)
+        server.serve_body(cams[0].id, PEOPLE_FIXTURE.read_bytes())
+        server.serve_body(cams[1].id, PEOPLE_FIXTURE.read_bytes())
+        server.serve_404(cams[2].id)
+        server.serve_corrupt(cams[3].id)
+        assert benchmark._comparison(models, cams) == 0
+    assert benchmark.main(["--dry-run", "--cameras", "4", "--model-dir", str(models)]) == 0
+
+
+def test_benchmark_creates_no_files_and_no_image_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    models = _benchmark_models(tmp_path)
+    canary = _canary(_leak_os_open) if os.environ.get(CANARY_ENV) == "1" else None
+    with (
+        guarded(tmp_path, monkeypatch, capsys, caplog) as report,
+        canary or contextlib.nullcontext(),
+    ):
+        if models is None:
+            monkeypatch.setattr(detect, "open_session", lambda path: _BlankModel())
+            models = tmp_path / "absent"
+        _benchmark_run(models)  # sessions open inside the guard: loading is covered too
+    assert "| yolox_s |" in report.output and "| yolox_m |" in report.output
+    report.assert_clean()
+
+
+BENCHMARK_PRELUDE = r"""
+import numpy as np
+from wearreport import benchmark, detect
+from wearreport.testing.fake_cameras import FakeCameraServer
+
+if MODELS is None:
+    class _BlankModel:
+        def run(self, tensor):
+            return [np.zeros(detect.OUTPUT_SHAPE, dtype=np.float32)]
+    detect.open_session = lambda path: _BlankModel()
+    MODELS = "absent"
+
+assert benchmark.main(["--synthetic", "3", "--model-dir", MODELS]) == 0
+with FakeCameraServer() as server:
+    cams = server.cameras(4)
+    with open(PEOPLE, "rb") as fh:
+        server.serve_body(cams[0].id, fh.read())
+    server.serve_404(cams[1].id)
+    assert benchmark._comparison(detect.Path(MODELS), cams) == 0
+"""
+
+
+def test_benchmark_process_leaves_no_files(tmp_path: Path) -> None:
+    """The benchmark in a child process from interpreter start to exit, onnxruntime's
+    import, session creation and shutdown included."""
+    models = _benchmark_models(tmp_path)
+    prelude = (
+        f"MODELS = {None if models is None else str(models)!r}\n"
+        f"PEOPLE = {str(PEOPLE_FIXTURE)!r}\n" + BENCHMARK_PRELUDE
+    )
+    report = _run_dry_sweep_process(tmp_path, prelude)
+    assert "median ms per frame: " in report.output
+    assert "| yolox_s |" in report.output and "| yolox_m |" in report.output
+    report.assert_clean()

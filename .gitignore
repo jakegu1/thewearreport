@@ -10,7 +10,8 @@ htmlcov/
 dist/
 build/
 
-# Models are downloaded at runtime, never committed
+# Models are downloaded by scripts/fetch_model.sh, never committed
+.models/
 *.onnx
 
 # Never commit images: the engine must not write any (INV-1)

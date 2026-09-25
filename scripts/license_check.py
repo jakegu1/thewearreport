@@ -79,6 +79,7 @@ ALLOWED_ALIASES = frozenset(
         "new bsd",
         "new bsd license",
         "3-clause bsd",
+        "3-clause bsd license",  # protobuf
         "bsd 3-clause",
         "apache 2.0",
         "apache-2",

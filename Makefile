@@ -8,15 +8,19 @@ GITLEAKS := .tools/bin/gitleaks
 PY_SRC := engine scripts
 
 .PHONY: help setup check test lint format format-check typecheck schemas licenses \
-	privacy secrets public-guard sweep-dry
+	privacy secrets public-guard sweep-dry model
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
-setup: ## Install uv (if missing), Python 3.12, dependencies and gitleaks
+setup: ## Install uv (if missing), Python 3.12, dependencies, gitleaks and the model
 	@command -v $(UV) >/dev/null 2>&1 || sh scripts/install_uv.sh
 	$(UV) sync --locked
 	sh scripts/install_gitleaks.sh
+	$(MAKE) model
+
+model: ## Download and verify the YOLOX-s model into .models/ (add YOLOX-m: sh scripts/fetch_model.sh --with-m)
+	sh scripts/fetch_model.sh
 
 check: lint format-check typecheck test schemas licenses privacy secrets public-guard ## Everything CI runs
 
