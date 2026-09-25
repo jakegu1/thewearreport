@@ -377,6 +377,34 @@ def test_run_sweep_skips_duplicate_and_unpublishable_camera_ids(
     assert any(getattr(r, "skipped", None) == 2 for r in caplog.records)
 
 
+def test_run_sweep_fetches_a_duplicated_camera_once_from_its_first_listing() -> None:
+    first = registry.Camera("A", "A", 51.5, -0.1, "https://example.invalid/first.jpg")
+    again = registry.Camera("A", "A again", 51.6, -0.2, "https://example.invalid/again.jpg")
+    fetched: list[registry.Camera] = []
+
+    def fetch_frames(cams: Sequence[registry.Camera]) -> list[fetch.FrameResult]:
+        fetched.extend(cams)
+        return _results(cams, {})
+
+    clock = iter([100.0, 101.0])
+    record = aggregate.run_sweep(
+        _FakeDetector([2, 1]),
+        DIGEST,
+        model_name="yolox_m",
+        list_cameras=lambda: [first, _camera("B"), again],
+        fetch_frames=fetch_frames,
+        conditions=lambda at: None,
+        now=lambda: T0,
+        monotonic=lambda: next(clock),
+    )
+    assert fetched == [first, _camera("B")]
+    assert record["cameras_listed"] == 2 and record["frames_ok"] == 2
+    assert record["per_camera"] == {
+        "A": {"persons": 2, "umbrellas": 0},
+        "B": {"persons": 1, "umbrellas": 0},
+    }
+
+
 def test_run_sweep_refuses_an_absurd_registry() -> None:
     cams = [_camera(f"C{i}") for i in range(aggregate.MAX_CAMERAS + 1)]
     with pytest.raises(aggregate.SweepError):
