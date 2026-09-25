@@ -2,11 +2,14 @@
 """Fail if a Python runtime dependency is not permissively licensed (AGENTS.md INV-2).
 
 Walks the runtime dependency closure of the installed `wearreport` distribution (dev
-dependencies are not included) and reads each package's licence from its metadata, in
+dependencies are not included), including every extra the project declares and every
+extra requested along the way, and reads each package's licence from its metadata, in
 this order: License-Expression (SPDX), then licence classifiers, then the legacy
 License field. A package passes only if its licence is on the allowlist:
 
-  MIT, BSD (any), Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, CC0
+  MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF, MPL-2.0, CC0
+
+Other BSD variants (e.g. BSD-Protection, BSD-3-Clause-No-Nuclear-*) are rejected.
 
 Anything else, including missing or unrecognised licence metadata, fails and needs a
 human decision. `ultralytics` fails by name and must not appear anywhere in uv.lock.
@@ -44,6 +47,8 @@ ALLOWED_SPDX = frozenset(
         "Python-2.0",
         "MPL-2.0",
         "0BSD",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
         "CC0-1.0",
     }
 )
@@ -93,7 +98,7 @@ _SPDX_TOKEN = re.compile(r"\(|\)|[A-Za-z0-9.+-]+")
 
 
 def spdx_allowed(identifier: str) -> bool:
-    return identifier in ALLOWED_SPDX or identifier.startswith("BSD-")
+    return identifier in ALLOWED_SPDX
 
 
 class _SpdxParser:
@@ -187,26 +192,43 @@ def license_problem(meta: metadata.PackageMetadata | Message) -> str | None:
 
 
 def runtime_distributions(project: str) -> Iterator[metadata.Distribution]:
-    """Yield installed distributions in the runtime closure of `project` (excluded)."""
-    seen = {canonicalize_name(project)}
+    """Yield installed distributions in the runtime closure of `project` (excluded).
+
+    The project is expanded with all of its declared extras. A package reached again
+    with extras not yet expanded is re-expanded for those extras, so the result does
+    not depend on the order of requirements. Requirements whose markers do not match
+    this environment (e.g. another platform) are not followed.
+    """
+    root = metadata.distribution(project)
+    # Extras already expanded per package; "" stands for the base requirements.
+    expanded: dict[str, set[str]] = {
+        canonicalize_name(project): {"", *(root.metadata.get_all("Provides-Extra") or [])}
+    }
     queue: list[tuple[metadata.Distribution, frozenset[str]]] = [
-        (metadata.distribution(project), frozenset())
+        (root, frozenset(expanded[canonicalize_name(project)]))
     ]
     while queue:
         dist, extras = queue.pop()
         for line in dist.requires or []:
             req = Requirement(line)
             if req.marker is not None and not any(
-                req.marker.evaluate({"extra": extra}) for extra in extras or {""}
+                req.marker.evaluate({"extra": extra}) for extra in extras
             ):
                 continue
+            if req.marker is None and "" not in extras:
+                continue  # base requirement, already followed
             key = canonicalize_name(req.name)
-            if key in seen:
+            wanted = {"", *req.extras}
+            done = expanded.get(key)
+            if done is not None and wanted <= done:
                 continue
-            seen.add(key)
             child = metadata.distribution(req.name)
-            yield child
-            queue.append((child, frozenset(req.extras)))
+            if done is None:
+                done = expanded[key] = set()
+                yield child
+            new = frozenset(wanted - done)
+            done |= new
+            queue.append((child, new))
 
 
 def locked_packages(lock: Path) -> set[str]:
