@@ -4,8 +4,9 @@ Every response is a synthetic JPEG of random noise, encoded in memory when the r
 arrives. No image is read from or written to disk. URLs look like
 `http://127.0.0.1:<port>/cam/<camera_id>`, with no file extension.
 
-Per camera, the server can be told to answer 404, to wait before answering, or to send
-bytes that are not a decodable image.
+Per camera, the server can be told to answer 404, to wait before answering, to send
+bytes that are not a decodable image, or to send a given body (for example one of the
+hostile images below).
 """
 
 from __future__ import annotations
@@ -16,9 +17,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import TracebackType
 from typing import Literal
 
-import cv2
 import numpy as np
 
+from wearreport._cv import encode_jpeg
 from wearreport.registry import Camera
 
 # JamCam stills are 352x288.
@@ -26,27 +27,45 @@ FRAME_WIDTH = 352
 FRAME_HEIGHT = 288
 PATH_PREFIX = "/cam/"
 
-Mode = Literal["ok", "not_found", "delay", "corrupt"]
+Mode = Literal["ok", "not_found", "delay", "corrupt", "body"]
 
 
 @dataclass(frozen=True, slots=True)
 class _Behaviour:
     mode: Mode
     delay_s: float = 0.0
+    body: bytes = b""
 
 
 def synthetic_jpeg(rng: np.random.Generator) -> bytes:
     """Encode a frame of random noise as JPEG, in memory."""
     pixels = rng.integers(0, 256, size=(FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
-    ok, encoded = cv2.imencode(".jpg", pixels)
-    if not ok:
-        raise RuntimeError("cv2.imencode failed")
-    return encoded.tobytes()
+    return encode_jpeg(pixels)
 
 
 def corrupt_bytes(rng: np.random.Generator) -> bytes:
     """A JPEG start-of-image marker followed by noise: looks like a JPEG, never decodes."""
     return b"\xff\xd8\xff" + rng.bytes(2048)
+
+
+def radiance_hdr(width: int = 8, height: int = 8) -> bytes:
+    """A flat grey Radiance HDR image: a format OpenCV decodes through a temporary file."""
+    header = f"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n".encode()
+    return header + bytes([128, 128, 128, 129]) * (width * height)
+
+
+def jpeg_declaring(width: int, height: int) -> bytes:
+    """A small valid JPEG whose frame header is rewritten to declare `width` x `height`.
+
+    The body stays a few hundred bytes; a decoder without a pixel cap would allocate the
+    declared size and fill it in.
+    """
+    body = bytearray(encode_jpeg(np.zeros((16, 16, 3), dtype=np.uint8)))
+    sof = body.find(b"\xff\xc0")  # baseline start-of-frame
+    if sof < 0:
+        raise RuntimeError("no baseline start-of-frame marker")
+    body[sof + 5 : sof + 9] = height.to_bytes(2, "big") + width.to_bytes(2, "big")
+    return bytes(body)
 
 
 class FakeCameraServer:
@@ -98,6 +117,10 @@ class FakeCameraServer:
 
     def serve_corrupt(self, camera_id: str) -> None:
         self._set(camera_id, _Behaviour("corrupt"))
+
+    def serve_body(self, camera_id: str, body: bytes) -> None:
+        """Answer 200 with exactly `body`."""
+        self._set(camera_id, _Behaviour("body", body=body))
 
     def requests(self, camera_id: str) -> int:
         """How many requests the server has received for `camera_id`."""
@@ -155,6 +178,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, b"")
         elif behaviour.mode == "corrupt":
             self._send(200, corrupt_bytes(rng))
+        elif behaviour.mode == "body":
+            self._send(200, behaviour.body)
         else:
             if behaviour.mode == "delay" and owner._stopping.wait(behaviour.delay_s):
                 return  # server is stopping

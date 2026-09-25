@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import http.client
 import io
 import json
 import logging
+import socket
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -317,8 +323,8 @@ def test_client_errors_are_not_retried(status: int, caplog: pytest.LogCaptureFix
     assert info.value.__cause__ is None and info.value.__suppress_context__
 
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
-def test_rate_limit_and_server_errors_are_retried(status: int) -> None:
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_timeouts_rate_limit_and_server_errors_are_retried(status: int) -> None:
     calls: list[int] = []
     sleeps: list[float] = []
 
@@ -330,3 +336,181 @@ def test_rate_limit_and_server_errors_are_retried(status: int) -> None:
         registry.list_cameras(None, fetch=fetch, sleep=sleeps.append)
     assert len(calls) == 3
     assert sleeps == [1, 2]
+
+
+# bounded_get: one request, no redirects, one wall-clock deadline ---------------------
+
+
+class _Handler(BaseHTTPRequestHandler):
+    hits: list[str]
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+    def reply(self, status: int, body: bytes, **headers: str) -> None:
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextlib.contextmanager
+def _serve(do_get: Any) -> Iterator[tuple[str, list[str]]]:
+    hits: list[str] = []
+
+    class Handler(_Handler):
+        def do_GET(self) -> None:
+            hits.append(self.path)
+            do_get(self)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.daemon_threads = True
+    httpd.block_on_close = False
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/x", hits
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _get(url: str, timeout_s: float = 5, max_bytes: int = 1000) -> bytes:
+    return registry.bounded_get(url, timeout_s=timeout_s, max_bytes=max_bytes, schemes=("http",))
+
+
+def test_bounded_get_returns_the_body_and_sends_the_user_agent() -> None:
+    agents: list[str] = []
+
+    def ok(h: _Handler) -> None:
+        agents.append(h.headers["User-Agent"])
+        h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(ok) as (url, hits):
+        assert _get(url) == b"[]"
+    assert hits == ["/x"]
+    assert agents[0].startswith("wearreport")
+
+
+@pytest.mark.parametrize(
+    "url", ["http://example.test/x", "file:///etc/passwd", "ftp://example.test/x", "data:,x"]
+)
+def test_bounded_get_is_https_only_by_default(url: str) -> None:
+    with pytest.raises(ValueError, match="not allowed") as info:
+        registry.bounded_get(url, timeout_s=1, max_bytes=10)
+    assert "example.test" not in str(info.value)
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_bounded_get_never_follows_a_redirect(status: int) -> None:
+    def redirect(h: _Handler) -> None:
+        if h.path == "/x":
+            h.reply(status, b"", Location="/elsewhere", **{"Content-Length": "0"})
+        else:
+            h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(redirect) as (url, hits), pytest.raises(urllib.error.HTTPError) as info:
+        _get(url)
+    assert info.value.code == status
+    info.value.close()
+    assert hits == ["/x"]
+
+
+def test_bounded_get_deadline_covers_trickled_headers() -> None:
+    def trickle(h: _Handler) -> None:
+        with contextlib.suppress(OSError):
+            h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            for _ in range(60):
+                h.wfile.write(b"X")
+                h.wfile.flush()
+                time.sleep(0.9)
+
+    with _serve(trickle) as (url, hits):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _get(url, timeout_s=1)
+        assert time.monotonic() - started < 2
+    assert hits == ["/x"]
+
+
+def test_bounded_get_deadline_covers_a_trickled_body_without_length() -> None:
+    def trickle(h: _Handler) -> None:
+        h.send_response(200)
+        h.end_headers()
+        with contextlib.suppress(OSError):
+            for _ in range(60):
+                h.wfile.write(b" ")
+                h.wfile.flush()
+                time.sleep(0.1)
+
+    with _serve(trickle) as (url, _):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _get(url, timeout_s=0.5)
+        assert time.monotonic() - started < 1.5
+
+
+def test_bounded_get_deadline_covers_a_silent_server() -> None:
+    """Accepts the connection, then never answers: a TLS handshake that stalls looks alike."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _get(f"http://127.0.0.1:{port}/x", timeout_s=0.5)
+        assert time.monotonic() - started < 1.5
+
+
+def test_bounded_get_refuses_a_declared_oversized_body() -> None:
+    with (
+        _serve(lambda h: h.reply(200, b"x" * 2000, **{"Content-Length": "2000"})) as (url, _),
+        pytest.raises(registry.BodyTooLarge),
+    ):
+        _get(url, max_bytes=1000)
+
+
+def test_bounded_get_stops_reading_past_the_cap() -> None:
+    def endless(h: _Handler) -> None:
+        h.send_response(200)
+        h.end_headers()
+        with contextlib.suppress(OSError):
+            for _ in range(1000):
+                h.wfile.write(b"x" * 1000)
+
+    with _serve(endless) as (url, _), pytest.raises(registry.BodyTooLarge):
+        _get(url, max_bytes=1000)
+
+
+def test_bounded_get_body_at_the_cap_is_returned() -> None:
+    with _serve(lambda h: h.reply(200, b"x" * 1000, **{"Content-Length": "1000"})) as (url, _):
+        assert len(_get(url, max_bytes=1000)) == 1000
+
+
+def test_bounded_get_refuses_a_short_body() -> None:
+    def short(h: _Handler) -> None:
+        h.reply(200, b"x" * 10, **{"Content-Length": "500"})
+        h.connection.shutdown(socket.SHUT_RDWR)
+
+    with _serve(short) as (url, _), pytest.raises(http.client.IncompleteRead):
+        _get(url)
+
+
+def test_bounded_get_connection_refused_is_an_os_error() -> None:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with pytest.raises(OSError) as info:
+        _get(f"http://127.0.0.1:{port}/x")
+    assert not isinstance(info.value, TimeoutError)
+
+
+def test_bounded_get_leaves_no_timer_thread_behind() -> None:
+    before = threading.active_count()
+    with _serve(lambda h: h.reply(200, b"[]", **{"Content-Length": "2"})) as (url, _):
+        for _ in range(5):
+            _get(url)
+    deadline = time.monotonic() + 2
+    while threading.active_count() > before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= before

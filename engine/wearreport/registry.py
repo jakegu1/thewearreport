@@ -4,21 +4,31 @@ Availability changes over time, so the registry is fetched fresh on every sweep 
 never persisted. Only metadata is read here; frames are fetched elsewhere.
 
 Run `python -m wearreport.registry` to print the current count.
+
+`bounded_get` is the engine's one-attempt HTTP GET: no redirects, a size cap and one
+wall-clock deadline per request. It lives here, in a standard-library-only module, so
+that every engine module can use it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import logging
 import math
+import socket
+import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import TracebackType
+from typing import Any
 
 from wearreport.settings import load_settings
 
@@ -29,6 +39,8 @@ MAX_ATTEMPTS = 3
 BACKOFF_S = (1, 2)  # sleep before attempts 2 and 3
 # The real response is about 1 MB; a larger body than this is refused, never parsed.
 MAX_BODY_BYTES = 16 * 1024 * 1024
+RETRYABLE_CLIENT_ERRORS = frozenset({408, 429})
+READ_CHUNK = 64 * 1024
 
 logger = logging.getLogger("wearreport.registry")
 
@@ -68,6 +80,206 @@ def http_fetch(url: str, timeout: float) -> bytes:
     return body
 
 
+class BodyTooLarge(Exception):
+    """A response body is, or declares itself, larger than the caller's cap."""
+
+
+def bounded_get(
+    url: str, *, timeout_s: float, max_bytes: int, schemes: tuple[str, ...] = ("https",)
+) -> bytes:
+    """GET `url` in exactly one request and return its body.
+
+    - Only URLs whose scheme is in `schemes` are opened (ValueError otherwise).
+    - Redirects are never followed: a 3xx raises urllib.error.HTTPError, as any other
+      status outside 2xx does.
+    - One wall-clock deadline of `timeout_s` covers connecting, the TLS handshake (and a
+      proxy tunnel), the status line, the headers and the body. When it passes, the socket
+      is shut down and TimeoutError is raised, however slowly the server trickles bytes.
+      Known limit: DNS resolution happens before the deadline can interrupt it.
+    - A body larger than `max_bytes`, declared or counted, raises BodyTooLarge; a body
+      shorter than its Content-Length raises http.client.IncompleteRead.
+
+    Other failures raise OSError (including urllib.error.URLError) or
+    http.client.HTTPException. Exception messages never contain the URL or the body.
+    """
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme not in schemes:
+        raise ValueError(f"URL scheme {scheme!r} is not allowed")
+    with _Deadline(timeout_s) as deadline:
+        try:
+            body = _get(url, timeout_s, max_bytes, deadline)
+        except (OSError, http.client.HTTPException, ValueError):
+            if deadline.expired:
+                raise TimeoutError("request deadline passed") from None
+            raise
+        if deadline.expired:  # the socket was shut down under a read that then saw EOF
+            raise TimeoutError("request deadline passed")
+    return body
+
+
+def _get(url: str, timeout_s: float, max_bytes: int, deadline: _Deadline) -> bytes:
+    opener = urllib.request.OpenerDirector()
+    # No HTTPRedirectHandler: a 3xx reaches HTTPDefaultErrorHandler and raises HTTPError.
+    for handler in (
+        urllib.request.ProxyHandler(),
+        _HTTPHandler(deadline),
+        _HTTPSHandler(deadline),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
+    with opener.open(req, timeout=timeout_s) as resp:
+        declared = resp.headers.get("Content-Length", "")
+        length = int(declared) if declared.isdigit() and len(declared) < 19 else None
+        if length is not None and length > max_bytes:
+            raise BodyTooLarge(f"response declares more than {max_bytes} bytes")
+        body = bytearray()
+        while chunk := resp.read1(READ_CHUNK):
+            body += chunk
+            if len(body) > max_bytes:
+                raise BodyTooLarge(f"response exceeds {max_bytes} bytes")
+        # read1() does not raise IncompleteRead; a cut-off body must not be used.
+        if length is not None and len(body) != length:
+            raise http.client.IncompleteRead(b"", length - len(body))
+        return bytes(body)
+
+
+class _Deadline:
+    """One request's wall-clock deadline.
+
+    Each socket the request opens is registered here through a duplicate descriptor. When
+    the deadline passes, a timer thread shuts every registered socket down, which ends any
+    blocked connect, TLS handshake or read. The duplicate refers to the same connection
+    even after TLS wraps the original socket, and it is closed only on exit, so the timer
+    can never touch a descriptor that has been reused elsewhere.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self._end = time.monotonic() + seconds
+        self._lock = threading.Lock()
+        self._handles: list[socket.socket] = []
+        self._expired = False
+        self._done = False
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+
+    def __enter__(self) -> _Deadline:
+        self._timer.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._timer.cancel()
+        with self._lock:
+            self._done = True
+            for handle in self._handles:
+                handle.close()
+            self._handles.clear()
+
+    @property
+    def expired(self) -> bool:
+        with self._lock:
+            return self._expired
+
+    def remaining(self) -> float:
+        return self._end - time.monotonic()
+
+    def open_socket(self, address: tuple[str, int], timeout: object) -> socket.socket:
+        """socket.create_connection, with each connect attempt bounded by the deadline."""
+        per_op = float(timeout) if isinstance(timeout, int | float) else None
+        host, port = address
+        # DNS resolution is outside the deadline: getaddrinfo cannot be interrupted.
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        error: OSError = OSError("no address to connect to")
+        for family, kind, proto, _, sockaddr in infos:
+            remaining = self.remaining()
+            if remaining <= 0:
+                raise TimeoutError("request deadline passed while connecting")
+            sock = socket.socket(family, kind, proto)
+            try:
+                sock.settimeout(remaining if per_op is None else min(per_op, remaining))
+                sock.connect(sockaddr)
+                sock.settimeout(per_op)
+                self._watch(sock)
+            except OSError as exc:
+                sock.close()
+                error = exc
+                continue
+            return sock
+        raise error
+
+    def _watch(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self._done:
+                raise TimeoutError("request already finished")
+            handle = sock.dup()
+            self._handles.append(handle)
+            if self._expired:
+                _shut_down(handle)
+
+    def _expire(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._expired = True
+            for handle in self._handles:
+                _shut_down(handle)
+
+
+def _shut_down(handle: socket.socket) -> None:
+    with contextlib.suppress(OSError):  # already closed by the peer
+        handle.shutdown(socket.SHUT_RDWR)
+
+
+class _DeadlineConnection(http.client.HTTPConnection):
+    """An HTTP(S) connection whose sockets are opened and watched by a _Deadline."""
+
+    def __init__(self, host: str, *, deadline: _Deadline, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        # HTTPConnection.connect() opens its socket through this attribute.
+        self._create_connection = self._open_socket
+        self._deadline = deadline
+
+    def _open_socket(
+        self, address: tuple[str, int], timeout: object, source_address: object = None
+    ) -> socket.socket:
+        return self._deadline.open_socket(address, timeout)
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline: _Deadline) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        def connection(host: str, **kwargs: Any) -> http.client.HTTPConnection:
+            return _DeadlineConnection(host, deadline=self._deadline, **kwargs)
+
+        return self.do_open(connection, req=req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline: _Deadline) -> None:
+        self._tls = ssl.create_default_context()
+        super().__init__(context=self._tls)
+        self._deadline = deadline
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        def connection(host: str, **kwargs: Any) -> http.client.HTTPConnection:
+            return _DeadlineHTTPSConnection(host, deadline=self._deadline, **kwargs)
+
+        return self.do_open(connection, req=req, context=self._tls)
+
+
 def list_cameras(
     app_key: str | None, *, fetch: Fetch = http_fetch, sleep: Sleep = time.sleep
 ) -> list[Camera]:
@@ -101,8 +313,8 @@ def _fetch_places(url: str, fetch: Fetch, sleep: Sleep) -> list[object]:
         try:
             return _decode_places(fetch(url, TIMEOUT_S))
         except urllib.error.HTTPError as exc:
-            # A client error will not change on retry; 429 (rate limited) may.
-            if 400 <= exc.code < 500 and exc.code != 429:
+            # A client error will not change on retry; 408 (timeout) and 429 (rate limited) may.
+            if 400 <= exc.code < 500 and exc.code not in RETRYABLE_CLIENT_ERRORS:
                 raise RegistryError(
                     f"JamCam registry refused the request (HTTP {exc.code})"
                 ) from None

@@ -2,8 +2,13 @@
 
 Frames are downloaded into memory, decoded with `cv2.imdecode` and returned as arrays.
 Nothing is written to disk and no image bytes are logged (AGENTS.md INV-1). Each camera
-gets exactly one attempt: a failed frame is recorded with its error category and never
-retried, so a sweep's cost and duration stay bounded.
+gets exactly one attempt, one request with no redirects, under one wall-clock deadline: a
+failed frame is recorded with its error category and never retried, so a sweep's cost and
+duration stay bounded.
+
+Only complete JPEGs reach the decoder: a body must start with the JPEG start-of-image
+marker and end with the end-of-image marker. Other formats are refused before decoding,
+because some of OpenCV's decoders go through a temporary file (see `wearreport._cv`).
 
 Run `python -m wearreport.fetch --live` for one sweep of the real JamCams, or
 `python -m wearreport.fetch --dry-run` for one sweep of a local fake server (no network).
@@ -17,26 +22,28 @@ import logging
 import sys
 import time
 import urllib.error
-import urllib.request
 from collections import Counter
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-import cv2
 import numpy as np
 import numpy.typing as npt
 
 from wearreport import registry
+from wearreport._cv import cv2
 from wearreport.settings import load_settings
 
 CONCURRENCY = 24
 TIMEOUT_S = 20
 # JamCam stills are about 30 kB; anything near this is not a camera frame.
 MAX_FRAME_BYTES = 8 * 1024 * 1024
-READ_CHUNK = 64 * 1024
 DRY_RUN_CAMERAS = 50
+JPEG_SOI = b"\xff\xd8\xff"  # start-of-image marker and the first byte of the next marker
+JPEG_EOI = b"\xff\xd9"
+# Encoders may pad after the end-of-image marker; it must appear this close to the end.
+EOI_WINDOW = 16
 
 ErrorKind = Literal["timeout", "http", "decode", "network"]
 ERROR_KINDS: tuple[ErrorKind, ...] = get_args(ErrorKind)
@@ -66,16 +73,16 @@ def fetch_sweep(
 ) -> list[FrameResult]:
     """Fetch and decode one frame per camera; results follow the order of `cameras`.
 
-    `timeout_s` bounds each socket operation and the download of each body as a whole.
+    `timeout_s` is one wall-clock deadline per frame, covering the connection, the
+    headers and the body (see `registry.bounded_get`; DNS resolution is outside it).
     """
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
     if not timeout_s > 0:
         raise ValueError("timeout_s must be positive")
-    opener = _opener()
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="fetch") as pool:
-        results = list(pool.map(lambda cam: fetch_frame(cam, timeout_s, opener), cameras))
+        results = list(pool.map(lambda cam: fetch_frame(cam, timeout_s), cameras))
     counts = Counter(r.error for r in results)
     logger.info(
         "sweep fetched",
@@ -89,15 +96,13 @@ def fetch_sweep(
     return results
 
 
-def fetch_frame(
-    camera: registry.Camera, timeout_s: float, opener: urllib.request.OpenerDirector
-) -> FrameResult:
+def fetch_frame(camera: registry.Camera, timeout_s: float) -> FrameResult:
     """One attempt at one camera. Failures become a FrameResult, never an exception."""
     started = time.monotonic()
     frame: npt.NDArray[np.uint8] | None = None
     error: ErrorKind | None = None
     try:
-        body = _download(opener, camera.image_url, timeout_s, started + timeout_s)
+        body = _download(camera.image_url, timeout_s)
         frame = _decode(body)
         del body
     except _FetchError as exc:
@@ -106,45 +111,14 @@ def fetch_frame(
     return FrameResult(camera.id, frame, time.monotonic() - started, error)
 
 
-def _opener() -> urllib.request.OpenerDirector:
-    """HTTP(S) only: unlike urlopen, no file:, ftp: or data: handlers, even on redirect."""
-    opener = urllib.request.OpenerDirector()
-    for handler in (
-        urllib.request.ProxyHandler(),
-        urllib.request.HTTPHandler(),
-        urllib.request.HTTPSHandler(),
-        urllib.request.HTTPRedirectHandler(),
-        urllib.request.HTTPDefaultErrorHandler(),
-        urllib.request.HTTPErrorProcessor(),
-    ):
-        opener.add_handler(handler)
-    return opener
-
-
-def _download(
-    opener: urllib.request.OpenerDirector, url: str, timeout_s: float, deadline: float
-) -> bytes:
-    if not url.startswith(("https://", "http://")):
-        raise _FetchError("network")
+def _download(url: str, timeout_s: float) -> bytes:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": registry.USER_AGENT})  # noqa: S310
-        with opener.open(req, timeout=timeout_s) as resp:
-            declared = resp.headers.get("Content-Length")
-            length = int(declared) if declared is not None and declared.isdigit() else None
-            if length is not None and length > MAX_FRAME_BYTES:
-                raise _FetchError("http")
-            body = bytearray()
-            while chunk := resp.read1(READ_CHUNK):
-                body += chunk
-                if len(body) > MAX_FRAME_BYTES:
-                    raise _FetchError("http")
-                if time.monotonic() > deadline:
-                    raise _FetchError("timeout")
-            # read1() does not raise IncompleteRead; a cut-off frame must not be decoded.
-            if length is not None and len(body) != length:
-                raise _FetchError("network")
-            return bytes(body)
-    except urllib.error.HTTPError as exc:
+        return registry.bounded_get(
+            url, timeout_s=timeout_s, max_bytes=MAX_FRAME_BYTES, schemes=("https", "http")
+        )
+    except registry.BodyTooLarge:
+        raise _FetchError("http") from None
+    except urllib.error.HTTPError as exc:  # any status outside 2xx, redirects included
         exc.close()
         raise _FetchError("http") from None
     except urllib.error.URLError as exc:
@@ -153,16 +127,17 @@ def _download(
     except TimeoutError:
         raise _FetchError("timeout") from None
     except (OSError, http.client.HTTPException, ValueError):
-        # ValueError: a URL urllib cannot parse.
+        # ValueError: a URL that is not http(s), or that urllib cannot parse.
         raise _FetchError("network") from None
 
 
 def _decode(body: bytes) -> npt.NDArray[np.uint8]:
-    if not body:
+    # Never hand the decoder anything but a complete JPEG (see the module docstring).
+    if not body.startswith(JPEG_SOI) or JPEG_EOI not in body[-EOI_WINDOW:]:
         raise _FetchError("decode")
     try:
         frame = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
-    except cv2.error:
+    except cv2.error:  # includes images over wearreport._cv.MAX_IMAGE_PIXELS
         raise _FetchError("decode") from None
     if frame is None or frame.ndim != 3 or frame.dtype != np.uint8:
         raise _FetchError("decode")
