@@ -13,6 +13,7 @@ that every engine module can use it.
 from __future__ import annotations
 
 import contextlib
+import functools
 import http.client
 import json
 import logging
@@ -267,9 +268,15 @@ class _HTTPHandler(urllib.request.HTTPHandler):
         return self.do_open(connection, req=req)
 
 
+@functools.cache
+def _tls_context() -> ssl.SSLContext:
+    """One shared context: building one loads the CA bundle (tens of milliseconds)."""
+    return ssl.create_default_context()
+
+
 class _HTTPSHandler(urllib.request.HTTPSHandler):
     def __init__(self, deadline: _Deadline) -> None:
-        self._tls = ssl.create_default_context()
+        self._tls = _tls_context()
         super().__init__(context=self._tls)
         self._deadline = deadline
 
