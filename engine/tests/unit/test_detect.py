@@ -493,10 +493,18 @@ def test_importing_the_detector_leaves_no_telemetry_files(tmp_path: Path) -> Non
 
 
 def test_the_telemetry_check_itself_sees_the_files(tmp_path: Path) -> None:
-    # Canary: without the variable, loading onnxruntime writes under HOME and TMPDIR.
-    proc, left = _python("import onnxruntime\n", tmp_path)
+    # Canary: a file written where onnxruntime puts its device ID is found. (Whether the
+    # library writes it without the variable depends on the host, so it is planted here.)
+    code = (
+        "import pathlib\n"
+        "d = pathlib.Path.home() / '.cache' / 'Microsoft' / 'DeveloperTools' / '.onnxruntime'\n"
+        "d.mkdir(parents=True)\n"
+        "(d / 'deviceid').write_text('x')\n"
+        "from wearreport import detect\n"
+    )
+    proc, left = _python(code, tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert any("Microsoft" in p.parts for p in left), left
+    assert any(p.name == "deviceid" for p in left), left
 
 
 def test_import_refuses_when_onnxruntime_was_loaded_first(tmp_path: Path) -> None:
