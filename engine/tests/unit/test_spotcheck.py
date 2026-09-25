@@ -875,15 +875,62 @@ def test_child_exit_paths_leave_no_directory(
     assert not (tmp_path / "out").exists()
 
 
-@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGQUIT], ids=lambda s: s.name)
-def test_child_other_signals_while_waiting(tmp_path: Path, signum: signal.Signals) -> None:
-    args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
-    proc, tmp = _spawn(tmp_path, "json", args)
-    workdir = _wait_for_review(tmp, proc)
-    proc.send_signal(signum)
-    returncode, output = _finish(proc)
-    assert returncode == 128 + signum, output
-    assert not workdir.exists() and _leftovers(tmp) == []
+# Signals whose default action ends the process but that the guard cannot handle.
+NOT_HANDLED = {"SIGKILL", "SIGSTOP"}
+# Default action: ignore, stop or continue.
+HARMLESS = {"SIGCHLD", "SIGCONT", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGWINCH"}
+# Faults (handled by crashing), SIGPIPE and SIGXFSZ (Python ignores them), SIGALRM (the
+# review alarm).
+LEFT_ALONE = {"SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGTRAP", "SIGSYS", "SIGABRT"}
+LEFT_ALONE |= {"SIGPIPE", "SIGXFSZ", "SIGALRM"}
+
+
+def _name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return "SIGRT"
+
+
+def _terminating() -> set[int]:
+    """Worked out independently of the tool: what its handlers must cover."""
+    excluded = NOT_HANDLED | HARMLESS | LEFT_ALONE
+    return {int(s) for s in signal.valid_signals() if _name(s) not in excluded}
+
+
+def test_every_catchable_terminating_signal_is_handled() -> None:
+    expected = _terminating()
+    assert set(spotcheck.HANDLED_SIGNALS) == expected
+    assert {signal.SIGUSR1, signal.SIGXCPU, signal.SIGPROF} <= expected
+    if hasattr(signal, "SIGRTMIN"):
+        assert signal.SIGRTMIN in expected and signal.SIGRTMAX in expected
+
+
+def _sent_while_waiting() -> list[int]:
+    """Every named terminating signal except SIGINT and SIGTERM (covered above), three
+    real-time signals, and the alarm."""
+    chosen = sorted(s for s in _terminating() if _name(s) != "SIGRT")
+    if hasattr(signal, "SIGRTMIN"):
+        chosen += [signal.SIGRTMIN, signal.SIGRTMIN + 5, signal.SIGRTMAX]
+    chosen = [s for s in dict.fromkeys(chosen) if s not in (signal.SIGINT, signal.SIGTERM)]
+    return [*chosen, signal.SIGALRM]
+
+
+def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
+    runs = []
+    for signum in _sent_while_waiting():
+        base = tmp_path / str(int(signum))
+        base.mkdir()
+        args = ["--n", "2", "--min-persons", "1", "--judgements", str(base / "j.json")]
+        runs.append((signum, *_spawn(base, "json", args)))
+    for signum, proc, tmp in runs:
+        workdir = _wait_for_review(tmp, proc)
+        proc.send_signal(signum)
+        returncode, output = _finish(proc)
+        code = 3 if signum == signal.SIGALRM else 128 + signum
+        assert returncode == code, (signum, output)
+        assert "Traceback" not in output
+        assert not workdir.exists() and _leftovers(tmp) == [], signum
 
 
 @pytest.mark.parametrize(
@@ -933,8 +980,11 @@ def test_child_repeated_signals_stress(tmp_path: Path) -> None:
             proc.send_signal(signum)  # a no-op once the process has exited
     for base, proc, tmp in runs:
         returncode, output = _finish(proc)
-        # Pending signals are delivered lowest number first, so any of them may win.
-        assert returncode in {128 + s for s in BURST}, output
+        # Pending signals are delivered lowest number first, so any of them may win. A
+        # signal that arrives after clean-up, once the original handlers are back, ends
+        # the process by its default action: the directory is gone by then.
+        assert returncode in {128 + s for s in BURST} | {-s for s in BURST}, output
+        assert "stopped by SIG" in output
         assert "Traceback" not in output
         assert _leftovers(tmp) == [], base
 

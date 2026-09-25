@@ -104,10 +104,15 @@ A `--dry-run` check describes the fixture photos, not the cameras, so it needs a
 ## Privacy and cleanup
 
 Rendered images exist only in the temporary directory, and the tool deletes it when it
-exits: after a normal run, an error, Ctrl-C (SIGINT), SIGTERM, SIGHUP, SIGQUIT or the
-review timeout. Nothing else is written except the statistics file.
+exits: after a normal run, an error, the review timeout, or any catchable signal whose
+default action ends the process: Ctrl-C (SIGINT), SIGTERM, SIGHUP, SIGQUIT, SIGUSR1,
+SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, SIGPWR, SIGSTKFLT and the
+real-time signals, where the platform has them. Repeated signals (Ctrl-C twice, or a
+closing terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else is
+written except the statistics file.
 
-**SIGKILL cannot be handled** (nor can a power cut): the directory then stays behind.
+**SIGKILL cannot be handled** (nor can a power cut, or a crash with SIGSEGV, SIGBUS or
+another fault signal): the directory then stays behind.
 While it runs, the tool holds a lock on its directory; at start it deletes every
 `wearreport-spotcheck-*` directory of the current user that is older than the timeout
 and not locked by a running instance. To clean up by hand:

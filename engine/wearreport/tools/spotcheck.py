@@ -18,9 +18,12 @@ Privacy (AGENTS.md INV-1, exception (c)). This is the only engine module that wr
 images derived from camera frames, and it writes them only into a directory it creates
 with `tempfile.mkdtemp(prefix=TEMP_PREFIX)` (mode 0700) and always deletes:
 
-- after a normal run, an exception, SIGINT, SIGTERM, SIGHUP, SIGQUIT or the review
-  timeout. Signals are turned into exceptions, except while the directory is being
-  created or deleted: a signal that arrives then is held until that step is done;
+- after a normal run, an exception, the review timeout, or any catchable signal whose
+  default action ends the process (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, ...; see
+  HANDLED_SIGNALS). Signals are turned into exceptions, except while the directory is
+  being created or deleted: a signal that arrives then is held until that step is done.
+  Only the first signal is raised; later ones are dropped, so they cannot interrupt the
+  clean-up the first one started;
 - the directory holds a lock (flock) while the tool runs. At start the tool deletes
   every `wearreport-spotcheck-*` directory of the current user in the temporary
   directory that is older than the timeout and not locked, which is what SIGKILL (which
@@ -86,7 +89,39 @@ DEFAULT_TIMEOUT_S = 30 * 60
 DEFAULT_MIN_PERSONS = 3
 DEFAULT_REVIEWER = "unnamed"
 CI_VARIABLES = ("CI", "GITHUB_ACTIONS")
-HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# Every catchable signal whose default action ends the process, where the platform has
+# it, so that none of them can end the run without clean-up. Left out: SIGALRM, which is
+# the review alarm and handled as a timeout; SIGPIPE and SIGXFSZ, which Python ignores;
+# and the fault signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGSYS, SIGABRT),
+# since a Python handler cannot run while C code faults and would turn a crash into a
+# hang. Like SIGKILL, what those leave behind is deleted by a later run.
+TERMINATING_SIGNAL_NAMES = (
+    "SIGINT",
+    "SIGTERM",
+    "SIGHUP",
+    "SIGQUIT",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGXCPU",
+    "SIGVTALRM",
+    "SIGPROF",
+    "SIGPOLL",
+    "SIGIO",
+    "SIGPWR",
+    "SIGSTKFLT",
+)
+
+
+def _terminating_signals() -> tuple[int, ...]:
+    named = {
+        int(getattr(signal, name)) for name in TERMINATING_SIGNAL_NAMES if hasattr(signal, name)
+    }
+    low, high = getattr(signal, "SIGRTMIN", None), getattr(signal, "SIGRTMAX", None)
+    realtime = set(range(int(low), int(high) + 1)) if low and high else set()
+    return tuple(sorted(named | realtime))
+
+
+HANDLED_SIGNALS = _terminating_signals()
 
 MAX_N = 500
 MAX_MIN_PERSONS = 100
