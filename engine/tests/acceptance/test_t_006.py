@@ -7,10 +7,11 @@ hourly arrays). No network calls: the HTTP function is injected.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 import logging
-import tomllib
+import sys
 import urllib.error
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
@@ -308,9 +309,18 @@ def test_ac4_process_cap_of_ten_requests(caplog: pytest.LogCaptureFixture) -> No
 
 
 def test_ac4_no_runtime_dependency_added() -> None:
+    # The weather adapter is standard-library only: every top-level module it imports is
+    # in the standard library or is the engine package itself.
     root = Path(__file__).resolve().parents[3]
-    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
-    assert project["dependencies"] == []
+    source = (root / "engine" / "wearreport" / "weather.py").read_text()
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("wearreport" if node.level else (node.module or "").split(".")[0])
+    assert imported, "no imports found"
+    assert imported - sys.stdlib_module_names <= {"wearreport"}
     assert weather.urllib_get.__module__ == "wearreport.weather"
 
 

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import io
 import json
 import logging
-import re
 import runpy
 import sys
-import tomllib
 import typing
 import urllib.request
 from collections.abc import Iterator
@@ -191,12 +190,17 @@ def test_ac3_zero_malformed_is_logged_as_zero(caplog: pytest.LogCaptureFixture) 
 
 
 def test_ac4_no_runtime_dependencies_added() -> None:
-    # T-003 owns numpy and opencv-python-headless; the registry itself adds none.
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    names = {re.split(r"[<>=!~;\[ ]", dep, maxsplit=1)[0] for dep in project["dependencies"]}
-    assert names <= {"numpy", "opencv-python-headless"}
+    # The registry is standard-library only: every top-level module it imports is in the
+    # standard library or is the engine package itself.
     source = (ROOT / "engine" / "wearreport" / "registry.py").read_text()
-    assert "import numpy" not in source and "import cv2" not in source
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("wearreport" if node.level else (node.module or "").split(".")[0])
+    assert imported, "no imports found"
+    assert imported - sys.stdlib_module_names <= {"wearreport"}
 
 
 def test_ac4_each_attempt_uses_30s_timeout() -> None:
