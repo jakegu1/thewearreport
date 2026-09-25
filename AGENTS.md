@@ -46,9 +46,10 @@ workspace provides them, with this repository mounted next to it. One task = one
 image bytes derived from camera frames to disk, logs, git, caches, CI artifacts or
 third-party services. Three exceptions only: (a) passing arrays in memory to models that
 run locally on the same machine, such as the detector and the spot-check reviewer, so the
-image data never leaves that machine; (b) sending person crops (never full frames) to a vision-model API when a task
-spec explicitly allows it, within its budget; (c) the spot-check tool rendering annotated
-frames into a temporary directory it creates and deletes on exit, never in CI. Never
+image data never leaves that machine; (b) sending person crops (never full frames) to a
+vision-model API when a task spec explicitly allows it, within its budget; (c) the
+spot-check tool rendering annotated frames into a temporary directory it creates and
+deletes on exit, never in CI. Never
 implement face detection, face recognition, re-identification, or tracking of individuals
 across frames. Publish aggregates only.
 
