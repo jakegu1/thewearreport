@@ -10,9 +10,11 @@ temporary file in the same directory and then hard-linked into place, which fail
 name already exists, so a record is either absent or complete, and two publishers can
 never both create it. Publishing the same record again changes nothing; a different
 record with the same sweep_id raises ConflictError and writes nothing. status.json is
-replaced atomically (write, then rename). The whole publish runs under an exclusive
-`flock` on the data directory itself, so concurrent publishers take turns and no lock
-file is left behind.
+replaced atomically (write, then rename). A publisher killed between writing a temporary
+file and moving it into place leaves that file behind; the next publish removes such
+files from the data directory and from the record's day directory before it writes. The
+whole publish runs under an exclusive `flock` on the data directory itself, so concurrent
+publishers take turns and no lock file is left behind.
 
 status.json is computed from the record files alone (see `compute_status`). Record files
 are external data when read back: each is size-capped, parsed and checked with
@@ -58,6 +60,8 @@ STATUS_ATTRIBUTION: Final = (aggregate.TFL_ATTRIBUTION, weather.METOFFICE_ATTRIB
 
 YEAR, MONTH, DAY = re.compile(r"[0-9]{4}"), re.compile(r"[0-9]{2}"), re.compile(r"[0-9]{2}")
 RECORD_FILE = re.compile(rf"({aggregate.SWEEP_ID.pattern})\.json")
+# The name `_temporary` gives: .<target name>.<16 hex digits>.tmp
+TEMPORARY_FILE = re.compile(r"\..+\.[0-9a-f]{16}\.tmp")
 
 
 class PublishError(RuntimeError):
@@ -113,6 +117,8 @@ def publish(data_dir: Path, record: Record, *, now: datetime) -> Published:
     root = _data_root(data_dir)
     path = record_path(root, record["sweep_id"])
     with _locked(root):
+        _remove_stale_temporaries(root)
+        _remove_stale_temporaries(path.parent)
         existing = _read_existing(path)
         if existing is None:
             _make_dirs(root, path.parent)
@@ -198,6 +204,30 @@ def _read_existing(path: Path) -> bytes | None:
 
 def _temporary(directory: Path, name: str) -> Path:
     return directory / f".{name}.{secrets.token_hex(8)}.tmp"
+
+
+def _remove_stale_temporaries(directory: Path) -> None:
+    """Delete temporary files a killed publisher left in `directory`. Called under the lock,
+    so no other publisher on this machine has one in flight. Only plain files named as
+    `_temporary` names them are removed; a missing directory has none."""
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PublishError(f"cannot list {directory.name}: {exc.strerror}") from None
+    for name in names:
+        if not TEMPORARY_FILE.fullmatch(name):
+            continue
+        stale = directory / name
+        try:
+            if stat.S_ISREG(os.lstat(stale).st_mode):
+                os.unlink(stale)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise PublishError(f"cannot remove a stale temporary file: {exc.strerror}") from None
+        logger.warning("stale temporary file removed", extra={"file": name})
 
 
 def _write_new(path: Path, data: bytes) -> None:

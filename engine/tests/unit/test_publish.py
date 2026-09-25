@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -115,6 +118,66 @@ def test_identical_republish_leaves_the_record_file_untouched(tmp_path: Path) ->
     assert first.created and not second.created
     assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
     assert after.st_nlink == 1
+
+
+_KILLED_PUBLISHER = """
+import json, os, signal, sys
+from datetime import datetime
+from pathlib import Path
+from wearreport import publish
+
+def die(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+setattr(os, sys.argv[1], die)
+publish.publish(Path(sys.argv[2]), json.loads(sys.argv[3]), now=datetime.fromisoformat(sys.argv[4]))
+"""
+
+
+def _kill_publisher_at(step: str, data_dir: Path, record: Any) -> None:
+    """Publish `record` in another process that is killed (SIGKILL: no cleanup runs) when
+    it calls os.<step>."""
+    args = [step, str(data_dir), json.dumps(record), T0.isoformat()]
+    done = subprocess.run(
+        [sys.executable, "-c", _KILLED_PUBLISHER, *args], capture_output=True, timeout=60
+    )
+    assert done.returncode == -signal.SIGKILL, done.stderr
+
+
+@pytest.mark.parametrize(
+    ("step", "left_in"),
+    [("link", "sweeps/2026/07/15/.20260715T1230Z.json."), ("replace", ".status.json.")],
+)
+def test_a_later_publish_removes_what_a_killed_publisher_left(
+    tmp_path: Path, step: str, left_in: str
+) -> None:
+    _kill_publisher_at(step, tmp_path, _record())
+    stale = [p for p in _tree(tmp_path) if p.startswith(left_in) and p.endswith(".tmp")]
+    assert len(stale) == 1
+    publish.publish(tmp_path, _record(), now=T0)
+    assert _tree(tmp_path) == [
+        "status.json",
+        "sweeps",
+        "sweeps/2026",
+        "sweeps/2026/07",
+        "sweeps/2026/07/15",
+        "sweeps/2026/07/15/20260715T1230Z.json",
+    ]
+
+
+def test_stale_temporary_cleanup_spares_other_files(tmp_path: Path) -> None:
+    day = publish.record_path(tmp_path, _record()["sweep_id"]).parent
+    day.mkdir(parents=True)
+    keep = ["README", ".x.tmp", ".status.json.nothex_nothex_ab.tmp", "a.0123456789abcdef.tmp"]
+    for name in keep:
+        (tmp_path / name).write_text("x")
+    (day / ".dir.0123456789abcdef.tmp").mkdir()
+    (tmp_path / ".link.0123456789abcdef.tmp").symlink_to(tmp_path / "README")
+    publish.publish(tmp_path, _record(), now=T0)
+    for name in keep:
+        assert (tmp_path / name).read_text() == "x"
+    assert (day / ".dir.0123456789abcdef.tmp").is_dir()
+    assert (tmp_path / ".link.0123456789abcdef.tmp").is_symlink()
 
 
 def test_publish_refuses_a_symlinked_directory(tmp_path: Path) -> None:
