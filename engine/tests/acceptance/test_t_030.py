@@ -226,17 +226,37 @@ def test_ac3_mutant_setting_the_variable_after_the_import_is_caught(
     line_end = source.index("\n", source.index(importing)) + 1
     source = source[:line_end] + setting + source[line_end:]
     (mutant / "wearreport" / "detect.py").write_text(source, encoding="utf-8")
-    prelude = "from wearreport import detect\nassert detect.__file__.startswith(MUTANT)\n"
+    # Installed before the engine is imported, so it sees onnxruntime's first import: the
+    # proof holds on every host, whether or not onnxruntime writes files there (the file
+    # scan in _run_dry_sweep_process stays as a second layer). It never imports onnxruntime.
+    hook = (
+        "import os, sys\n"
+        "_ort_seen = []\n"
+        "def _ort_import(event, args):\n"
+        "    if event != 'import' or _ort_seen:\n"
+        "        return\n"
+        "    if args[0] == 'onnxruntime' or args[0].startswith('onnxruntime.'):\n"
+        "        value = os.environ.get('ORT_DISABLE_TELEMETRY')\n"
+        "        _ort_seen.append(value)\n"
+        "        if value != '1':\n"
+        "            os.write(2, ('\\n@@privacy escape onnxruntime imported with '\n"
+        "                         f'ORT_DISABLE_TELEMETRY={value!r}\\n').encode())\n"
+        "sys.addaudithook(_ort_import)\n"
+    )
+    prelude = hook + "from wearreport import detect\nassert detect.__file__.startswith(MUTANT)\n"
 
     clean = tmp_path / "clean"
     clean.mkdir()
-    real = "from wearreport import detect\nassert 'mutant' not in detect.__file__\n"
+    real = hook + "from wearreport import detect\nassert 'mutant' not in detect.__file__\n"
     privacy._run_dry_sweep_process(clean, real).assert_clean()
 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     monkeypatch.setenv("PYTHONPATH", str(mutant))
     report = privacy._run_dry_sweep_process(run_dir, f"MUTANT = {str(mutant)!r}\n" + prelude)
+    assert any(
+        "onnxruntime imported with ORT_DISABLE_TELEMETRY=None" in e for e in report.escapes
+    ), report.escapes
     with pytest.raises(AssertionError):
         report.assert_clean()
 
