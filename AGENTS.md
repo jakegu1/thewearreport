@@ -104,7 +104,7 @@ Created by the bootstrap task; later tasks must keep these working.
 | Detector | YOLOX-s ONNX via onnxruntime (CPU) |
 | Language and tools | Python 3.12, `uv`, `ruff`, `mypy --strict`, `pytest` |
 | Scheduling | GitHub Actions cron during London daytime |
-| Aggregate storage | JSON Lines on the orphan `data` branch, validated by JSON Schema |
+| Aggregate storage | One immutable JSON record per sweep on the orphan `data` branch (records concatenate into JSON Lines), validated by JSON Schema |
 | Weather | Met Office DataHub (UK), NWS (US) |
 
 If you believe a decided choice is wrong, say so with evidence in the PR. Do not change
@@ -116,6 +116,11 @@ it unilaterally.
 - Structured JSON logs. Never log image data or URLs containing tokens.
 - Tests assert behaviour, including failure paths (timeouts, malformed input, partial
   failures). Do not test mocks.
+- Treat external data as hostile. A parser of a network response or data file turns every
+  failure into the module's typed error. That includes `ValueError`, `TypeError`, `KeyError`,
+  `UnicodeDecodeError`, `RecursionError` (deep nesting) and `OverflowError` (huge numbers,
+  out-of-range dates). Raise it `from None` when the original message could echo a secret.
+  Cap response sizes. Tests include these pathological inputs.
 - Never skip, disable or weaken a test or check to make CI pass.
 - Code, comments, commits and PRs in English.
 

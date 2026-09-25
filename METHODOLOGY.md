@@ -27,7 +27,7 @@ brands). At 352×288 pixels they are not reliable, and the product does not need
 | Fetch | Download the latest still from each camera | In memory only; timeouts and bounded retries |
 | Detect | YOLOX-s (Apache-2.0) on CPU via ONNX Runtime; classes *person* and *umbrella* | About 80 ms per frame in early tests |
 | Classify | Coarse attributes per person crop | Method chosen in a later milestone; see Changelog |
-| Aggregate | Counts per sweep, joined to weather | Published as JSON Lines on the `data` branch |
+| Aggregate | Counts per sweep, joined to weather | Published on the `data` branch as one JSON record per sweep (concatenates into JSON Lines) |
 
 ## Privacy
 
