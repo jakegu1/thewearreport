@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import io
 import json
 import logging
-import runpy
 import sys
 import typing
-import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -280,24 +277,18 @@ def test_ac4_app_key_is_sent_only_when_given() -> None:
     assert "app_key=abc123" in urls[1]
 
 
-class _FakeResponse(io.BytesIO):
-    def __enter__(self) -> _FakeResponse:
-        return self
+def test_ac4_default_fetch_uses_bounded_get_with_30s_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object, object]] = []
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def fake_bounded_get(url: str, *, timeout_s: float, max_bytes: int, **kwargs: object) -> bytes:
+        calls.append((url, timeout_s, max_bytes))
+        return _fixture_bytes()
 
-
-def test_ac4_default_fetch_uses_urllib_with_30s_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    timeouts: list[object] = []
-
-    def fake_urlopen(req: object, timeout: object = None, **kwargs: object) -> _FakeResponse:
-        timeouts.append(timeout)
-        return _FakeResponse(_fixture_bytes())
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(registry, "bounded_get", fake_bounded_get)
     cams = registry.list_cameras(None, sleep=_no_sleep)
-    assert timeouts == [30]
+    assert calls == [(registry.JAMCAM_URL, 30, registry.MAX_BODY_BYTES)]
     assert {c.id for c in cams} == AVAILABLE_IDS
 
 
@@ -317,15 +308,24 @@ def test_ac5_fixture_is_trimmed_real_response_shape() -> None:
 def test_ac5_module_entry_point_prints_counts(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def fake_urlopen(req: object, timeout: object = None, **kwargs: object) -> _FakeResponse:
-        return _FakeResponse(_fixture_bytes())
+    timeouts: list[object] = []
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    def fake_bounded_get(url: str, *, timeout_s: float, max_bytes: int, **kwargs: object) -> bytes:
+        timeouts.append(timeout_s)
+        return _fixture_bytes()
+
+    # `python -m wearreport.registry` runs the module's `if __name__ == "__main__"` block,
+    # which must hand main()'s return code to SystemExit.
+    tree = ast.parse((ROOT / "engine" / "wearreport" / "registry.py").read_text())
+    guard = tree.body[-1]
+    assert isinstance(guard, ast.If)
+    assert ast.unparse(guard.test) == "__name__ == '__main__'"
+    assert [ast.unparse(stmt) for stmt in guard.body] == ["raise SystemExit(main())"]
+
+    monkeypatch.setattr(registry, "bounded_get", fake_bounded_get)
     monkeypatch.delenv("TFL_APP_KEY", raising=False)
-    monkeypatch.delitem(sys.modules, "wearreport.registry")  # run it fresh, as `python -m` does
-    with pytest.raises(SystemExit) as exit_info:
-        runpy.run_module("wearreport.registry", run_name="__main__")
-    assert exit_info.value.code in (0, None)
+    assert registry.main() == 0
+    assert timeouts == [30]
     lines = capsys.readouterr().out.splitlines()
     assert "available cameras: 8" in lines
     assert "skipped malformed: 1" in lines
