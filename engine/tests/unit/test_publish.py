@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -278,6 +279,111 @@ def test_concurrent_conflicting_publishes_keep_the_first(tmp_path: Path) -> None
     stored = json.loads(publish.record_path(tmp_path, records[0]["sweep_id"]).read_text())
     assert stored in records
     assert not [p for p in tmp_path.rglob(".*")]
+
+
+_PUBLISHER = """
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+from wearreport import publish
+
+go = Path(sys.argv[1])
+while not go.exists():
+    time.sleep(0.001)
+try:
+    result = publish.publish(
+        Path(sys.argv[2]), json.loads(sys.argv[3]), now=datetime.fromisoformat(sys.argv[4])
+    )
+    print("created" if result.created else "same")
+except publish.ConflictError:
+    print("conflict")
+"""
+
+
+def test_publishers_in_separate_processes_keep_one_record_per_sweep(tmp_path: Path) -> None:
+    data, go = tmp_path / "data", tmp_path / "go"
+    data.mkdir()
+    now = T0 + timedelta(hours=3)
+    jobs: list[tuple[str, bytes, subprocess.Popen[str]]] = []
+    for hours in range(3):
+        for persons in (1, 2, 1, 2, 1, 2):
+            record = _record(T0 + timedelta(hours=hours), persons=persons)
+            args = [str(go), str(data), json.dumps(record), now.isoformat()]
+            child = subprocess.Popen(
+                [sys.executable, "-c", _PUBLISHER, *args], stdout=subprocess.PIPE, text=True
+            )
+            jobs.append((record["sweep_id"], publish.serialize(record), child))
+    go.touch()
+    outcomes: dict[str, list[tuple[bytes, str]]] = {}
+    for sweep_id, data_bytes, child in jobs:
+        out, _ = child.communicate(timeout=120)
+        assert child.returncode == 0
+        outcomes.setdefault(sweep_id, []).append((data_bytes, out.strip()))
+    for sweep_id, results in outcomes.items():
+        stored = publish.record_path(data, sweep_id).read_bytes()
+        assert [r for _, r in results].count("created") == 1
+        for content, result in results:
+            if content == stored:
+                assert result in ("created", "same")
+            else:
+                assert result == "conflict"
+    status = json.loads((data / "status.json").read_bytes())
+    assert status["sweeps_24h"] == 3
+    assert not [p for p in data.rglob(".*")]
+
+
+def test_a_record_linked_by_another_publisher_first_is_compared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the lock normally prevents: the record appears between the check for an
+    existing record and the link (a publisher the lock does not reach)."""
+    ours, theirs = _record(persons=3), _record(persons=4)
+    link = os.link
+
+    def lose_the_race(src: Any, dst: Any) -> None:
+        Path(dst).write_bytes(publish.serialize(theirs))
+        monkeypatch.setattr(os, "link", link)
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(os, "link", lose_the_race)
+    with pytest.raises(publish.ConflictError):
+        publish.publish(tmp_path, ours, now=T0)
+    assert publish.record_path(tmp_path, ours["sweep_id"]).read_bytes() == publish.serialize(theirs)
+    assert not [p for p in tmp_path.rglob(".*")]
+
+
+def test_a_record_linked_by_another_publisher_first_with_the_same_bytes_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _record()
+
+    def lose_the_race(src: Any, dst: Any) -> None:
+        Path(dst).write_bytes(publish.serialize(record))
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(os, "link", lose_the_race)
+    assert publish.publish(tmp_path, record, now=T0).created is False
+
+
+def test_publish_waits_for_the_lock_on_the_data_directory(tmp_path: Path) -> None:
+    fd = os.open(tmp_path, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    done = threading.Event()
+
+    def publisher() -> None:
+        publish.publish(tmp_path, _record(), now=T0)
+        done.set()
+
+    thread = threading.Thread(target=publisher)
+    try:
+        thread.start()
+        assert not done.wait(0.5)
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        os.close(fd)  # releases the lock
+    thread.join(30)
+    assert done.is_set()
+    assert (tmp_path / "status.json").is_file()
 
 
 # status.json ---------------------------------------------------------------------------
