@@ -328,6 +328,37 @@ def test_sample_can_pick_every_qualifying_frame_and_keeps_order() -> None:
     assert picked == {0, 2, 3, 5, 6}
 
 
+def test_sample_skips_a_frame_the_detector_fails_on_and_prints_only_the_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailsOnSecond:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def detect(self, frame: npt.NDArray[np.uint8]) -> list[detect.Detection]:
+            self.calls += 1
+            if self.calls == 2:
+                raise detect.DetectorError("model output has NaN or infinite values")
+            return [detect.Detection("person", 0.9, _box(k)) for k in range(3)]
+
+    frames = [np.full((H, W, 3), 10 * i, dtype=np.uint8) for i in range(3)]
+    detector = FailsOnSecond()
+    chosen = spotcheck.sample(frames, detector, n=5, min_persons=3, seed=0)
+    assert [int(s.frame[0, 0, 0]) for s in chosen] == [0, 20]
+    assert detector.calls == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "spotcheck: skipped 1 frame(s) the detector could not read\n"
+
+
+def test_sample_prints_nothing_when_no_frame_is_skipped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    frames = [np.zeros((H, W, 3), dtype=np.uint8)]
+    spotcheck.sample(frames, Stub([3]), n=1, min_persons=3, seed=0)
+    assert capsys.readouterr() == ("", "")
+
+
 def test_sample_ignores_umbrellas() -> None:
     class Umbrellas:
         def detect(self, frame: npt.NDArray[np.uint8]) -> list[detect.Detection]:
@@ -861,6 +892,45 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     assert spotcheck.remove_stale(tmp_path / "missing", 1) == 0
 
 
+def _stale_dirs(tmp: Path, names: Sequence[str]) -> list[Path]:
+    old = time.time() - 7200
+    made = []
+    for name in names:
+        d = tmp / (spotcheck.TEMP_PREFIX + name)
+        (d / "sub").mkdir(parents=True)
+        for i in range(5):
+            (d / "sub" / f"crop-{i}.png").write_bytes(b"x")
+        os.utime(d, (old, old))
+        made.append(d)
+    return made
+
+
+def test_remove_stale_finishes_a_removal_that_a_signal_lands_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = _stale_dirs(tmp_path, ["a", "b"])
+    real_rmtree = shutil.rmtree
+    calls: list[str] = []
+
+    def rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+        calls.append(Path(path).name)
+        _deliver(signal.SIGTERM)  # the guard holds it: this removal is a critical step
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    guard = spotcheck._SignalGuard()
+    guard.install()
+    try:
+        with pytest.raises(spotcheck.Interrupted):
+            spotcheck.remove_stale(tmp_path, 3600, guard=guard)
+    finally:
+        guard.restore()
+    assert len(calls) == 1  # the signal stops the sweep once that directory is gone
+    removed, kept = (first, second) if calls == [first.name] else (second, first)
+    assert not os.path.lexists(removed)
+    assert kept.is_dir()  # the next run removes it
+
+
 # Child processes: every exit path ----------------------------------------------------
 
 CHILD = r"""
@@ -911,6 +981,13 @@ elif scenario == "in_rmtree":
     real_rmtree = shutil.rmtree
     def rmtree(path, *args, **kwargs):
         kill_self(signal.SIGTERM)
+        return real_rmtree(path, *args, **kwargs)
+    shutil.rmtree = rmtree
+elif scenario.startswith("in_stale_sweep_"):
+    real_rmtree = shutil.rmtree
+    def rmtree(path, *args, **kwargs):
+        if os.path.basename(str(path)) == sc.TEMP_PREFIX + "stale":
+            kill_self(getattr(signal, scenario.removeprefix("in_stale_sweep_")))
         return real_rmtree(path, *args, **kwargs)
     shutil.rmtree = rmtree
 elif scenario == "parser_breaks":
@@ -1197,6 +1274,23 @@ def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     assert _leftovers(tmp) == []
 
 
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"])
+def test_child_signal_during_the_stale_sweep_still_removes_the_directory(
+    tmp_path: Path, signame: str
+) -> None:
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    (stale,) = _stale_dirs(tmp, ["stale"])
+    proc, _ = _spawn(tmp_path, f"in_stale_sweep_{signame}", ["--n", "1", "--min-persons", "1"])
+    returncode, output = _finish(proc)
+    signum = int(getattr(signal, signame))
+    assert returncode == 128 + signum, output
+    assert f"stopped by {signame}" in output
+    assert not os.path.lexists(stale)
+    assert _leftovers(tmp) == []
+    assert not (tmp_path / "out").exists()
+
+
 # Where writes land: a full main() under an audit hook ----------------------------------
 
 CONFINED = r"""
@@ -1224,6 +1318,9 @@ class Scripted:
     def judge(self, items, mode, deadline):
         if scenario == "stray":  # a write outside the review directory
             Path("notes.txt").write_text("judged", encoding="utf-8")
+        if scenario == "move_out":  # an image moved out of the review directory
+            review = next(Path(tempfile.gettempdir()).glob(sc.TEMP_PREFIX + "*"))
+            os.rename(review / items[0].file, "moved.png")
         return {i.number: sc.Judgement(frozenset({i.boxes[0]}), frozenset(),
                                        0 if mode == "frames" else None) for i in items}
 
@@ -1231,6 +1328,8 @@ WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 EVENTS = {"os.mkdir": "write", "os.rename": "write", "os.replace": "write",
           "os.link": "write", "os.symlink": "write", "os.truncate": "write",
           "tempfile.mkstemp": "write", "tempfile.mkdtemp": "mkdtemp"}
+# Events that also create or overwrite their second argument: the destination.
+TWO_PATHS = {"os.rename", "os.replace", "os.link", "os.symlink"}
 
 def report(kind, path):
     path = os.path.abspath(os.fsdecode(path))
@@ -1243,8 +1342,11 @@ def audit(event, args):
             isinstance(flags, int) and flags & WRITE_FLAGS)
         if writing and not isinstance(path, int):
             report("write", path)
-    elif event in EVENTS and args[0] is not None:
-        report(EVENTS[event], args[0])
+    elif event in EVENTS:
+        if args[0] is not None:
+            report(EVENTS[event], args[0])
+        if event in TWO_PATHS and args[1] is not None:
+            report(EVENTS[event], args[1])
 
 pipeline = sc.Pipeline(frames=frames, detector=Stub(),
                        info=sc.DetectorInfo(model="stub", sha256="0" * 64, conf=0.35))
@@ -1306,6 +1408,18 @@ def test_the_write_audit_catches_a_stray_write(tmp_path: Path) -> None:
         _assert_writes_confined(events, stats_file)
 
 
+def test_the_write_audit_catches_a_file_moved_out(tmp_path: Path) -> None:
+    """A rename is a write to its destination: moving an image out of the review directory
+    puts it where the clean-up never looks."""
+    events, stats_file = _confined_run(tmp_path, "move_out", "crops")
+    moved = stats_file.parent.parent / "moved.png"
+    assert moved.read_bytes().startswith(IMAGE_MAGIC)
+    moved.unlink()
+    assert ("write", str(moved)) in events
+    with pytest.raises(AssertionError, match=r"moved\.png"):
+        _assert_writes_confined(events, stats_file)
+
+
 # Runtime privacy (AC9): the real command, from interpreter start to exit --------------
 
 AUDITED = r"""
@@ -1314,6 +1428,7 @@ import os, sys
 WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 FILE_EVENTS = {"os.mkdir", "os.rename", "os.replace", "os.link", "os.symlink",
                "os.truncate", "tempfile.mkstemp", "tempfile.mkdtemp"}
+TWO_PATHS = {"os.rename", "os.replace", "os.link", "os.symlink"}
 PROCESS_EVENTS = {"subprocess.Popen", "os.system", "os.exec", "os.posix_spawn",
                   "os.spawn", "os.fork", "os.forkpty"}
 
@@ -1330,6 +1445,8 @@ def audit(event, args):
             report("write", os.fsdecode(path))
     elif event in FILE_EVENTS:
         report("write", os.fsdecode(args[0]) if args[0] is not None else "?")
+        if event in TWO_PATHS and args[1] is not None:
+            report("write", os.fsdecode(args[1]))
     elif event in PROCESS_EVENTS:
         report("escape", f"{event} {args[0]!s}")
     elif event in ("socket.connect", "socket.sendto"):

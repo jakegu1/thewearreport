@@ -12,7 +12,9 @@ never both create it. Publishing the same record again changes nothing; a differ
 record with the same sweep_id raises ConflictError and writes nothing. status.json is
 replaced atomically (write, then rename). A publisher killed between writing a temporary
 file and moving it into place leaves that file behind; the next publish removes such
-files from the data directory and from the record's day directory before it writes. The
+files from the data directory and from the record's day directory before it writes, once
+it has checked that none of sweeps/, the year, month and day directories is a symlink or
+anything but a plain directory (a symlink could point the clean-up outside). The
 whole publish runs under an exclusive `flock` on the data directory itself, so concurrent
 publishers take turns and no lock file is left behind.
 
@@ -119,6 +121,7 @@ def publish(data_dir: Path, record: Record, *, now: datetime) -> Published:
     root = _data_root(data_dir)
     path = record_path(root, record["sweep_id"])
     with _locked(root):
+        _check_dirs(root, path.parent)  # before any clean-up can follow a symlink
         _remove_stale_temporaries(root)
         _remove_stale_temporaries(path.parent)
         existing = _read_existing(path)
@@ -177,6 +180,22 @@ def _is_real_dir(path: Path) -> bool:
     except FileNotFoundError:
         return False
     return stat.S_ISDIR(st.st_mode)
+
+
+def _check_dirs(root: Path, directory: Path) -> None:
+    """Refuse `directory` if any existing component below `root` is a symlink or not a
+    directory. Components that do not exist yet are fine: `_make_dirs` creates them."""
+    current = root
+    for part in directory.relative_to(root).parts:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise PublishError(f"cannot inspect {part}: {exc.strerror}") from None
+        if not stat.S_ISDIR(st.st_mode):
+            raise PublishError(f"{current.relative_to(root)} is not a plain directory")
 
 
 def _make_dirs(root: Path, directory: Path) -> None:

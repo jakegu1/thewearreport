@@ -7,5 +7,5 @@ allowed.
 | Source | License | File |
 |---|---|---|
 | TfL Open Data (metadata only) | TfL open data terms (attribution: "Powered by TfL Open Data") | engine/tests/fixtures/jamcam_places.json |
-| https://www.flickr.com/photos/9298216@N08/13161566643 by Berit Watkin ("Aldgate: people"), unmodified 1024 px download | CC BY 2.0 | fixtures/detect/people_aldgate.jpg |
+| https://commons.wikimedia.org/wiki/File:Washington,_D.C._Aerial_view_of_a_street_corner2.jpg by David Myers, Farm Security Administration / Office of War Information, 1939 ("Washington, D.C. Aerial view of a street corner", Library of Congress fsa.8a31563; a US federal government work, {{PD-USGov-FSA}}), Commons 1280 px thumbnail downscaled to 1024 px wide | Public domain | fixtures/detect/people_street.jpg |
 | https://www.flickr.com/photos/38315261@N00/143909914 by Sharon Mollerus ("Walking in the Rain, Lakewalk, Duluth"), unmodified 1024 px download | CC BY 2.0 | fixtures/detect/umbrella_rain.jpg |

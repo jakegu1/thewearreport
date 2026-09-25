@@ -11,6 +11,8 @@
 
 Models come from `--model-dir` (default `.models/`, filled by `scripts/fetch_model.sh`;
 YOLOX-m needs `--with-m`). Each model runs once on a blank frame before timing starts.
+The table labels each row by file name; a line per model below it names the pinned model
+that the file's SHA-256 matches, and a warning says when two files are the same model.
 
 Privacy (AGENTS.md INV-1): frames exist only in memory and are dropped as soon as every
 model has seen them. Only counts and timings are printed or logged.
@@ -19,6 +21,7 @@ model has seen them. Only counts and timings are printed or logged.
 from __future__ import annotations
 
 import argparse
+import itertools
 import statistics
 import sys
 import time
@@ -103,14 +106,51 @@ def table(results: Sequence[Result]) -> str:
     return "\n".join(lines)
 
 
-def _detectors(model_dir: Path, names: Sequence[str]) -> list[detect.Detector]:
-    return [detect.Detector(model_dir / f"{name}.onnx") for name in names]
+def _sha256(path: Path) -> str | None:
+    try:
+        return detect.sha256_of(path)
+    except OSError:
+        return None
+
+
+def identity(paths: Sequence[Path]) -> list[str]:
+    """For each model file, the pinned model its SHA-256 matches, saying so when that is
+    not the model its name claims; then a warning for each pair of files that are one
+    model. The table's rows are labelled by file name, so these lines keep it honest."""
+    pinned_by_digest = {digest: name for name, digest in detect.MODEL_SHA256.items()}
+    digests = [(path, _sha256(path)) for path in paths]
+    lines = []
+    for path, digest in digests:
+        pinned = pinned_by_digest.get(digest) if digest is not None else None
+        if pinned is None:
+            lines.append(f"sha256: {path.name} matches no pinned model")
+        elif pinned == path.name:
+            lines.append(f"sha256: {path.name} is the pinned {pinned}")
+        else:
+            lines.append(f"sha256: {path.name} is the pinned {pinned}, not {path.name}")
+    for (first, a), (second, b) in itertools.combinations(digests, 2):
+        if a is not None and a == b:
+            lines.append(
+                f"warning: {first.name} and {second.name} have the same SHA-256; "
+                "their rows measure one model"
+            )
+    return lines
+
+
+def _paths(model_dir: Path, names: Sequence[str]) -> list[Path]:
+    return [model_dir / f"{name}.onnx" for name in names]
+
+
+def _detectors(paths: Sequence[Path]) -> list[detect.Detector]:
+    return [detect.Detector(path) for path in paths]
 
 
 def _synthetic(model_dir: Path, count: int) -> int:
-    (detector,) = _detectors(model_dir, MODELS[:1])
+    paths = _paths(model_dir, MODELS[:1])
+    (detector,) = _detectors(paths)
     result = run(detector, synthetic_frames(count))
     print(f"model: {result.model}")
+    print("\n".join(identity(paths)))
     print(f"frame size: {FRAME_WIDTH}x{FRAME_HEIGHT}")
     print(f"frames: {result.frames}")
     print(f"median ms per frame: {result.median_ms:.1f}")
@@ -119,7 +159,8 @@ def _synthetic(model_dir: Path, count: int) -> int:
 
 
 def _comparison(model_dir: Path, cameras: Sequence[registry.Camera]) -> int:
-    detectors = _detectors(model_dir, MODELS)  # before fetching: fail fast on a bad model
+    paths = _paths(model_dir, MODELS)
+    detectors = _detectors(paths)  # before fetching: fail fast on a bad model
     started = time.monotonic()
     frames, failed = fetched_frames(cameras)
     print(f"cameras: {len(cameras)}")
@@ -129,6 +170,7 @@ def _comparison(model_dir: Path, cameras: Sequence[registry.Camera]) -> int:
     results = compare(detectors, frames)
     del frames
     print(table(results))
+    print("\n".join(identity(paths)))
     return 0
 
 

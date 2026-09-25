@@ -244,9 +244,7 @@ def test_ac1_live_path_uses_registry_fetch_and_detector_defaults(
     env: Path, offline: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _model()
-    bodies = [
-        (FIXTURES / name).read_bytes() for name in ("people_aldgate.jpg", "umbrella_rain.jpg")
-    ]
+    bodies = [(FIXTURES / name).read_bytes() for name in ("people_street.jpg", "umbrella_rain.jpg")]
     calls: dict[str, list[Any]] = {"list": [], "fetch": [], "detector": []}
     real_fetch_sweep = fetch.fetch_sweep
     real_detector = detect.Detector

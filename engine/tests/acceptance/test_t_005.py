@@ -31,7 +31,7 @@ from wearreport.testing.fake_cameras import FakeCameraServer
 ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = ROOT / "data" / "schema" / "sweep.v1.json"
 SAMPLE_PATH = ROOT / "data" / "schema" / "samples" / "sweep.v1.json"
-PEOPLE = ROOT / "fixtures" / "detect" / "people_aldgate.jpg"
+PEOPLE = ROOT / "fixtures" / "detect" / "people_street.jpg"
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
 RUNTIME_TEST = "engine/tests/unit/test_privacy_runtime.py"
 ERROR_KINDS = ("timeout", "http", "decode", "network", "detect")

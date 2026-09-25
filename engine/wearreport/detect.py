@@ -72,7 +72,8 @@ MODEL_SHA256 = {
 
 
 class DetectorError(RuntimeError):
-    """The model cannot be opened or produced output of the wrong shape."""
+    """The model cannot be opened, or produced output of the wrong shape or with values
+    no working model gives (non-finite numbers, scores outside [0, 1])."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,13 +130,18 @@ def open_session(model_path: Path) -> Session:
     """Open a pinned model on the CPU. Raises DetectorError for anything else.
 
     The bytes that are hashed are the bytes that are loaded, so the file cannot be swapped
-    between the check and the load.
+    between the check and the load. onnxruntime's default logger, which writes warnings
+    to stderr whatever the session options say, is set to errors only before the session
+    is created. onnxruntime may still print device-discovery warnings (such as
+    `GetPciBusId` on hosts without a PCI bus path) when its environment is first created,
+    which can happen before that severity applies; they carry no frame data.
     """
     data = _read_model(model_path)
     if hashlib.sha256(data).hexdigest() not in MODEL_SHA256.values():
         raise DetectorError(
             f"model {model_path.name} does not match a pinned SHA-256; run scripts/fetch_model.sh"
         )
+    ort.set_default_logger_severity(3)  # errors only
     try:
         session = ort.InferenceSession(
             data, sess_options=session_options(), providers=["CPUExecutionProvider"]
@@ -254,9 +260,26 @@ def nms(boxes: FloatArray, scores: FloatArray, threshold: float) -> list[int]:
 
 
 def postprocess(
-    raw: FloatArray, scale: float, width: int, height: int, conf: float, nms_threshold: float
+    raw: FloatArray,
+    scale: float,
+    width: int,
+    height: int,
+    conf: float,
+    nms_threshold: float,
+    *,
+    refuse_all_dropped: bool = False,
 ) -> list[Detection]:
-    """Filter, suppress and map raw outputs (N x 85) to detections in a width x height frame."""
+    """Filter, suppress and map raw outputs (N x 85) to detections in a width x height frame.
+
+    A row whose box or score is not finite, including a box whose decoded coordinates
+    overflow float32, is dropped, and so is a box with no area once clipped to the frame.
+    `Detector.detect` has already refused output that holds NaN, infinity or scores outside
+    [0, 1], so only the overflow case reaches here from it.
+
+    With `refuse_all_dropped`, raise DetectorError when at least one person or umbrella row
+    reaches `conf` and every such row is dropped: a model whose confident boxes all
+    overflow or fall outside the frame is broken, and must not read as an empty frame.
+    """
     with np.errstate(over="ignore", invalid="ignore"):
         class_scores = raw[:, 4:5] * raw[:, 5:]
         best_class = class_scores.argmax(axis=1)
@@ -264,10 +287,15 @@ def postprocess(
         boxes = unletterbox(decode(raw), scale, width, height)
     finite = np.isfinite(boxes).all(axis=1) & np.isfinite(best_score)
     has_area = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    # A box counts for the class with its highest score, as in the spike.
+    confident = np.isin(best_class, list(CLASS_IDS.values())) & (best_score >= conf)
+    if refuse_all_dropped and confident.any() and not (confident & finite & has_area).any():
+        raise DetectorError(
+            f"model output has {int(confident.sum())} confident boxes and none inside the frame"
+        )
     detections: list[Detection] = []
     for label, class_id in CLASS_IDS.items():
-        # A box counts for the class with its highest score, as in the spike.
-        mask = finite & has_area & (best_class == class_id) & (best_score >= conf)
+        mask = finite & has_area & confident & (best_class == class_id)
         if not mask.any():
             continue
         class_boxes, class_conf = boxes[mask], best_score[mask]
@@ -301,7 +329,9 @@ class Detector:
         conf: float = DEFAULT_CONF,
         nms: float = DEFAULT_NMS,
     ) -> Detector:
-        """A detector around an already open session (tests use a stand-in model)."""
+        """For tests only: a detector around an already open session, such as a stand-in
+        model. It skips `open_session`, so no SHA-256 pin is checked; the engine always
+        opens models through `Detector(model_path)`."""
         detector = cls.__new__(cls)
         detector.conf = _check_threshold("conf", conf)
         detector.nms = _check_threshold("nms", nms)
@@ -313,7 +343,12 @@ class Detector:
         """Detections in `frame` (HxWx3 uint8, BGR), highest score first.
 
         Raises ValueError for a frame of the wrong type, dtype, shape or size, and
-        DetectorError if the model returns output of an unexpected shape.
+        DetectorError if the model returns output of an unexpected shape, any NaN or
+        infinity, or an objectness or class score outside [0, 1]: such output is a broken
+        model, not a frame without people. A box whose decoded coordinates overflow (a
+        finite but huge regression output), or that has no area inside the frame, is
+        dropped; but if every person or umbrella box that reaches `conf` is dropped that
+        way, that is a broken model too, and raises DetectorError.
         """
         pixels = validate_frame(frame)
         height, width = pixels.shape[:2]
@@ -321,7 +356,7 @@ class Detector:
         del pixels
         raw = self._infer(tensor)
         del tensor
-        return postprocess(raw, scale, width, height, self.conf, self.nms)
+        return postprocess(raw, scale, width, height, self.conf, self.nms, refuse_all_dropped=True)
 
     def _infer(self, tensor: FloatArray) -> FloatArray:
         try:
@@ -334,7 +369,15 @@ class Detector:
         if not isinstance(out, np.ndarray) or out.shape != OUTPUT_SHAPE:
             shape = getattr(out, "shape", None)
             raise DetectorError(f"model output has shape {shape}, expected {OUTPUT_SHAPE}")
-        return np.asarray(out[0], dtype=np.float32)
+        if out.dtype.kind != "f":  # an integer, complex or object output would cast silently
+            raise DetectorError(f"model output has dtype {out.dtype}, expected a float type")
+        raw = np.asarray(out[0], dtype=np.float32)
+        if not np.isfinite(raw).all():
+            raise DetectorError("model output has NaN or infinite values")
+        scores = raw[:, 4:]  # objectness, then one score per class
+        if (scores < 0).any() or (scores > 1).any():
+            raise DetectorError("model output has scores outside [0, 1]")
+        return raw
 
 
 def model_path(name: str) -> Path:
