@@ -145,7 +145,7 @@ LABEL_BACKGROUND = (0, 0, 0)
 DRY_RUN_CAMERAS = 12
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / "fixtures" / "detect"
-DRY_RUN_FIXTURES = ("people_aldgate.jpg", "umbrella_rain.jpg")
+DRY_RUN_FIXTURES = ("people_street.jpg", "umbrella_rain.jpg")
 
 
 class SpotcheckError(RuntimeError):
@@ -561,9 +561,14 @@ class ReviewDirectory:
         return gone
 
 
-def remove_stale(tmpdir: Path, max_age_s: float, now: float | None = None) -> int:
+def remove_stale(
+    tmpdir: Path, max_age_s: float, now: float | None = None, *, guard: _SignalGuard | None = None
+) -> int:
     """Delete this user's review directories in `tmpdir` that are older than `max_age_s`
-    and not locked by a running instance. Returns how many were deleted."""
+    and not locked by a running instance. Returns how many were deleted.
+
+    With `guard`, each removal is a critical step: a signal that arrives during one waits
+    until that directory is gone, so it cannot leave a half-deleted one behind."""
     now = time.time() if now is None else now
     removed = 0
     try:
@@ -581,14 +586,15 @@ def remove_stale(tmpdir: Path, max_age_s: float, now: float | None = None) -> in
             continue
         if now - st.st_mtime <= max_age_s:
             continue
-        fd = _lock(entry.path)
-        if fd is None:
-            continue  # a running instance holds it
-        try:
-            if os.fstat(fd).st_ino == st.st_ino and _rmtree(Path(entry.path)):
-                removed += 1
-        finally:
-            os.close(fd)
+        with guard.critical() if guard is not None else contextlib.nullcontext():
+            fd = _lock(entry.path)
+            if fd is None:
+                continue  # a running instance holds it
+            try:
+                if os.fstat(fd).st_ino == st.st_ino and _rmtree(Path(entry.path)):
+                    removed += 1
+            finally:
+                os.close(fd)
     return removed
 
 
@@ -1165,7 +1171,7 @@ def _run(
             reviewer = JsonFileReviewer(path)
         else:
             reviewer = KeyboardReviewer(sys.stdin.fileno())
-    removed = remove_stale(Path(tempfile.gettempdir()), args.timeout)
+    removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
     if removed:
         print(f"Deleted {removed} review directories left by earlier runs.")
     if pipeline is None:

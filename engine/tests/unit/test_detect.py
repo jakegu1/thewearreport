@@ -344,6 +344,65 @@ def test_detector_rejects_malformed_model_output(outputs: list[object]) -> None:
         detector.detect(np.zeros((288, 352, 3), dtype=np.uint8))
 
 
+def _one_person() -> np.ndarray:
+    return raw_output((anchor(32, 3, 3), PERSON, 0.9, (0, 0, 0, 0)))
+
+
+@pytest.mark.parametrize(
+    ("row", "column", "value"),
+    [
+        (anchor(8, 40, 40), 5 + CAR, np.nan),  # a class the detector does not report
+        (anchor(8, 40, 40), 4, np.inf),  # objectness
+        (anchor(16, 5, 5), 5 + PERSON, -np.inf),
+        (anchor(16, 5, 5), 0, np.nan),  # a regression output
+        (anchor(16, 5, 5), 3, np.inf),  # a log-size: decode would clamp it, but it is broken
+        (anchor(32, 9, 9), 5 + UMBRELLA, 25.0),  # a score of 25, with objectness 0
+        (anchor(32, 9, 9), 4, 1.0001),
+        (anchor(32, 9, 9), 5 + CAR, -0.0001),
+    ],
+    ids=[
+        "nan-other-class",
+        "inf-objectness",
+        "minus-inf-person",
+        "nan-regression",
+        "inf-log-size",
+        "score-25",
+        "objectness-above-one",
+        "negative-score",
+    ],
+)
+def test_detector_refuses_non_finite_or_out_of_range_output(
+    row: int, column: int, value: float
+) -> None:
+    raw = _one_person()
+    assert len(stub_detector(raw).detect(np.zeros((288, 352, 3), dtype=np.uint8))) == 1
+    raw[row, column] = value
+    with pytest.raises(detect.DetectorError):
+        stub_detector(raw).detect(np.zeros((288, 352, 3), dtype=np.uint8))
+
+
+def test_detector_accepts_scores_of_exactly_zero_and_one() -> None:
+    raw = _one_person()
+    raw[anchor(32, 9, 9), 4] = 1.0
+    raw[anchor(32, 9, 9), 5 + CAR] = 1.0
+    raw[anchor(32, 12, 12), 4:] = 0.0
+    found = stub_detector(raw).detect(np.zeros((640, 640, 3), dtype=np.uint8))
+    assert [d.label for d in found] == ["person"]
+
+
+def test_detector_drops_a_box_whose_coordinates_overflow() -> None:
+    raw = _one_person()
+    overflow = anchor(8, 20, 20)
+    raw[overflow] = 0.0
+    raw[overflow, :2] = (3e38, 3e38)  # finite, but (dx + gx) * stride overflows float32
+    raw[overflow, 4] = 1.0
+    raw[overflow, 5 + PERSON] = 0.95
+    with np.errstate(over="raise"):  # the overflow stays inside postprocess
+        found = stub_detector(raw).detect(np.zeros((640, 640, 3), dtype=np.uint8))
+    assert [round(d.score, 2) for d in found] == [0.9]
+    assert "overflow" in (detect.Detector.detect.__doc__ or "")
+
+
 def test_detector_wraps_runtime_errors() -> None:
     class Failing:
         def run(self, tensor: np.ndarray) -> Sequence[object]:
@@ -447,6 +506,46 @@ def test_open_session_refuses_oversized_models(
         detect.Detector(model)
 
 
+def test_default_logger_is_quiet_before_the_first_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[str] = []
+
+    class Input:
+        name = "images"
+        shape = (1, 3, 640, 640)
+
+    class FakeSession:
+        def __init__(self, path: bytes, sess_options: Any, providers: list[str]) -> None:
+            calls.append("session")
+
+        def get_inputs(self) -> list[Input]:
+            return [Input()]
+
+    def severity(level: int) -> None:
+        calls.append(f"severity {level}")
+
+    model = tmp_path / "yolox_s.onnx"
+    model.write_bytes(b"x")
+    monkeypatch.setitem(detect.MODEL_SHA256, "test", hashlib.sha256(b"x").hexdigest())
+    monkeypatch.setattr("wearreport.detect.ort.set_default_logger_severity", severity)
+    monkeypatch.setattr("wearreport.detect.ort.InferenceSession", FakeSession)
+    detect.Detector(model)
+    detect.Detector(model)
+    assert calls == ["severity 3", "session", "severity 3", "session"]
+
+
+def test_from_session_is_documented_as_test_only_and_used_only_by_detect() -> None:
+    doc = detect.Detector.from_session.__doc__ or ""
+    assert "tests only" in doc.lower() and "SHA-256" in doc
+    package = Path(detect.__file__).resolve().parent
+    detect_py = package / "detect.py"
+    modules = sorted(package.rglob("*.py"))
+    assert detect_py in modules and len(modules) > 5
+    users = [p for p in modules if p != detect_py and "from_session" in p.read_text("utf-8")]
+    assert users == []
+
+
 def test_pins_match_the_fetch_script() -> None:
     script = (Path(__file__).resolve().parents[3] / "scripts" / "fetch_model.sh").read_text()
     for digest in detect.MODEL_SHA256.values():
@@ -533,10 +632,23 @@ def test_model_boxes_clip_to_hostile_frame_shapes(
 
 
 def test_model_clip_on_fixture_crops(yolox_s: detect.Detector) -> None:
-    frame = np.asarray(cv2.imread(str(FIXTURES / "people_aldgate.jpg")), dtype=np.uint8)
+    frame = np.asarray(cv2.imread(str(FIXTURES / "people_street.jpg")), dtype=np.uint8)
     assert frame.ndim == 3
     for crop in (frame[:200], frame[:, :300], frame[-150:, -400:], frame[::3, ::2]):
         assert_inside(yolox_s.detect(crop), crop.shape[1], crop.shape[0])
+
+
+@pytest.mark.parametrize("name", ["people_street.jpg", "umbrella_rain.jpg"])
+def test_model_output_passes_the_checks_unchanged(yolox_s: detect.Detector, name: str) -> None:
+    """The output checks refuse only broken output: real frames give exactly what
+    postprocess makes of the raw output, as before the checks existed."""
+    frame = np.asarray(cv2.imread(str(FIXTURES / name)), dtype=np.uint8)
+    tensor, scale = detect.letterbox(frame)
+    (out, *_) = detect.open_session(_model()).run(tensor)
+    raw = np.asarray(out, dtype=np.float32)[0]
+    assert np.isfinite(raw).all() and raw[:, 4:].min() >= 0 and raw[:, 4:].max() <= 1
+    expected = detect.postprocess(raw, scale, frame.shape[1], frame.shape[0], 0.35, 0.45)
+    assert expected and yolox_s.detect(frame) == expected
 
 
 def test_model_output_is_deterministic(yolox_s: detect.Detector) -> None:

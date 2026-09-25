@@ -568,13 +568,21 @@ atexit.register(_dump_recent)
 
 
 def _run_dry_sweep_process(tmp_path: Path, prelude: str = "") -> Report:
-    """Run the real dry-sweep command under the child audit hook; report what happened."""
+    """Run the real dry-sweep command under the child audit hook; report what happened.
+
+    The child does not inherit ORT_DISABLE_TELEMETRY (this process has it, because
+    wearreport.detect sets it): the engine must switch onnxruntime's telemetry off by
+    itself, before the library loads, or the files it writes show up in the scan."""
     import subprocess
 
     work, home, tmp = tmp_path / "work", tmp_path / "home", tmp_path / "tmp"
     for d in (work, home, tmp):
         d.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("XDG_")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("XDG_") and k != detect.TELEMETRY_ENV
+    }
     env.update(HOME=str(home), TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
@@ -708,7 +716,7 @@ def test_media_kind_ignores_text_and_zeros(data: bytes) -> None:
 # blank stand-in model keeps the fetch, pre-processing and reporting path covered.
 
 REQUIRE_MODEL_ENV = "WEARREPORT_REQUIRE_MODEL"
-PEOPLE_FIXTURE = REPO_ROOT / "fixtures" / "detect" / "people_aldgate.jpg"
+PEOPLE_FIXTURE = REPO_ROOT / "fixtures" / "detect" / "people_street.jpg"
 
 
 class _BlankModel:

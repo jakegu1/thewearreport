@@ -192,6 +192,41 @@ def test_publish_refuses_a_symlinked_directory(tmp_path: Path) -> None:
     assert not (data / "status.json").exists()
 
 
+@pytest.mark.parametrize("level", [1, 2, 3, 4], ids=["sweeps", "year", "month", "day"])
+def test_publish_checks_directories_before_it_removes_temporaries(
+    tmp_path: Path, level: int
+) -> None:
+    """A temp-named file behind a symlinked sweeps/, year, month or day directory is not
+    ours: publish refuses the directory before its clean-up can reach through it."""
+    data, outside = tmp_path / "data", tmp_path / "outside"
+    data.mkdir()
+    outside.mkdir()
+    record = _record()
+    parts = publish.record_path(data, record["sweep_id"]).parent.relative_to(data).parts
+    link = data.joinpath(*parts[:level])
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+    target = outside.joinpath(*parts[level:])
+    target.mkdir(parents=True, exist_ok=True)
+    victim = target / ".20260715T1230Z.json.0123456789abcdef.tmp"
+    victim.write_text("someone else's file")
+    with pytest.raises(publish.PublishError, match="not a plain directory"):
+        publish.publish(data, record, now=T0)
+    assert victim.read_text() == "someone else's file"
+    assert _tree(data) == ["/".join(parts[:i]) for i in range(1, level + 1)]  # nothing new
+
+
+def test_publish_refuses_a_file_where_a_directory_belongs_before_cleaning(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sweeps").write_text("not a directory")
+    stale = tmp_path / ".status.json.0123456789abcdef.tmp"
+    stale.write_text("left by a killed publisher")
+    with pytest.raises(publish.PublishError, match="not a plain directory"):
+        publish.publish(tmp_path, _record(), now=T0)
+    assert stale.exists()  # nothing is cleaned in a data directory publish refuses
+
+
 def test_publish_refuses_an_existing_record_reached_through_a_symlink(tmp_path: Path) -> None:
     data, outside = tmp_path / "data", tmp_path / "outside"
     data.mkdir()
