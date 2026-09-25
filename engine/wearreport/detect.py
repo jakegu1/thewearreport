@@ -258,13 +258,25 @@ def nms(boxes: FloatArray, scores: FloatArray, threshold: float) -> list[int]:
 
 
 def postprocess(
-    raw: FloatArray, scale: float, width: int, height: int, conf: float, nms_threshold: float
+    raw: FloatArray,
+    scale: float,
+    width: int,
+    height: int,
+    conf: float,
+    nms_threshold: float,
+    *,
+    refuse_all_dropped: bool = False,
 ) -> list[Detection]:
     """Filter, suppress and map raw outputs (N x 85) to detections in a width x height frame.
 
     A row whose box or score is not finite, including a box whose decoded coordinates
-    overflow float32, is dropped. `Detector.detect` has already refused output that holds
-    NaN, infinity or scores outside [0, 1], so only the overflow case reaches here from it.
+    overflow float32, is dropped, and so is a box with no area once clipped to the frame.
+    `Detector.detect` has already refused output that holds NaN, infinity or scores outside
+    [0, 1], so only the overflow case reaches here from it.
+
+    With `refuse_all_dropped`, raise DetectorError when at least one person or umbrella row
+    reaches `conf` and every such row is dropped: a model whose confident boxes all
+    overflow or fall outside the frame is broken, and must not read as an empty frame.
     """
     with np.errstate(over="ignore", invalid="ignore"):
         class_scores = raw[:, 4:5] * raw[:, 5:]
@@ -273,10 +285,15 @@ def postprocess(
         boxes = unletterbox(decode(raw), scale, width, height)
     finite = np.isfinite(boxes).all(axis=1) & np.isfinite(best_score)
     has_area = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    # A box counts for the class with its highest score, as in the spike.
+    confident = np.isin(best_class, list(CLASS_IDS.values())) & (best_score >= conf)
+    if refuse_all_dropped and confident.any() and not (confident & finite & has_area).any():
+        raise DetectorError(
+            f"model output has {int(confident.sum())} confident boxes and none inside the frame"
+        )
     detections: list[Detection] = []
     for label, class_id in CLASS_IDS.items():
-        # A box counts for the class with its highest score, as in the spike.
-        mask = finite & has_area & (best_class == class_id) & (best_score >= conf)
+        mask = finite & has_area & confident & (best_class == class_id)
         if not mask.any():
             continue
         class_boxes, class_conf = boxes[mask], best_score[mask]
@@ -327,7 +344,9 @@ class Detector:
         DetectorError if the model returns output of an unexpected shape, any NaN or
         infinity, or an objectness or class score outside [0, 1]: such output is a broken
         model, not a frame without people. A box whose decoded coordinates overflow (a
-        finite but huge regression output) is dropped, not an error.
+        finite but huge regression output), or that has no area inside the frame, is
+        dropped; but if every person or umbrella box that reaches `conf` is dropped that
+        way, that is a broken model too, and raises DetectorError.
         """
         pixels = validate_frame(frame)
         height, width = pixels.shape[:2]
@@ -335,7 +354,7 @@ class Detector:
         del pixels
         raw = self._infer(tensor)
         del tensor
-        return postprocess(raw, scale, width, height, self.conf, self.nms)
+        return postprocess(raw, scale, width, height, self.conf, self.nms, refuse_all_dropped=True)
 
     def _infer(self, tensor: FloatArray) -> FloatArray:
         try:

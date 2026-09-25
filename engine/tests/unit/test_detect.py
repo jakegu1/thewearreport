@@ -403,6 +403,52 @@ def test_detector_drops_a_box_whose_coordinates_overflow() -> None:
     assert "overflow" in (detect.Detector.detect.__doc__ or "")
 
 
+def _confident_everywhere() -> np.ndarray:
+    """Every anchor a certain person."""
+    raw = np.zeros((N_ANCHORS, ROW), dtype=np.float32)
+    raw[:, 4] = 1.0
+    raw[:, 5 + PERSON] = 1.0
+    return raw
+
+
+@pytest.mark.parametrize("offset", [1e6, -1e30])
+def test_detector_refuses_output_whose_confident_boxes_all_leave_the_frame(
+    offset: float,
+) -> None:
+    """Finite centre offsets so far off that every confident box is clipped to no area: a
+    broken model, not a frame with 0 people."""
+    raw = _confident_everywhere()
+    raw[:, 0:2] = offset
+    frame = np.zeros((640, 640, 3), dtype=np.uint8)
+    assert detect.postprocess(raw, 1.0, 640, 640, 0.35, 0.45) == []  # all dropped
+    with pytest.raises(detect.DetectorError, match="none inside the frame"):
+        stub_detector(raw).detect(frame)
+
+
+def test_detector_refuses_output_whose_confident_boxes_all_overflow() -> None:
+    raw = _confident_everywhere()
+    raw[:, 0:2] = 3e38
+    with pytest.raises(detect.DetectorError, match="none inside the frame"):
+        stub_detector(raw).detect(np.zeros((640, 640, 3), dtype=np.uint8))
+
+
+def test_detector_keeps_the_boxes_left_when_some_confident_ones_are_dropped() -> None:
+    raw = _one_person()
+    raw[anchor(32, 10, 18)] = raw[anchor(32, 3, 3)]
+    raw[anchor(32, 10, 18), :2] = 1e6  # clipped to no area
+    found = stub_detector(raw).detect(np.zeros((640, 640, 3), dtype=np.uint8))
+    assert [round(d.score, 2) for d in found] == [0.9]
+
+
+def test_detector_ignores_dropped_rows_below_the_threshold_or_of_other_classes() -> None:
+    raw = np.zeros((N_ANCHORS, ROW), dtype=np.float32)
+    raw[:, 0:2] = 1e6
+    raw[:, 4] = 1.0
+    raw[:10, 5 + PERSON] = 0.3  # under conf 0.35
+    raw[10:, 5 + CAR] = 1.0  # not a class the detector reports
+    assert stub_detector(raw).detect(np.zeros((640, 640, 3), dtype=np.uint8)) == []
+
+
 def test_detector_wraps_runtime_errors() -> None:
     class Failing:
         def run(self, tensor: np.ndarray) -> Sequence[object]:
