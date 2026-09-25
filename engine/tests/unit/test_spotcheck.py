@@ -1120,6 +1120,115 @@ def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     assert _leftovers(tmp) == []
 
 
+# Where writes land: a full main() under an audit hook ----------------------------------
+
+CONFINED = r"""
+import os, shutil, sys, tempfile
+from pathlib import Path
+from wearreport import detect
+from wearreport.testing.fake_cameras import FakeCameraServer
+from wearreport.tools import spotcheck as sc
+
+scenario = sys.argv[1]
+# tempfile caches the temporary directory after checking it is writable by creating and
+# deleting a file there. That check is tempfile's, not the tool's: do it before the hook.
+tempfile.gettempdir()
+
+class Stub:
+    def detect(self, frame):
+        return [detect.Detection("person", 0.9, (10.0 + 40 * k, 50.0, 40.0 + 40 * k, 150.0))
+                for k in range(2)]
+
+def frames():
+    with FakeCameraServer() as server:
+        yield from sc._sweep_frames(server.cameras(3))
+
+class Scripted:
+    def judge(self, items, mode, deadline):
+        if scenario == "stray":  # a write outside the review directory
+            Path("notes.txt").write_text("judged", encoding="utf-8")
+        return {i.number: sc.Judgement(frozenset({i.boxes[0]}), frozenset(),
+                                       0 if mode == "frames" else None) for i in items}
+
+WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+EVENTS = {"os.mkdir": "write", "os.rename": "write", "os.replace": "write",
+          "os.link": "write", "os.symlink": "write", "os.truncate": "write",
+          "tempfile.mkstemp": "write", "tempfile.mkdtemp": "mkdtemp"}
+
+def report(kind, path):
+    path = os.path.abspath(os.fsdecode(path))
+    os.write(2, ("\n@@audit " + kind + " " + path + "\n").encode("utf-8", "backslashreplace"))
+
+def audit(event, args):
+    if event == "open":
+        path, mode, flags = args
+        writing = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
+            isinstance(flags, int) and flags & WRITE_FLAGS)
+        if writing and not isinstance(path, int):
+            report("write", path)
+    elif event in EVENTS and args[0] is not None:
+        report(EVENTS[event], args[0])
+
+pipeline = sc.Pipeline(frames=frames, detector=Stub(),
+                       info=sc.DetectorInfo(model="stub", sha256="0" * 64, conf=0.35))
+sys.addaudithook(audit)
+sys.exit(sc.main(sys.argv[2:], pipeline=pipeline, reviewer=Scripted()))
+"""
+
+
+def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path) -> None:
+    """Every write is inside the one review directory, or is the statistics file (or the
+    directory made for it); and the images were written there."""
+    made = [Path(path) for kind, path in events if kind == "mkdtemp"]
+    assert len(made) == 1, made
+    review = made[0]
+    assert review.name.startswith(spotcheck.TEMP_PREFIX)
+    written = [Path(path) for kind, path in events if kind == "write"]
+    stray = [p for p in written if p not in (stats_file, stats_file.parent)]
+    stray = [p for p in stray if not p.is_relative_to(review)]
+    assert stray == [], stray
+    assert [p for p in written if p.suffix == spotcheck.IMAGE_SUFFIX], "no image write seen"
+
+
+def _confined_run(tmp_path: Path, scenario: str, mode: str) -> tuple[list[tuple[str, str]], Path]:
+    work, tmp = tmp_path / "work", tmp_path / "tmp"
+    work.mkdir()
+    tmp.mkdir()
+    environ = _child_env(tmp)
+    environ["HOME"] = str(tmp_path / "home")
+    args = ["--n", "3", "--min-persons", "1", "--mode", mode, "--reviewer", "tester"]
+    args += ["--out-dir", "stats"]
+    result = subprocess.run(
+        [sys.executable, "-c", CONFINED, scenario, *args],
+        cwd=work,
+        env=environ,
+        capture_output=True,
+        timeout=WAIT_S,
+        check=False,
+    )
+    stderr = result.stderr.decode(errors="replace")
+    assert result.returncode == 0, stderr
+    assert _leftovers(tmp) == []
+    stats_file = work / "stats" / f"{datetime.date.today().isoformat()}.json"
+    assert json.loads(stats_file.read_text(encoding="utf-8"))["boxes_not_person"] > 0
+    return MARKER.findall(stderr), stats_file
+
+
+@pytest.mark.parametrize("mode", ["crops", "frames"])
+def test_full_run_writes_only_into_the_review_directory(tmp_path: Path, mode: str) -> None:
+    events, stats_file = _confined_run(tmp_path, "ok", mode)
+    _assert_writes_confined(events, stats_file)
+    images = [p for kind, p in events if kind == "write" and p.endswith(spotcheck.IMAGE_SUFFIX)]
+    assert len(images) == (6 if mode == "crops" else 3)
+
+
+def test_the_write_audit_catches_a_stray_write(tmp_path: Path) -> None:
+    events, stats_file = _confined_run(tmp_path, "stray", "crops")
+    assert (stats_file.parent.parent / "notes.txt").is_file()
+    with pytest.raises(AssertionError, match=r"notes\.txt"):
+        _assert_writes_confined(events, stats_file)
+
+
 # Runtime privacy (AC9): the real command, from interpreter start to exit --------------
 
 AUDITED = r"""
