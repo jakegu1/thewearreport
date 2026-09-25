@@ -245,3 +245,88 @@ def test_main_reports_failure_with_exit_code_1(
     assert captured.out == ""
     assert "RegistryError" not in captured.err
     assert "unavailable after 3 attempts (URLError)" in captured.err
+
+
+# Hostile responses (a sweep survives one bad entry or response) -----------------------
+
+
+@pytest.mark.parametrize("field", ["lat", "lon"])
+@pytest.mark.parametrize("value", [10**400, -(10**400), 10**309])
+def test_coordinate_too_large_for_a_float_is_malformed(field: str, value: int) -> None:
+    places = json.loads(json.dumps([_place("big", **{field: value}), _place("ok")]))
+    result = registry.parse_places(places)
+    assert [c.id for c in result.cameras] == ["ok"]
+    assert result.skipped_malformed == 1
+
+
+def test_integer_coordinates_in_range_are_kept() -> None:
+    (cam,) = registry.parse_places([_place("a", lat=-90, lon=180)]).cameras
+    assert (cam.lat, cam.lon) == (-90.0, 180.0)
+
+
+def test_deeply_nested_body_is_a_registry_error_and_not_retried() -> None:
+    calls: list[int] = []
+    body = b'[{"a": ' * 100_000 + b"1" + b"}]" * 100_000
+
+    def fetch(url: str, timeout: float) -> bytes:
+        calls.append(1)
+        return body
+
+    with pytest.raises(registry.RegistryError, match="nested too deeply"):
+        registry.list_cameras(None, fetch=fetch, sleep=_never_sleep)
+    assert calls == [1]
+
+
+def test_body_at_the_cap_is_parsed_and_over_it_is_refused() -> None:
+    cap = registry.MAX_BODY_BYTES
+    at_cap = b"[" + b" " * (cap - 2) + b"]"
+    assert registry.list_cameras(None, fetch=lambda u, t: at_cap, sleep=_never_sleep) == []
+    calls: list[int] = []
+
+    def over(url: str, timeout: float) -> bytes:
+        calls.append(1)
+        return at_cap + b" "
+
+    with pytest.raises(registry.RegistryError, match="exceeds"):
+        registry.list_cameras(None, fetch=over, sleep=_never_sleep)
+    assert calls == [1]  # a deterministic refusal is not retried
+
+
+def test_http_fetch_reads_at_most_one_byte_past_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Endless(_Response):
+        def read(self, size: int | None = -1) -> bytes:
+            assert size is not None and size > 0, "unbounded read"
+            return b" " * size
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: Endless(b""))
+    assert len(registry.http_fetch("https://example.test/x", 30)) == registry.MAX_BODY_BYTES + 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 418, 451])
+def test_client_errors_are_not_retried(status: int, caplog: pytest.LogCaptureFixture) -> None:
+    calls: list[int] = []
+
+    def fetch(url: str, timeout: float) -> bytes:
+        calls.append(1)
+        raise urllib.error.HTTPError(url, status, "no", {}, None)  # type: ignore[arg-type]
+
+    with pytest.raises(registry.RegistryError, match=f"HTTP {status}") as info:
+        registry.list_cameras("s3cr3t", fetch=fetch, sleep=_never_sleep)
+    assert calls == [1]
+    assert "s3cr3t" not in str(info.value) + caplog.text
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_rate_limit_and_server_errors_are_retried(status: int) -> None:
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    def fetch(url: str, timeout: float) -> bytes:
+        calls.append(1)
+        raise urllib.error.HTTPError(url, status, "busy", {}, None)  # type: ignore[arg-type]
+
+    with pytest.raises(registry.RegistryError, match="after 3 attempts"):
+        registry.list_cameras(None, fetch=fetch, sleep=sleeps.append)
+    assert len(calls) == 3
+    assert sleeps == [1, 2]

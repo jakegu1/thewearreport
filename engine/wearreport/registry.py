@@ -14,6 +14,7 @@ import logging
 import math
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -26,6 +27,8 @@ USER_AGENT = "wearreport-engine (+https://github.com/jakegu1/thewearreport)"
 TIMEOUT_S = 30
 MAX_ATTEMPTS = 3
 BACKOFF_S = (1, 2)  # sleep before attempts 2 and 3
+# The real response is about 1 MB; a larger body than this is refused, never parsed.
+MAX_BODY_BYTES = 16 * 1024 * 1024
 
 logger = logging.getLogger("wearreport.registry")
 
@@ -54,10 +57,14 @@ class Registry:
 
 
 def http_fetch(url: str, timeout: float) -> bytes:
-    """GET `url` with the standard library and return the body."""
+    """GET `url` with the standard library and return the body.
+
+    Reads at most MAX_BODY_BYTES + 1 bytes, so an oversized body is detected without
+    being held in memory.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        body: bytes = resp.read()
+        body: bytes = resp.read(MAX_BODY_BYTES + 1)
     return body
 
 
@@ -92,21 +99,36 @@ def _fetch_places(url: str, fetch: Fetch, sleep: Sleep) -> list[object]:
     # Error messages name the exception type only: `url` may carry the app key.
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            payload = json.loads(fetch(url, TIMEOUT_S))
-            if not isinstance(payload, list):
-                raise ValueError("response is not a JSON array")
-            return payload
+            return _decode_places(fetch(url, TIMEOUT_S))
+        except urllib.error.HTTPError as exc:
+            # A client error will not change on retry; 429 (rate limited) may.
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise RegistryError(
+                    f"JamCam registry refused the request (HTTP {exc.code})"
+                ) from None
+            error = type(exc).__name__
         except (OSError, http.client.HTTPException, ValueError) as exc:
             error = type(exc).__name__
-            if attempt == MAX_ATTEMPTS:
-                raise RegistryError(
-                    f"JamCam registry unavailable after {MAX_ATTEMPTS} attempts ({error})"
-                ) from None
-            logger.warning(
-                "jamcam registry attempt failed", extra={"attempt": attempt, "error": error}
-            )
-            sleep(BACKOFF_S[attempt - 1])
+        if attempt == MAX_ATTEMPTS:
+            raise RegistryError(
+                f"JamCam registry unavailable after {MAX_ATTEMPTS} attempts ({error})"
+            ) from None
+        logger.warning("jamcam registry attempt failed", extra={"attempt": attempt, "error": error})
+        sleep(BACKOFF_S[attempt - 1])
     raise AssertionError("unreachable")
+
+
+def _decode_places(body: bytes) -> list[object]:
+    """Parse the registry body. Raises RegistryError, without retry, for a hostile body."""
+    if len(body) > MAX_BODY_BYTES:
+        raise RegistryError(f"JamCam registry response exceeds {MAX_BODY_BYTES} bytes")
+    try:
+        payload = json.loads(body)
+    except RecursionError:
+        raise RegistryError("JamCam registry response is nested too deeply") from None
+    if not isinstance(payload, list):
+        raise ValueError("response is not a JSON array")
+    return payload
 
 
 def parse_places(places: list[object]) -> Registry:
@@ -158,7 +180,10 @@ def _camera(place: Mapping[str, object], props: Mapping[str, object]) -> Camera 
 def _coordinate(value: object, limit: float) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    if not math.isfinite(value) or abs(value) > limit:
+    # Compare before converting: float() of a huge JSON integer raises OverflowError.
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if abs(value) > limit:
         return None
     return float(value)
 
