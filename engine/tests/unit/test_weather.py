@@ -50,7 +50,7 @@ def mo_body(steps: list[dict[str, Any]]) -> bytes:
     ).encode()
 
 
-def om_body(times: list[str], temps: list[Any], offset: int = 0) -> bytes:
+def om_body(times: list[Any], temps: list[Any], offset: int = 0) -> bytes:
     hourly = {
         "time": times,
         "temperature_2m": temps,
@@ -86,7 +86,7 @@ def mo(http: FakeHttp, budget: weather.RequestBudget | None = None) -> weather.C
         AT,
         settings=cfg(METOFFICE_API_KEY=KEY),
         http_get=http,
-        budget=budget or weather.RequestBudget(10),
+        _budget=budget or weather.RequestBudget(10),
     )
 
 
@@ -148,6 +148,62 @@ def test_bad_time_string_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
 
 def test_invalid_utf8_is_rejected() -> None:
     assert mo(FakeHttp(b"\xff\xfe")) is None
+
+
+# Pathological bodies within the size cap: each must be a WeatherError, never escape.
+
+DEEP_ARRAY = b"[" * 200_000
+HUGE_INT = int("1" + "0" * 400)  # 401 digits: a valid JSON number, too large for a float
+OUT_OF_RANGE_TIME = "0001-01-01T00:00+01:00"  # before datetime.min once in UTC
+
+
+def assert_weather_error(caplog: pytest.LogCaptureFixture, result: object) -> None:
+    assert result is None
+    assert caplog.records[-1].__dict__["error_type"] == "WeatherError"
+
+
+def test_metoffice_deeply_nested_json_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, mo(FakeHttp(DEEP_ARRAY)))
+
+
+def test_metoffice_huge_integer_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    step = mo_step(datetime(2026, 3, 2, 10, 0, tzinfo=UTC), screenTemperature=HUGE_INT)
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, mo(FakeHttp(mo_body([step]))))
+
+
+def test_metoffice_out_of_range_time_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    step = mo_step(datetime(2026, 3, 2, 10, 0, tzinfo=UTC), time=OUT_OF_RANGE_TIME)
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, mo(FakeHttp(mo_body([step]))))
+
+
+def test_weather_error_has_no_cause() -> None:
+    for body in (DEEP_ARRAY, mo_body([mo_step(AT, time=OUT_OF_RANGE_TIME)])):
+        with pytest.raises(weather.WeatherError) as info:
+            weather.parse_metoffice(body, AT)
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+    with pytest.raises(weather.WeatherError) as info:
+        weather.parse_metoffice(mo_body([mo_step(AT, screenTemperature=HUGE_INT)]), AT)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"a":' * 100_000, id="deep-object"),
+        pytest.param(mo_body([mo_step(AT, screenTemperature=1e999)]), id="exponent-inf"),
+        pytest.param(mo_body([mo_step(AT)]).replace(b"8.0", b"1e400"), id="exponent-literal"),
+        pytest.param(mo_body([mo_step(AT, time="9999-12-31T23:59-01:00")]), id="after-max"),
+        pytest.param(mo_body([mo_step(AT, time=12)]), id="numeric-time"),
+        pytest.param(mo_body([mo_step(AT, time=None)]), id="null-time"),
+        pytest.param(mo_body([mo_step(AT, time=["2026"])]), id="array-time"),
+        pytest.param(b"[" * 200_000 + b"]" * 200_000, id="deep-closed-array"),
+    ],
+)
+def test_metoffice_other_pathological_bodies_are_none(body: bytes) -> None:
+    assert mo(FakeHttp(body)) is None
 
 
 # Retry policy and request cap -------------------------------------------------------
@@ -216,7 +272,7 @@ def test_settings_default_to_process_environment(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("WEARREPORT_ENV", "test")
     monkeypatch.setenv("WEARREPORT_DEV_WEATHER", "openmeteo")
     http = FakeHttp(om_body(["2026-03-02T10:00"], [6.5]))
-    result = weather.current_conditions(AT, http_get=http, budget=weather.RequestBudget(10))
+    result = weather.current_conditions(AT, http_get=http, _budget=weather.RequestBudget(10))
     assert result is not None and result.source == "openmeteo"
 
 
@@ -228,7 +284,7 @@ def om(body: bytes) -> weather.Conditions | None:
         AT,
         settings=cfg(WEARREPORT_DEV_WEATHER="openmeteo"),
         http_get=FakeHttp(body),
-        budget=weather.RequestBudget(10),
+        _budget=weather.RequestBudget(10),
     )
 
 
@@ -238,7 +294,7 @@ def test_openmeteo_request_asks_for_utc_hourly_fields() -> None:
         AT,
         settings=cfg(WEARREPORT_DEV_WEATHER="openmeteo"),
         http_get=http,
-        budget=weather.RequestBudget(10),
+        _budget=weather.RequestBudget(10),
     )
     query = parse_qs(urlsplit(http.urls[0]).query)
     assert query["timezone"] == ["UTC"]
@@ -259,6 +315,36 @@ def test_openmeteo_non_utc_response_is_rejected() -> None:
 
 def test_openmeteo_no_step_within_30_minutes_is_none() -> None:
     assert om(om_body(["2026-03-02T11:00"], [6.5])) is None
+
+
+def test_openmeteo_deeply_nested_json_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, om(DEEP_ARRAY))
+
+
+def test_openmeteo_huge_integer_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, om(om_body(["2026-03-02T10:00"], [HUGE_INT])))
+
+
+def test_openmeteo_out_of_range_time_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="wearreport.weather"):
+        assert_weather_error(caplog, om(om_body([OUT_OF_RANGE_TIME], [6.5])))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b'{"a":' * 100_000, id="deep-object"),
+        pytest.param(om_body(["2026-03-02T10:00"], [1e999]), id="exponent-inf"),
+        pytest.param(om_body(["9999-12-31T23:59-01:00"], [6.5]), id="after-max"),
+        pytest.param(om_body(["0001-01-01T00:00"], [6.5]), id="naive-min"),
+        pytest.param(om_body([1_700_000_000], [6.5]), id="numeric-time"),
+        pytest.param(om_body([None], [6.5]), id="null-time"),
+    ],
+)
+def test_openmeteo_other_pathological_bodies_are_none(body: bytes) -> None:
+    assert om(body) is None
 
 
 # Default HTTP function --------------------------------------------------------------

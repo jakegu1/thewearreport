@@ -58,6 +58,8 @@ class Conditions:
     source: Source
 
 
+# Messages are logged as `detail`, so they must never contain request or response data
+# (URLs, headers, body text or values): only constants and field names.
 class WeatherError(Exception):
     """A provider response could not be used. Messages never contain credentials."""
 
@@ -155,9 +157,13 @@ def _number(row: Mapping[str, Any], name: str) -> float:
     value = row.get(name)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise WeatherError(f"missing or non-numeric field: {name}")
-    if not math.isfinite(value):
+    try:
+        number = float(value)
+    except OverflowError:  # an int too large for a float
+        raise WeatherError(f"non-finite field: {name}") from None
+    if not math.isfinite(number):
         raise WeatherError(f"non-finite field: {name}")
-    return float(value)
+    return number
 
 
 def _mapping(value: object, what: str) -> Mapping[str, Any]:
@@ -180,7 +186,10 @@ def _utc_time(raw: object, what: str) -> datetime:
     except ValueError:
         raise WeatherError(f"unparseable time: {what}") from None
     # Open-Meteo returns naive times in the requested zone, which is UTC.
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    try:
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except OverflowError:  # e.g. 0001-01-01T00:00+01:00 falls before datetime.min
+        raise WeatherError(f"time out of range: {what}") from None
 
 
 def _nearest(times: Sequence[datetime], at: datetime) -> int | None:
@@ -198,7 +207,7 @@ def _nearest(times: Sequence[datetime], at: datetime) -> int | None:
 def _decode(body: bytes) -> object:
     try:
         return json.loads(body)
-    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+    except (ValueError, RecursionError) as exc:  # also UnicodeDecodeError, deep nesting
         raise WeatherError(f"invalid JSON ({type(exc).__name__})") from None
 
 
@@ -314,13 +323,15 @@ def current_conditions(
     *,
     settings: Settings | None = None,
     http_get: HttpGet = urllib_get,
-    budget: RequestBudget | None = None,
+    _budget: RequestBudget | None = None,
 ) -> Conditions | None:
     """Conditions in central London at the forecast time step nearest `at`.
 
     Returns None when no provider is configured, when no step is within 30 minutes,
     when the request cap is spent, or on any provider error. Raises ValueError for a
     naive `at`, and WeatherConfigError for the dev flag in production.
+
+    `_budget` is for tests only; production always counts against the process cap.
     """
     if at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("at must be timezone-aware")
@@ -328,7 +339,8 @@ def current_conditions(
     if provider is None:
         return None
     try:
-        return provider.fetch(at.astimezone(UTC), budget if budget is not None else _PROCESS_BUDGET)
+        budget = _budget if _budget is not None else _PROCESS_BUDGET
+        return provider.fetch(at.astimezone(UTC), budget)
     except WeatherError as exc:
         logger.warning(
             "weather response unusable",
