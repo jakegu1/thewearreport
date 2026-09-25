@@ -366,10 +366,16 @@ def render(samples: Sequence[Sample], mode: Mode) -> list[ReviewItem]:
 
 class _SignalGuard:
     """Turn signals and the review alarm into exceptions, except inside `critical()`,
-    where they wait until the critical step is done."""
+    where they wait until the critical step is done.
+
+    One-shot: once one signal (or the alarm) has been raised, or `stop()` has been
+    called, every later signal is dropped, so nothing can interrupt the clean-up that
+    the first one starts.
+    """
 
     def __init__(self) -> None:
         self._depth = 0
+        self._stopping = False
         self._pending: BaseException | None = None
         self._previous: dict[int, object] = {}
         self._installed = False
@@ -377,14 +383,18 @@ class _SignalGuard:
     def install(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return  # signal handlers can only be set from the main thread
+        self._installed = True
         for signum in (*HANDLED_SIGNALS, signal.SIGALRM):
             self._previous[signum] = signal.signal(signum, self._handle)
-        self._installed = True
+
+    def stop(self) -> None:
+        """From here on, drop every signal: the tool is on its way out."""
+        self._stopping = True
 
     def restore(self) -> None:
         if not self._installed:
             return
-        self._depth += 1  # from here on, a signal is dropped: the work is done
+        self._stopping = True
         signal.setitimer(signal.ITIMER_REAL, 0)
         for signum, handler in self._previous.items():
             signal.signal(signum, handler)  # type: ignore[arg-type]
@@ -397,6 +407,8 @@ class _SignalGuard:
             signal.setitimer(signal.ITIMER_REAL, seconds)
 
     def _handle(self, signum: int, frame: FrameType | None) -> None:
+        if self._stopping:
+            return
         exc: BaseException = (
             ReviewTimeout("the review timed out")
             if signum == signal.SIGALRM
@@ -406,6 +418,7 @@ class _SignalGuard:
             if self._pending is None:
                 self._pending = exc
             return
+        self._stopping = True  # before raising: no later signal may interrupt clean-up
         raise exc
 
     @contextlib.contextmanager
@@ -417,7 +430,9 @@ class _SignalGuard:
             self._depth -= 1
             if not self._depth and self._pending is not None:
                 exc, self._pending = self._pending, None
-                raise exc
+                if not self._stopping:
+                    self._stopping = True
+                    raise exc
 
 
 def _lock(path: str | Path) -> int | None:
@@ -997,6 +1012,13 @@ def _check_out_dir(out_dir: Path) -> None:
         raise SpotcheckError(f"cannot write statistics into {out_dir}")
 
 
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
 def _print_numbering(workdir: Path, items: Sequence[ReviewItem]) -> None:
     print(f"Review directory (deleted when this tool exits): {workdir}")
     for item in items:
@@ -1031,8 +1053,15 @@ def _review(
         except JudgementError as exc:
             raise SpotcheckError(f"the reviewer returned an invalid judgement: {exc}") from None
     finally:
-        with guard.critical():
-            directory.remove()
+        # A signal can land before critical() has begun. The guard raises only the
+        # first one, so the second attempt cannot be interrupted.
+        try:
+            with guard.critical():
+                directory.remove()
+        except (Interrupted, ReviewTimeout):
+            with guard.critical():
+                directory.remove()
+            raise
 
 
 def _run(
@@ -1103,11 +1132,16 @@ def main(
         return 2
     args = build_parser().parse_args(argv)
     guard = _SignalGuard()
-    guard.install()
     try:
-        return _run(args, pipeline, reviewer, today or datetime.date.today(), guard)
+        try:
+            guard.install()
+            return _run(args, pipeline, reviewer, today or datetime.date.today(), guard)
+        finally:
+            # Nothing may interrupt the handlers below. A signal that lands before
+            # stop() is raised here, is the last one raised, and is caught below.
+            guard.stop()
     except Interrupted as exc:
-        name = signal.Signals(exc.signum).name
+        name = _signal_name(exc.signum)
         print(f"spotcheck: stopped by {name}; no statistics written", file=sys.stderr)
         return 128 + exc.signum
     except ReviewTimeout:

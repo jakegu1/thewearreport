@@ -487,6 +487,51 @@ def test_signal_handlers_are_restored(env: Path, tmp_path: Path) -> None:
     assert {s: signal.getsignal(s) for s in before} == before
 
 
+def _deliver(signum: int) -> None:
+    os.kill(os.getpid(), signum)
+    time.sleep(0.05)  # the Python-level handler runs at the latest here
+
+
+def test_signal_guard_raises_only_the_first_signal() -> None:
+    guard = spotcheck._SignalGuard()
+    guard.install()
+    try:
+        with pytest.raises(spotcheck.Interrupted) as raised:
+            _deliver(signal.SIGINT)
+        assert raised.value.signum == signal.SIGINT
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGALRM):
+            _deliver(signum)  # dropped: clean-up is under way
+        with guard.critical():
+            _deliver(signal.SIGTERM)
+        # and nothing is held back to be raised later
+    finally:
+        guard.restore()
+
+
+def test_signal_guard_holds_a_signal_inside_critical_then_latches() -> None:
+    guard = spotcheck._SignalGuard()
+    guard.install()
+    try:
+        with pytest.raises(spotcheck.Interrupted) as raised, guard.critical():
+            _deliver(signal.SIGTERM)
+            _deliver(signal.SIGINT)
+        assert raised.value.signum == signal.SIGTERM  # the first one, once done
+        _deliver(signal.SIGHUP)  # dropped
+    finally:
+        guard.restore()
+
+
+def test_signal_guard_stop_drops_every_signal() -> None:
+    guard = spotcheck._SignalGuard()
+    guard.install()
+    try:
+        guard.stop()
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
+            _deliver(signum)
+    finally:
+        guard.restore()
+
+
 def test_encoding_failure_while_writing_leaves_nothing(
     env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -727,6 +772,42 @@ elif scenario == "stats_fail":
     def full(*args, **kwargs):
         raise OSError(28, "No space left on device")
     sc._write_new = full
+elif scenario.startswith("at_cleanup:"):
+    # at_cleanup:<first>:<burst>. The reviewer is stopped by <first> ("-": it returns),
+    # then each burst signal is sent to this process every time critical() is called
+    # from then on, so it lands as clean-up starts, before critical() can defer it.
+    _, first, burst = scenario.split(":")
+    burst = [getattr(signal, name) for name in burst.split(",")]
+    reviewing = []
+    class Stopped(Ok):
+        def judge(self, items, mode, deadline):
+            reviewing.append(True)
+            if first != "-":
+                kill_self(getattr(signal, first))
+            return super().judge(items, mode, deadline)
+    reviewer = Stopped()
+    real_critical = sc._SignalGuard.critical
+    def critical(self):
+        if reviewing:
+            for signum in burst:
+                os.kill(os.getpid(), signum)
+        return real_critical(self)
+    sc._SignalGuard.critical = critical
+elif scenario == "signal_in_handler":
+    def full(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+    sc._write_new = full
+    class Stderr:
+        def __init__(self, real):
+            self.real, self.sent = real, False
+        def write(self, text):
+            if not self.sent:
+                self.sent = True
+                kill_self(signal.SIGTERM)
+            return self.real.write(text)
+        def flush(self):
+            self.real.flush()
+    sys.stderr = Stderr(sys.stderr)
 sys.exit(sc.main(sys.argv[3:], pipeline=pipeline, reviewer=reviewer))
 """
 
@@ -805,15 +886,57 @@ def test_child_other_signals_while_waiting(tmp_path: Path, signum: signal.Signal
     assert not workdir.exists() and _leftovers(tmp) == []
 
 
-def test_child_repeated_signals_still_clean_up(tmp_path: Path) -> None:
-    args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
-    proc, tmp = _spawn(tmp_path, "json", args)
-    workdir = _wait_for_review(tmp, proc)
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        proc.send_signal(signum)  # a no-op once the process has exited
+@pytest.mark.parametrize(
+    ("scenario", "code"),
+    [
+        # One signal as clean-up starts, after a normal review.
+        ("at_cleanup:-:SIGTERM", 128 + signal.SIGTERM),
+        # Ctrl-C, then more signals as clean-up starts: the first one decides the exit.
+        ("at_cleanup:SIGINT:SIGTERM,SIGINT,SIGHUP", 128 + signal.SIGINT),
+        ("at_cleanup:-:SIGHUP,SIGTERM,SIGINT", 128 + signal.SIGHUP),
+    ],
+)
+def test_child_signals_as_cleanup_starts_still_clean_up(
+    tmp_path: Path, scenario: str, code: int
+) -> None:
+    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1"])
     returncode, output = _finish(proc)
-    assert returncode != 0, output
-    assert not workdir.exists() and _leftovers(tmp) == []
+    assert returncode == code, output
+    assert "Traceback" not in output
+    assert _leftovers(tmp) == []
+    assert not (tmp_path / "out").exists()
+
+
+def test_child_signal_while_reporting_an_error(tmp_path: Path) -> None:
+    proc, tmp = _spawn(tmp_path, "signal_in_handler", ["--n", "2", "--min-persons", "1"])
+    returncode, output = _finish(proc)
+    assert returncode == 1, output
+    assert "No space left" in output and "Traceback" not in output
+    assert _leftovers(tmp) == []
+
+
+STRESS_RUNS = 20
+BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def test_child_repeated_signals_stress(tmp_path: Path) -> None:
+    """INT, TERM, INT, HUP back to back while the review is open, in many processes."""
+    runs = []
+    for k in range(STRESS_RUNS):
+        base = tmp_path / f"run{k}"
+        base.mkdir()
+        args = ["--n", "2", "--min-persons", "1", "--judgements", str(base / "j.json")]
+        runs.append((base, *_spawn(base, "json", args)))
+    for _base, proc, tmp in runs:
+        _wait_for_review(tmp, proc)
+        for signum in BURST:
+            proc.send_signal(signum)  # a no-op once the process has exited
+    for base, proc, tmp in runs:
+        returncode, output = _finish(proc)
+        # Pending signals are delivered lowest number first, so any of them may win.
+        assert returncode in {128 + s for s in BURST}, output
+        assert "Traceback" not in output
+        assert _leftovers(tmp) == [], base
 
 
 def test_child_parser_exception_while_polling(tmp_path: Path) -> None:
