@@ -29,6 +29,8 @@ class Settings:
     tfl_app_key: str | None = field(repr=False)
     metoffice_api_key: str | None = field(repr=False)
     nws_user_agent: str | None
+    # Development-only weather source; the only accepted value is "openmeteo".
+    dev_weather: str | None = None
 
 
 def _optional(environ: Mapping[str, str], name: str) -> str | None:
@@ -47,6 +49,20 @@ def _environment(environ: Mapping[str, str]) -> Environment:
         raise SettingsError(f"WEARREPORT_ENV must be one of: {allowed}") from None
 
 
+DEV_WEATHER_SOURCES = ("openmeteo",)
+
+
+def _dev_weather(environ: Mapping[str, str]) -> str | None:
+    raw = _optional(environ, "WEARREPORT_DEV_WEATHER")
+    if raw is None:
+        return None
+    value = raw.lower()
+    if value not in DEV_WEATHER_SOURCES:
+        allowed = ", ".join(DEV_WEATHER_SOURCES)
+        raise SettingsError(f"WEARREPORT_DEV_WEATHER must be empty or one of: {allowed}")
+    return value
+
+
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """Build settings from `environ` (defaults to the process environment)."""
     env = os.environ if environ is None else environ
@@ -55,4 +71,5 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         tfl_app_key=_optional(env, "TFL_APP_KEY"),
         metoffice_api_key=_optional(env, "METOFFICE_API_KEY"),
         nws_user_agent=_optional(env, "NWS_USER_AGENT"),
+        dev_weather=_dev_weather(env),
     )
