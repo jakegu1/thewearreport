@@ -274,10 +274,14 @@ def test_ac8_env_example_lists_every_variable_empty_with_comment() -> None:
     assert all(ln.endswith("=") for ln in assigned), "no values in .env.example"
 
 
-def test_ac8_fixture_licenses_table_exists_and_is_empty() -> None:
+def test_ac8_fixture_licenses_table_rows_are_complete() -> None:
     text = (ROOT / "fixtures" / "LICENSES.md").read_text()
     rows = [ln for ln in text.splitlines() if ln.strip().startswith("|")]
-    assert len(rows) == 2, "header and separator only"
+    assert len(rows) >= 2, "header and separator"
     header = [c.strip().lower() for c in rows[0].strip().strip("|").split("|")]
     assert header == ["source", "license", "file"]
     assert set(rows[1].replace("|", "").strip()) <= {"-", ":", " "}
+    for row in rows[2:]:
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        assert len(cells) == 3 and all(cells), f"incomplete row: {row}"
+        assert (ROOT / cells[2]).is_file(), f"listed file does not exist: {cells[2]}"

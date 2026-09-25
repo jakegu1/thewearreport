@@ -6,3 +6,4 @@ allowed.
 
 | Source | License | File |
 |---|---|---|
+| TfL Open Data (metadata only) | TfL open data terms (attribution: "Powered by TfL Open Data") | engine/tests/fixtures/jamcam_places.json |
