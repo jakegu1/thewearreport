@@ -14,7 +14,7 @@ You may copy, redistribute and adapt them, including commercially, as long as yo
 credit. Suggested credit:
 
 > Source: The Wear Report, aggregate observations from London traffic cameras.
-> Powered by TfL Open Data. Contains Met Office data.
+> Powered by TfL Open Data. Powered by Met Office data.
 
 Please link to the project where possible.
 
@@ -26,7 +26,7 @@ their attribution when you reuse the data:
 | Source | Attribution | Terms |
 |---|---|---|
 | Transport for London JamCam feed | "Powered by TfL Open Data" | TfL transport data terms |
-| Met Office Weather DataHub | "Contains Met Office data" | Met Office DataHub terms |
+| Met Office Weather DataHub | "Powered by Met Office data" | Met Office DataHub terms |
 | US National Weather Service | Credit the National Weather Service | Public domain (US Government) |
 
 No camera images or crops are published, so none are licensed.

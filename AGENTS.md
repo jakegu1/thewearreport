@@ -67,7 +67,8 @@ permissively licensed images, and record the source and license of each in
 `fixtures/LICENSES.md`.
 
 **INV-5 Attribution.** Published data carries "Powered by TfL Open Data" and
-"Contains Met Office data" (and NWS credit where used).
+"Powered by Met Office data" (and NWS credit where used). Both are the exact statements
+the providers' terms ask for.
 
 **INV-6 Honesty.** Never fabricate, impute or pad observations. Every published figure
 must be traceable to the sweep records it came from.
