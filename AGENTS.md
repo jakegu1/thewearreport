@@ -52,7 +52,9 @@ implement face detection, face recognition, re-identification, or tracking of in
 across frames. Publish aggregates only.
 
 **INV-2 Licenses.** Runtime dependencies must be permissively licensed (MIT, BSD,
-Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, CC0). No AGPL, GPL, SSPL, BUSL or non-commercial
+Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, Zlib, CC0). The exact list is `ALLOWED_SPDX` in
+`scripts/license_check.py`. Only an OSI-approved permissive licence may be added to it, and
+only with a justification in the PR. No AGPL, GPL, SSPL, BUSL or non-commercial
 licenses. In particular **`ultralytics` must never be a dependency** (AGPL-3.0). Data
 sources are limited to TfL, the Met Office and the US National Weather Service.
 Open-Meteo may be used only in local development and tests behind an explicit flag,
