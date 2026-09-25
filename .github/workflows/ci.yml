@@ -18,7 +18,10 @@ concurrency:
 jobs:
   python:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
+    env:
+      # Model-dependent tests fail, instead of skipping, when the model is missing.
+      WEARREPORT_REQUIRE_MODEL: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -29,6 +32,8 @@ jobs:
           enable-cache: false
       - name: Install dependencies
         run: uv sync --locked
+      - name: Fetch the YOLOX-s model (SHA-256 verified)
+        run: sh scripts/fetch_model.sh
       - name: ruff check
         run: uv run --locked ruff check engine scripts
       - name: ruff format --check
@@ -43,6 +48,8 @@ jobs:
         run: uv run --locked python scripts/license_check.py
       - name: Privacy guard
         run: uv run --locked python scripts/privacy_guard.py
+      - name: Detector latency (information only)
+        run: uv run --locked python -m wearreport.benchmark --synthetic 20
 
   secrets:
     runs-on: ubuntu-24.04
