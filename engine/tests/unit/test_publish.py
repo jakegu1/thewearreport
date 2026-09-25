@@ -235,6 +235,18 @@ def test_publish_replaces_status_but_keeps_records(tmp_path: Path) -> None:
     assert json.loads(second.status_path.read_bytes())["sweeps_24h"] == 2
 
 
+@pytest.mark.parametrize("call", ["open", "mkdir"])
+def test_publish_turns_os_errors_into_publish_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, call, refuse)
+    with pytest.raises(publish.PublishError, match="Permission denied"):
+        publish.publish(tmp_path, _record(), now=T0)
+
+
 def test_publish_fails_loudly_when_status_cannot_be_written(tmp_path: Path) -> None:
     (tmp_path / "status.json").mkdir()
     with pytest.raises(publish.PublishError):

@@ -157,9 +157,15 @@ def _data_root(data_dir: Path) -> Path:
 @contextlib.contextmanager
 def _locked(root: Path) -> Iterator[None]:
     """An exclusive flock on the data directory; released when the block exits."""
-    fd = os.open(root, os.O_RDONLY)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fd = os.open(root, os.O_RDONLY)
+    except OSError as exc:
+        raise PublishError(f"cannot open the data directory: {exc.strerror}") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise PublishError(f"cannot lock the data directory: {exc.strerror}") from None
         yield
     finally:
         os.close(fd)  # closing the descriptor releases the lock
@@ -179,8 +185,12 @@ def _make_dirs(root: Path, directory: Path) -> None:
     current = root
     for part in directory.relative_to(root).parts:
         current = current / part
-        with contextlib.suppress(FileExistsError):
+        try:
             os.mkdir(current)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise PublishError(f"cannot create {part}: {exc.strerror}") from None
         if not _is_real_dir(current):
             raise PublishError(f"{current.relative_to(root)} is not a plain directory")
 
