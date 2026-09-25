@@ -51,6 +51,5 @@ public-guard: ## Private-material guard, working tree and history (INV-9)
 	python3 tools/public_guard.py
 	python3 tools/public_guard.py --history
 
-sweep-dry: ## One sweep against a local fake camera server (not implemented yet)
-	@echo "sweep-dry: no sweep exists yet; a later task adds it" >&2
-	@exit 1
+sweep-dry: ## One sweep against a local fake camera server (no network)
+	$(RUN) python -m wearreport.fetch --dry-run

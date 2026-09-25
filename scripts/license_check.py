@@ -7,7 +7,7 @@ extra requested along the way, and reads each package's licence from its metadat
 this order: License-Expression (SPDX), then licence classifiers, then the legacy
 License field. A package passes only if its licence is on the allowlist:
 
-  MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF, MPL-2.0, CC0
+  MIT, BSD-2-Clause, BSD-3-Clause, 0BSD, Apache-2.0, ISC, PSF, MPL-2.0, CC0, Zlib
 
 Other BSD variants (e.g. BSD-Protection, BSD-3-Clause-No-Nuclear-*) are rejected.
 
@@ -50,6 +50,7 @@ ALLOWED_SPDX = frozenset(
         "BSD-2-Clause",
         "BSD-3-Clause",
         "CC0-1.0",
+        "Zlib",
     }
 )
 
