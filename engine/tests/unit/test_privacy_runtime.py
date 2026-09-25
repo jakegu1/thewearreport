@@ -498,6 +498,8 @@ def test_sweep_creates_no_files_and_no_image_bytes(
 # The child's audit hook. It is installed before any engine module is imported and stays
 # installed until the interpreter exits; each event is written straight to fd 2, so events
 # from atexit callbacks and shutdown are reported as well. It never opens a file.
+# It also reports an escape if onnxruntime is first imported without
+# ORT_DISABLE_TELEMETRY=1.
 CHILD = r"""
 import os, sys
 
@@ -511,8 +513,20 @@ def report(kind, text):
     os.write(2, ("\n@@privacy " + kind + " " + text.replace("\n", " ") + "\n").encode(
         "utf-8", "backslashreplace"))
 
+ort_imported = []
+
 def audit(event, args):
-    if event == "open":
+    if event == "import":
+        # onnxruntime's first import: its telemetry is off only if ORT_DISABLE_TELEMETRY
+        # is exactly "1" at this moment. Checked here, on every host, rather than through
+        # the files onnxruntime writes on some hosts only. Never imports onnxruntime.
+        name = args[0]
+        if not ort_imported and (name == "onnxruntime" or name.startswith("onnxruntime.")):
+            value = os.environ.get("ORT_DISABLE_TELEMETRY")
+            ort_imported.append(value)
+            if value != "1":
+                report("escape", f"onnxruntime imported with ORT_DISABLE_TELEMETRY={value!r}")
+    elif event == "open":
         path, mode, flags = args
         writing = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
             isinstance(flags, int) and flags & WRITE_FLAGS)
@@ -626,6 +640,27 @@ def test_dry_sweep_process_catches_an_atexit_writer(tmp_path: Path) -> None:
     assert report.created == []  # invisible to the directory scan
     with pytest.raises(AssertionError):
         report.assert_clean()
+
+
+TELEMETRY_ESCAPE = "escape: onnxruntime imported with ORT_DISABLE_TELEMETRY=None"
+
+
+def test_child_hook_reports_onnxruntime_imported_without_the_telemetry_variable(
+    tmp_path: Path,
+) -> None:
+    """Control: the child does not inherit the variable, so importing onnxruntime before
+    the engine does must be reported, on any host (whether or not files are written)."""
+    report = _run_dry_sweep_process(tmp_path, "import onnxruntime\n")
+    assert TELEMETRY_ESCAPE in report.escapes, report.escapes
+    with pytest.raises(AssertionError):
+        report.assert_clean()
+
+
+def test_child_hook_accepts_onnxruntime_imported_by_the_engine(tmp_path: Path) -> None:
+    """The engine sets the variable before it imports onnxruntime: nothing is reported."""
+    report = _run_dry_sweep_process(tmp_path, "from wearreport import detect\n")
+    assert not any("onnxruntime" in e for e in report.escapes), report.escapes
+    report.assert_clean()
 
 
 def test_child_hook_reports_writes_after_the_sweep(tmp_path: Path) -> None:
