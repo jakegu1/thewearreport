@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -586,6 +587,88 @@ def test_exemption_is_one_constant_and_not_the_allowlist() -> None:
 )
 def test_no_other_module_may_use_the_exempt_one(path: str, source: str) -> None:
     assert _messages(source, path)
+
+
+# Every reproduction from the adversarial review of T-008, and variants.
+TOOLS_DIR = "from pathlib import Path\nd = Path(__file__).parent / 'tools'\n"
+INDIRECT_USES = [
+    # String constants naming it, wherever they are.
+    "import importlib\nimportlib.import_module('.spotcheck', 'wearreport.tools')\n",
+    "__import__('wearreport.tools', fromlist=['spotcheck'])\n",
+    "from . import tools\ngetattr(tools, 'spotcheck')\n",
+    "import sys\nsys.modules['wearreport.tools.spotcheck']\n",
+    "import sys\nm = sys.modules.get('wearreport.tools.SpotCheck')\n",
+    "names = ['wearreport', 'tools', 'spotcheck']\n",
+    "p = Path(d) / 'tools' / 'spotcheck.py'\n",
+    "key = b'spotcheck'\n",
+    "f'wearreport.tools.{x}spotcheck'\n",
+    # Dynamic loaders with a computed argument.
+    "import importlib\nimportlib.import_module('wearreport.tools.' + 'spot' + 'check')\n",
+    "import importlib\nimportlib.import_module(f'wearreport.tools.{name}')\n",
+    "import importlib\nimportlib.import_module('.'.join(parts))\n",
+    "from importlib import import_module as im\nim(name)\n",
+    "__import__(name)\n",
+    "import builtins\nbuiltins.__import__(name)\n",
+    "import importlib\nimportlib.__import__(name)\n",
+    "import runpy\nrunpy.run_path(str(d / name))\n",
+    "import runpy\nrunpy.run_module(name)\n",
+    TOOLS_DIR + "import runpy\nrunpy.run_path(str(d / name))\n",
+    TOOLS_DIR + "import importlib.util\nimportlib.util.spec_from_file_location('m', d / n)\n",
+    "from importlib import util\nspec = util.find_spec(name)\n",
+    "import importlib.util\nm = importlib.util.module_from_spec(spec)\n",
+    "spec.loader.exec_module(m)\n",
+    TOOLS_DIR + "exec(compile((d / n).read_text(), 'x', 'exec'))\n",
+    "exec(source)\n",
+    "eval(source)\n",
+    "import pkgutil\nfrom . import tools\n"
+    "for m in pkgutil.iter_modules(tools.__path__):\n    __import__(m.name)\n",
+]
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        (MODULE, "from . import tools\ntools.spotcheck.ReviewDirectory().write_image(i)\n"),
+        (MODULE, "from . import tools as t\nt.spotcheck.ReviewDirectory\n"),
+        ("engine/wearreport/testing/x.py", "from .. import tools\ntools.spotcheck.main()\n"),
+        ("engine/wearreport/testing/x.py", "from ..tools import spotcheck as s\ns.main()\n"),
+    ],
+)
+def test_access_through_a_relatively_imported_package_is_flagged(path: str, source: str) -> None:
+    assert _messages(source, path)
+
+
+@pytest.mark.parametrize("source", INDIRECT_USES)
+def test_indirect_and_dynamic_uses_of_the_exempt_module_are_flagged(source: str) -> None:
+    for path in (MODULE, "engine/wearreport/tools/other.py", "engine/wearreport/tools/__init__.py"):
+        assert _messages(source, path), (path, source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import importlib\nimportlib.import_module('json')\n",
+        "__import__('json')\n",
+        "import re\nre.compile(pattern)\n",
+        "from re import compile\ncompile(pattern)\n",
+        "exec('x = 1')\n",
+        "x = 'spot-check'\n",
+        "from .fetch import fetch_sweep\nfetch_sweep(cameras)\n",
+    ],
+)
+def test_literal_loads_and_unrelated_names_are_not_flagged(source: str) -> None:
+    assert _messages(source, MODULE) == []
+
+
+def test_relative_aliases_resolve_to_the_package() -> None:
+    tree = ast.parse("from . import tools\nfrom ..x import y as z\nfrom .a.b import c\n")
+    aliases = privacy_guard._aliases(tree, ("wearreport", "tools"))
+    assert aliases == {
+        "tools": "wearreport.tools.tools",
+        "z": "wearreport.x.y",
+        "c": "wearreport.tools.a.b.c",
+    }
+    assert privacy_guard._aliases(ast.parse("from ... import x\n"), ("wearreport",)) == {}
 
 
 @pytest.mark.parametrize(

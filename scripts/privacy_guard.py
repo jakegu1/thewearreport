@@ -49,10 +49,14 @@ default. Parses every Python file under engine/ (except engine/tests/) and flags
      cv2.imwrite`, `getattr(cv2, "imwrite")`), since the call itself is then hidden;
      and `from ... import *`, which hides where names come from. shutil.make_archive()
      is a binary write (rule 3)
- 10. outside the exempt module below: importing it, from any engine module (absolute or
-     relative imports, and attribute access through its package), and call arguments
-     that are string literals naming it (importlib.import_module, runpy), so its
-     exemption cannot be borrowed by another module
+ 10. outside the exempt module below, so that its exemption cannot be borrowed by
+     another module: importing it (absolute or relative imports, and attribute access
+     through its package, also when the package itself was imported relatively); any
+     string or bytes constant that contains its file stem, case-insensitively, wherever
+     it appears (a call argument, a subscript such as sys.modules[...], a list item, a
+     path segment); and the dynamic loaders (DYNAMIC_LOADERS and runpy.*: import_module,
+     __import__, spec_from_file_location, exec, compile...) called with any argument
+     that is not a literal, since the module they load cannot then be seen
 
 Image-write exemption: the spot-check tool (AGENTS.md INV-1 exception (c)) renders
 detections into a temporary directory it creates and always deletes. Its repository-
@@ -219,9 +223,26 @@ def _package_path(path: str) -> tuple[str, ...] | None:
     return parts[1:]
 
 
-# Rule 10: the exempt module's dotted name and its path as a string literal may name it.
+# Rule 10: the exempt module's dotted name, and the file stem that a string may not hold.
 EXEMPT_MODULE = ".".join(_package_path(IMAGE_WRITE_EXEMPTION) or ())
-EXEMPT_FILE_TAIL = IMAGE_WRITE_EXEMPTION.removeprefix("engine/")
+EXEMPT_STEM = PurePosixPath(IMAGE_WRITE_EXEMPTION).stem.lower()
+# Rule 10: callables that load code by a name or path computed at run time. Matched on
+# the last part of the resolved name, so `from importlib import import_module as im` is
+# caught; builtins are matched on their exact name, so re.compile() is not.
+DYNAMIC_LOADERS = frozenset(
+    {
+        "import_module",
+        "spec_from_file_location",
+        "spec_from_loader",
+        "find_spec",
+        "module_from_spec",
+        "exec_module",
+        "load_module",
+        "run_module",
+        "run_path",
+    }
+)
+DYNAMIC_BUILTINS = frozenset({"__import__", "exec", "eval", "compile"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,8 +265,20 @@ def _dotted(node: ast.expr) -> str | None:
     return None
 
 
-def _aliases(tree: ast.AST) -> dict[str, str]:
-    """Map local names to the qualified names they are bound to by imports or rebinding."""
+def _import_base(node: ast.ImportFrom, package: tuple[str, ...] | None) -> str | None:
+    """The absolute module a `from ... import` reads from, if it can be resolved."""
+    if node.level == 0:
+        return node.module
+    if package is None or node.level - 1 > len(package):
+        return None
+    base = list(package[: len(package) - (node.level - 1)])
+    base += node.module.split(".") if node.module else []
+    return ".".join(base) or None
+
+
+def _aliases(tree: ast.AST, package: tuple[str, ...] | None = None) -> dict[str, str]:
+    """Map local names to the qualified names they are bound to by imports or rebinding.
+    `package` is the importing module's package, for relative imports."""
     aliases: dict[str, str] = {}
     rebinds: list[tuple[str, str]] = []
     for node in ast.walk(tree):
@@ -253,9 +286,10 @@ def _aliases(tree: ast.AST) -> dict[str, str]:
             for a in node.names:
                 if a.asname:
                     aliases[a.asname] = a.name
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            for a in node.names:
-                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+        elif isinstance(node, ast.ImportFrom):
+            base = _import_base(node, package)
+            for a in node.names if base else ():
+                aliases[a.asname or a.name] = f"{base}.{a.name}"
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             target, value = node.targets[0], _dotted(node.value)
             if isinstance(target, ast.Name) and value:
@@ -334,12 +368,12 @@ def _str_constant(node: ast.expr | None) -> str | None:
 
 class _Checker:
     def __init__(self, tree: ast.AST, filename: str) -> None:
-        self.aliases = _aliases(tree)
-        self.allow_binary = filename in BINARY_WRITE_ALLOWLIST
-        self.image_writes = filename == IMAGE_WRITE_EXEMPTION
         module = _package_path(filename)
         # The package that relative imports start from.
         self.package = None if module is None else module[:-1]
+        self.aliases = _aliases(tree, self.package)
+        self.allow_binary = filename in BINARY_WRITE_ALLOWLIST
+        self.image_writes = filename == IMAGE_WRITE_EXEMPTION
         self.video_writers = self._video_writer_names(tree)
         self.exempt = self._rule_b_exempt(tree)
 
@@ -568,7 +602,8 @@ class _Checker:
         return None
 
     def check_exempt_module_use(self, node: ast.AST) -> str | None:
-        """Rule 10: another module importing or naming the image-write exempt module."""
+        """Rule 10: another module importing, naming or dynamically loading the image-write
+        exempt module."""
         if self.image_writes:
             return None
         message = f"uses '{EXEMPT_MODULE}', the only module allowed to write images"
@@ -579,27 +614,36 @@ class _Checker:
             base = self.import_base(node)
             names = [f"{base}.{a.name}" if base else a.name for a in node.names]
             names += [base] if base else []
+        elif isinstance(node, ast.Constant):
+            value = node.value
+            if isinstance(value, bytes):
+                value = value.decode("latin-1")
+            if isinstance(value, str) and EXEMPT_STEM in value.lower():
+                return message
         elif isinstance(node, ast.Call):
             names = [self.qualname(node.func) or ""]
-            for arg in node.args + [kw.value for kw in node.keywords]:
-                text = _str_constant(arg)
-                if text and (EXEMPT_MODULE in text or EXEMPT_FILE_TAIL in text):
-                    return message
+            arguments = node.args + [k.value for k in node.keywords]
+            computed = not all(isinstance(arg, ast.Constant) for arg in arguments)
+            if computed and self.is_dynamic_loader(node.func):
+                loader = names[0] or self.call_name(node.func)
+                return f"'{loader}' with a computed argument could load '{EXEMPT_MODULE}'"
         elif isinstance(node, (ast.Name, ast.Attribute)):
             names = [self.qualname(node) or ""]
         if any(n == EXEMPT_MODULE or n.startswith(EXEMPT_MODULE + ".") for n in names):
             return message
         return None
 
+    def is_dynamic_loader(self, func: ast.expr) -> bool:
+        qual = self.qualname(func)
+        if qual in DYNAMIC_BUILTINS or qual in {f"builtins.{b}" for b in DYNAMIC_BUILTINS}:
+            return True
+        if qual == "importlib.__import__" or (qual or "").startswith("runpy."):
+            return True
+        return self.call_name(func) in DYNAMIC_LOADERS
+
     def import_base(self, node: ast.ImportFrom) -> str | None:
         """The absolute module a `from ... import` reads from, if it can be resolved."""
-        if node.level == 0:
-            return node.module
-        if self.package is None or node.level - 1 > len(self.package):
-            return None
-        base = list(self.package[: len(self.package) - (node.level - 1)])
-        base += node.module.split(".") if node.module else []
-        return ".".join(base)
+        return _import_base(node, self.package)
 
     def check_media_literal(self, call: ast.Call) -> str | None:
         """Rule B: a call argument that is a literal naming an image or video file."""
@@ -701,7 +745,7 @@ def scan_source(source: str, filename: str) -> list[Finding]:
                 message = checker.check_reference(node) or checker.check_exempt_module_use(node)
         elif isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
             message = "'from ... import *' hides names from the privacy guard"
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        elif isinstance(node, (ast.Import, ast.ImportFrom, ast.Constant)):
             message = checker.check_exempt_module_use(node)
         if message:
             findings.append(Finding(filename, getattr(node, "lineno", 0), message))
