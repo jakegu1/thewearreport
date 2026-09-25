@@ -7,6 +7,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = "==3.12.*"
 dependencies = [
+    "llama-cpp-python==0.3.35",
     "numpy>=2.5.3",
     "onnxruntime>=1.30.0",
     "opencv-python-headless>=5.0.0.93",
@@ -23,6 +24,15 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.8",
     "types-jsonschema>=4.26.0.20260518",
+]
+
+# The spot-check judge's runtime (wearreport.tools.judge). PyPI has only the source
+# distribution, which compiles llama.cpp; these are the prebuilt CPU wheels its author
+# publishes with each release. uv.lock pins each wheel's SHA-256.
+[tool.uv.sources]
+llama-cpp-python = [
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
 ]
 
 [build-system]

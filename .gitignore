@@ -35,3 +35,6 @@ Thumbs.db
 .idea/
 .vscode/
 .tools/
+
+# Gold-set source photos, downloaded by scripts/fetch_goldset.sh, never committed
+.goldset/
