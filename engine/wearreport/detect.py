@@ -367,6 +367,8 @@ class Detector:
         if not isinstance(out, np.ndarray) or out.shape != OUTPUT_SHAPE:
             shape = getattr(out, "shape", None)
             raise DetectorError(f"model output has shape {shape}, expected {OUTPUT_SHAPE}")
+        if out.dtype.kind != "f":  # an integer, complex or object output would cast silently
+            raise DetectorError(f"model output has dtype {out.dtype}, expected a float type")
         raw = np.asarray(out[0], dtype=np.float32)
         if not np.isfinite(raw).all():
             raise DetectorError("model output has NaN or infinite values")

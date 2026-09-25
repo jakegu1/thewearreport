@@ -344,6 +344,21 @@ def test_detector_rejects_malformed_model_output(outputs: list[object]) -> None:
         detector.detect(np.zeros((288, 352, 3), dtype=np.uint8))
 
 
+@pytest.mark.parametrize("dtype", [np.int32, np.uint8, np.bool_, np.complex64, object])
+def test_detector_rejects_non_float_model_output(dtype: Any) -> None:
+    out = np.zeros((1, N_ANCHORS, ROW), dtype=dtype)
+    detector = detect.Detector.from_session(StubSession(outputs=[out]), name="stub")
+    with pytest.raises(detect.DetectorError, match="dtype"):
+        detector.detect(np.zeros((288, 352, 3), dtype=np.uint8))
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_detector_accepts_float_model_output(dtype: Any) -> None:
+    out = _one_person()[None].astype(dtype)
+    detector = detect.Detector.from_session(StubSession(outputs=[out]), name="stub")
+    assert len(detector.detect(np.zeros((288, 352, 3), dtype=np.uint8))) == 1
+
+
 def _one_person() -> np.ndarray:
     return raw_output((anchor(32, 3, 3), PERSON, 0.9, (0, 0, 0, 0)))
 
