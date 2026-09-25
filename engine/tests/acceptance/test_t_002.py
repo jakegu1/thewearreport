@@ -6,6 +6,7 @@ import dataclasses
 import io
 import json
 import logging
+import re
 import runpy
 import sys
 import tomllib
@@ -190,8 +191,12 @@ def test_ac3_zero_malformed_is_logged_as_zero(caplog: pytest.LogCaptureFixture) 
 
 
 def test_ac4_no_runtime_dependencies_added() -> None:
+    # T-003 owns numpy and opencv-python-headless; the registry itself adds none.
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    assert project["dependencies"] == []
+    names = {re.split(r"[<>=!~;\[ ]", dep, maxsplit=1)[0] for dep in project["dependencies"]}
+    assert names <= {"numpy", "opencv-python-headless"}
+    source = (ROOT / "engine" / "wearreport" / "registry.py").read_text()
+    assert "import numpy" not in source and "import cv2" not in source
 
 
 def test_ac4_each_attempt_uses_30s_timeout() -> None:
