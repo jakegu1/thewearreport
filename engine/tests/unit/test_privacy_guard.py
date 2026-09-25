@@ -510,3 +510,106 @@ def test_cli_flags_binary_write_without_image_extension(tmp_path: Path) -> None:
     module.parent.mkdir(parents=True)
     module.write_text("def f(p, b):\n    open(p, 'wb').write(b)\n")
     assert privacy_guard.main(["--root", str(tmp_path)]) == 1
+
+
+# The image-write exemption (T-008) ------------------------------------------------------
+
+EXEMPT = privacy_guard.IMAGE_WRITE_EXEMPTION
+EXEMPT_WRITES = [
+    "import os\nfd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n",
+    "import os\nwith os.fdopen(fd, 'wb') as fh:\n    fh.write(b)\n",
+    "open(p, 'xb').write(b)\n",
+]
+
+
+@pytest.mark.parametrize("source", EXEMPT_WRITES)
+def test_exemption_allows_binary_opens_only_in_the_exempt_file(source: str) -> None:
+    assert _messages(source, EXEMPT) == []
+    assert _messages(source, MODULE)
+    assert _messages(source, "engine/wearreport/tools/other.py")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import io\nio.FileIO(p, 'w')\n",
+        "import zipfile\nzipfile.ZipFile(p, 'w')\n",
+        "import gzip\ngzip.open(p, 'wb')\n",
+        "import sqlite3\nsqlite3.connect(p)\n",
+        "import shelve\nshelve.open(p)\n",
+        "import shutil\nshutil.make_archive(p, 'zip')\n",
+        "import tempfile\ntempfile.NamedTemporaryFile()\n",
+        "import tempfile\ntempfile.mkdtemp(suffix='.png')\n",
+        "p.write_bytes(b)\n",
+        "open(os.path.join(d, 'a.png'), 'wb')\n",
+        "import os\nos.path.join(d, 'crop.png')\n",
+        "Path(d, 'a.png').write_text(s)\n",
+        "import cv2\ncv2.VideoWriter(p, f, 1.0, s)\n",
+        "import imageio\nimageio.imwrite(p, f)\n",
+        "fig.savefig(p)\n",
+        "im.show()\n",
+        "import cv2\nw = cv2.imwrite\n",
+        "import cv2\ngetattr(cv2, 'imwrite')(p, f)\n",
+        "send(name='frame.jpeg')\n",
+    ],
+)
+def test_exemption_keeps_every_other_rule(source: str) -> None:
+    assert _messages(source, EXEMPT), source
+
+
+def test_exemption_is_one_constant_and_not_the_allowlist() -> None:
+    assert isinstance(EXEMPT, str)
+    assert EXEMPT not in privacy_guard.BINARY_WRITE_ALLOWLIST
+    module = EXEMPT.removeprefix("engine/").removesuffix(".py").replace("/", ".")
+    assert module == privacy_guard.EXEMPT_MODULE
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        (MODULE, "import wearreport.tools.spotcheck\n"),
+        (MODULE, "import wearreport.tools.spotcheck as s\n"),
+        (MODULE, "from wearreport.tools import spotcheck\n"),
+        (MODULE, "from wearreport.tools.spotcheck import ReviewDirectory\n"),
+        (MODULE, "from .tools import spotcheck\n"),
+        (MODULE, "from .tools.spotcheck import ReviewDirectory\n"),
+        ("engine/wearreport/tools/other.py", "from . import spotcheck\n"),
+        ("engine/wearreport/tools/other.py", "from .spotcheck import ReviewDirectory\n"),
+        ("engine/wearreport/tools/sub/x.py", "from ..spotcheck import ReviewDirectory\n"),
+        ("engine/wearreport/tools/__init__.py", "from .spotcheck import main\n"),
+        (MODULE, "from wearreport import tools\ntools.spotcheck.ReviewDirectory()\n"),
+        (MODULE, "import wearreport.tools\nd = wearreport.tools.spotcheck.ReviewDirectory\n"),
+        (MODULE, "import importlib\nimportlib.import_module('wearreport.tools.spotcheck')\n"),
+        (MODULE, "import runpy\nrunpy.run_path('engine/wearreport/tools/spotcheck.py')\n"),
+        (MODULE, "__import__('wearreport.tools.spotcheck')\n"),
+    ],
+)
+def test_no_other_module_may_use_the_exempt_one(path: str, source: str) -> None:
+    assert _messages(source, path)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from wearreport import tools\n",
+        "import wearreport.tools\n",
+        "from wearreport.tools import other\n",
+        "from . import spotcheck_notes\n",
+        "x = 'spot check'\n",
+    ],
+)
+def test_the_package_itself_is_not_off_limits(source: str) -> None:
+    assert _messages(source, "engine/wearreport/x.py") == []
+
+
+def test_the_exempt_module_may_name_itself() -> None:
+    assert _messages("prog = f('python -m wearreport.tools.spotcheck')\n", EXEMPT) == []
+
+
+def test_cli_symlink_to_the_exempt_file_is_checked_under_its_own_name(tmp_path: Path) -> None:
+    tool = tmp_path / EXEMPT
+    tool.parent.mkdir(parents=True)
+    tool.write_text(EXEMPT_WRITES[2], encoding="utf-8")
+    assert privacy_guard.main(["--root", str(tmp_path)]) == 0
+    (tmp_path / "engine" / "wearreport" / "alias.py").symlink_to(tool)
+    assert privacy_guard.main(["--root", str(tmp_path)]) == 1

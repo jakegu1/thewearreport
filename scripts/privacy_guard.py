@@ -49,6 +49,19 @@ default. Parses every Python file under engine/ (except engine/tests/) and flags
      cv2.imwrite`, `getattr(cv2, "imwrite")`), since the call itself is then hidden;
      and `from ... import *`, which hides where names come from. shutil.make_archive()
      is a binary write (rule 3)
+ 10. outside the exempt module below: importing it, from any engine module (absolute or
+     relative imports, and attribute access through its package), and call arguments
+     that are string literals naming it (importlib.import_module, runpy), so its
+     exemption cannot be borrowed by another module
+
+Image-write exemption: the spot-check tool (AGENTS.md INV-1 exception (c)) renders
+detections into a temporary directory it creates and always deletes. Its repository-
+relative path is the one constant IMAGE_WRITE_EXEMPTION, and for that exact path, and no
+other spelling of it, two checks are relaxed: rule A's binary write modes on file
+openers (open(), os.fdopen() and the like) and os.open() with write flags. Everything
+else still applies to it: image writers (rule 1), `.save()`/`.show()`, write_bytes and
+tofile, urlretrieve, the tempfile rules, archive, database and FileIO writes, image
+paths opened for writing (rule 7), media path literals (rule B) and rule 9.
 
 Names are resolved through `import ... as`, `from ... import ... as` and simple
 module-level or local rebinding (`w = cv2.imwrite`), so `w(...)` is checked as
@@ -95,10 +108,12 @@ import re
 import sys
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Repository-relative paths of modules allowed to write binary files. See the docstring.
 BINARY_WRITE_ALLOWLIST: frozenset[str] = frozenset()
+# The one module allowed to write images (INV-1 exception (c)). See the docstring.
+IMAGE_WRITE_EXEMPTION = "engine/wearreport/tools/spotcheck.py"
 
 MEDIA_SUFFIXES = (
     ".jpg",
@@ -194,6 +209,19 @@ MODE_PATTERN = re.compile(r"[rwxabtU+]{1,4}")
 OS_PATH_JOIN = frozenset({"os.path.join", "posixpath.join", "ntpath.join"})
 # tempfile functions whose default mode is "w+b".
 TEMPFILE_BINARY_DEFAULT = frozenset({"NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"})
+
+
+def _package_path(path: str) -> tuple[str, ...] | None:
+    """The dotted-name parts of an engine module ('engine/a/b.py' -> ('a', 'b'))."""
+    parts = PurePosixPath(path).with_suffix("").parts
+    if len(parts) < 2 or parts[0] != "engine":
+        return None
+    return parts[1:]
+
+
+# Rule 10: the exempt module's dotted name and its path as a string literal may name it.
+EXEMPT_MODULE = ".".join(_package_path(IMAGE_WRITE_EXEMPTION) or ())
+EXEMPT_FILE_TAIL = IMAGE_WRITE_EXEMPTION.removeprefix("engine/")
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,9 +333,13 @@ def _str_constant(node: ast.expr | None) -> str | None:
 
 
 class _Checker:
-    def __init__(self, tree: ast.AST, allow_binary: bool) -> None:
+    def __init__(self, tree: ast.AST, filename: str) -> None:
         self.aliases = _aliases(tree)
-        self.allow_binary = allow_binary
+        self.allow_binary = filename in BINARY_WRITE_ALLOWLIST
+        self.image_writes = filename == IMAGE_WRITE_EXEMPTION
+        module = _package_path(filename)
+        # The package that relative imports start from.
+        self.package = None if module is None else module[:-1]
         self.video_writers = self._video_writer_names(tree)
         self.exempt = self._rule_b_exempt(tree)
 
@@ -370,8 +402,11 @@ class _Checker:
     def is_os_path_join(self, call: ast.Call) -> bool:
         return self.qualname(call.func) in OS_PATH_JOIN
 
-    def binary_write(self, reason: str) -> str | None:
-        return None if self.allow_binary else f"{reason} (binary writes are not allowed)"
+    def binary_write(self, reason: str, *, opener: bool = False) -> str | None:
+        """`opener`: a binary open or os.open(), which the image-write exemption allows."""
+        if self.allow_binary or (opener and self.image_writes):
+            return None
+        return f"{reason} (binary writes are not allowed)"
 
     def check(self, call: ast.Call) -> str | None:
         """Rules 1 to 7; see the module docstring."""
@@ -410,7 +445,7 @@ class _Checker:
         if qual == "os.open":
             flags = _arg(call, 1, "flags")
             if flags is None or self.qualname(flags) != "os.O_RDONLY":
-                return self.binary_write("'os.open()' with write flags")
+                return self.binary_write("'os.open()' with write flags", opener=True)
             return None
         if name and name.endswith("open") and name not in NOT_FILE_OPENERS:
             if qual in MEDIA_READERS:
@@ -481,7 +516,7 @@ class _Checker:
         if self.is_image_path(target) and _mode_writes(mode, binary_only=False, default=False):
             return "image path opened for writing"
         if _mode_writes(mode, binary_only=True, default=False):
-            return self.binary_write("file opened in a binary write mode")
+            return self.binary_write("file opened in a binary write mode", opener=True)
         return None
 
     def check_tempfile(self, call: ast.Call, func: str) -> str | None:
@@ -531,6 +566,40 @@ class _Checker:
         if name in MEDIA_WRITERS or name in REFERENCED_WRITERS or qual in QUALIFIED_WRITERS:
             return f"reference to writer '{qual}' hides its calls"
         return None
+
+    def check_exempt_module_use(self, node: ast.AST) -> str | None:
+        """Rule 10: another module importing or naming the image-write exempt module."""
+        if self.image_writes:
+            return None
+        message = f"uses '{EXEMPT_MODULE}', the only module allowed to write images"
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = self.import_base(node)
+            names = [f"{base}.{a.name}" if base else a.name for a in node.names]
+            names += [base] if base else []
+        elif isinstance(node, ast.Call):
+            names = [self.qualname(node.func) or ""]
+            for arg in node.args + [kw.value for kw in node.keywords]:
+                text = _str_constant(arg)
+                if text and (EXEMPT_MODULE in text or EXEMPT_FILE_TAIL in text):
+                    return message
+        elif isinstance(node, (ast.Name, ast.Attribute)):
+            names = [self.qualname(node) or ""]
+        if any(n == EXEMPT_MODULE or n.startswith(EXEMPT_MODULE + ".") for n in names):
+            return message
+        return None
+
+    def import_base(self, node: ast.ImportFrom) -> str | None:
+        """The absolute module a `from ... import` reads from, if it can be resolved."""
+        if node.level == 0:
+            return node.module
+        if self.package is None or node.level - 1 > len(self.package):
+            return None
+        base = list(self.package[: len(self.package) - (node.level - 1)])
+        base += node.module.split(".") if node.module else []
+        return ".".join(base)
 
     def check_media_literal(self, call: ast.Call) -> str | None:
         """Rule B: a call argument that is a literal naming an image or video file."""
@@ -606,7 +675,7 @@ def scan_source(source: str, filename: str) -> list[Finding]:
         tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:
         return [Finding(filename, exc.lineno or 0, f"cannot parse: {exc.msg}")]
-    checker = _Checker(tree, allow_binary=filename in BINARY_WRITE_ALLOWLIST)
+    checker = _Checker(tree, filename)
     # Callees are checked as calls, annotations only name types, and `a.b` is checked
     # once as a whole rather than again as `a`.
     skip: set[int] = set()
@@ -625,12 +694,15 @@ def scan_source(source: str, filename: str) -> list[Finding]:
                 checker.check(node)
                 or checker.check_media_literal(node)
                 or checker.check_reference(node)
+                or checker.check_exempt_module_use(node)
             )
         elif isinstance(node, (ast.Name, ast.Attribute)) and id(node) not in skip:
             if isinstance(node.ctx, ast.Load):
-                message = checker.check_reference(node)
+                message = checker.check_reference(node) or checker.check_exempt_module_use(node)
         elif isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
             message = "'from ... import *' hides names from the privacy guard"
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            message = checker.check_exempt_module_use(node)
         if message:
             findings.append(Finding(filename, getattr(node, "lineno", 0), message))
     return sorted(findings, key=lambda f: f.line)
