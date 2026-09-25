@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -103,6 +104,17 @@ def test_publish_leaves_no_temporary_files(tmp_path: Path) -> None:
         "sweeps/2026/07/15",
         "sweeps/2026/07/15/20260715T1230Z.json",
     ]
+
+
+def test_identical_republish_leaves_the_record_file_untouched(tmp_path: Path) -> None:
+    first = publish.publish(tmp_path, _record(), now=T0)
+    before = os.stat(first.record_path)
+    time.sleep(0.05)
+    second = publish.publish(tmp_path, _record(), now=T0 + timedelta(minutes=5))
+    after = os.stat(second.record_path)
+    assert first.created and not second.created
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+    assert after.st_nlink == 1
 
 
 def test_publish_refuses_a_symlinked_directory(tmp_path: Path) -> None:
