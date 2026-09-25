@@ -19,6 +19,15 @@ cv2.VideoWriter. This test runs a full dry sweep and looks at what actually happ
     scanned too. Shared system directories such as /tmp are not watched: other processes
     write there, which would make the test flaky.
 
+The dry-sweep command also runs in a child process, from interpreter start to exit. A
+wrapper installs the same kind of audit hook before any engine module is imported, and the
+hook reports each event on fd 2 as it happens, so writes from `atexit` callbacks and
+interpreter shutdown are reported too. The number of `atexit` callbacks must not change
+while the engine is imported and the sweep runs.
+
+Log output is checked through every attribute of every captured record (what a JSON
+formatter would emit), not only the rendered message, so `extra=` fields are covered.
+
 The directory checks and the byte scan are what catch native writers, which neither the
 audit hook nor the patched openers can see. Out of reach: native code writing to an
 absolute path outside the watched places, or writing a file and deleting it before the
@@ -34,6 +43,7 @@ import builtins
 import contextlib
 import io
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -44,11 +54,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import pytest
 
 from wearreport import fetch
+from wearreport._cv import cv2
 from wearreport.testing.fake_cameras import FakeCameraServer, synthetic_jpeg
 
 CANARY_ENV = "WEARREPORT_PRIVACY_CANARY"
@@ -127,6 +137,16 @@ class Report:
         assert self.elsewhere == [], f"files created or changed elsewhere: {self.elsewhere}"
         kind = media_kind(self.output.encode("utf-8", "surrogateescape"))
         assert kind is None, f"{kind} in logs or output"
+        assert "\\xff\\xd8\\xff" not in self.output, "escaped JPEG bytes in logs or output"
+        assert URL.search(self.output) is None, "a URL in logs or output"
+
+
+URL = re.compile(r"\b[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+
+
+def logged(caplog: pytest.LogCaptureFixture) -> str:
+    """The rendered log text plus every attribute of every record (`extra=` included)."""
+    return caplog.text + "".join(repr(vars(record)) for record in caplog.records)
 
 
 # Audit hooks cannot be removed, so one hook is installed once and records only while a
@@ -315,7 +335,7 @@ def guarded(
         _scan([work, home, tmp], report)
         _diff(before, _snapshot(watched, exclude=[work, home, tmp]), report)
         captured = capsys.readouterr()
-        report.output = caplog.text + captured.out + captured.err
+        report.output = logged(caplog) + captured.out + captured.err
 
 
 def _sweep(*, full: bool = False) -> None:
@@ -416,6 +436,25 @@ def _leak_log() -> None:
     logging.getLogger("wearreport.fetch").debug("frame %s", frame)
 
 
+def _leak_log_extra() -> None:
+    # The message is clean; the URL and the frame ride along in `extra=`.
+    import base64
+    import logging
+
+    frame = base64.b64encode(synthetic_jpeg(np.random.default_rng())).decode()
+    logging.getLogger("wearreport.fetch").debug(
+        "frame failed",
+        extra={"camera_id": "x", "url": "http://127.0.0.1:1/cam/x", "frame_b64": frame},
+    )
+
+
+def _leak_log_raw_bytes_extra() -> None:
+    import logging
+
+    frame = synthetic_jpeg(np.random.default_rng())
+    logging.getLogger("wearreport.fetch").debug("frame failed", extra={"frame": frame[:64]})
+
+
 @contextlib.contextmanager
 def _canary(leak: Callable[[], None]) -> Iterator[None]:
     """Run `leak` once, from a fetch worker thread, during the next decode."""
@@ -455,8 +494,80 @@ def test_sweep_creates_no_files_and_no_image_bytes(
     report.assert_clean()
 
 
-def test_dry_sweep_process_leaves_no_files(tmp_path: Path) -> None:
-    """The real command, from interpreter start: covers import-time writes too."""
+# The child's audit hook. It is installed before any engine module is imported and stays
+# installed until the interpreter exits; each event is written straight to fd 2, so events
+# from atexit callbacks and shutdown are reported as well. It never opens a file.
+CHILD = r"""
+import os, sys
+
+WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+FILE_EVENTS = {"os.mkdir", "os.rename", "os.replace", "os.link", "os.symlink",
+               "os.truncate", "tempfile.mkstemp", "tempfile.mkdtemp"}
+PROCESS_EVENTS = {"subprocess.Popen", "os.system", "os.exec", "os.posix_spawn",
+                  "os.spawn", "os.fork", "os.forkpty"}
+
+def report(kind, text):
+    os.write(2, ("\n@@privacy " + kind + " " + text.replace("\n", " ") + "\n").encode(
+        "utf-8", "backslashreplace"))
+
+def audit(event, args):
+    if event == "open":
+        path, mode, flags = args
+        writing = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
+            isinstance(flags, int) and flags & WRITE_FLAGS)
+        if writing and not isinstance(path, int):
+            report("write", f"open {path!s} mode={mode!r} flags={flags!r}")
+    elif event in FILE_EVENTS:
+        report("write", f"{event} {args[0]!s}")
+    elif event in PROCESS_EVENTS:
+        report("escape", f"{event} {args[0]!s}")
+    elif event in ("socket.connect", "socket.sendto"):
+        address = args[1]
+        if not (isinstance(address, tuple) and address[0] in ("127.0.0.1", "::1")):
+            report("escape", f"{event} {address!r}")
+
+sys.addaudithook(audit)
+
+import atexit, logging, runpy  # logging registers its own atexit callback on import
+
+callbacks = atexit._ncallbacks()
+if sys.argv[1]:
+    exec(compile(sys.argv[1], "<canary>", "exec"), {})
+sys.argv = ["wearreport.fetch", "--dry-run"]
+try:
+    runpy.run_module("wearreport.fetch", run_name="__main__", alter_sys=True)
+finally:
+    after = atexit._ncallbacks()
+    if after != callbacks:
+        report("atexit", f"{after - callbacks} callback(s) registered by the engine")
+"""
+MARKER = re.compile(r"^@@privacy (\w+) (.*)$", re.MULTILINE)
+
+# The reviewer's leak: keep each frame and dump them all at exit, in text mode, to a place
+# none of the watched directories cover.
+ATEXIT_CANARY = r"""
+import atexit
+from wearreport._cv import cv2
+
+_recent = []
+_real = cv2.imdecode
+
+def _keep(buf, flags):
+    _recent.append(bytes(buf))
+    return _real(buf, flags)
+
+def _dump_recent():
+    if _recent:
+        with open(PATH, "a", encoding="latin-1") as fh:
+            fh.write(b"".join(_recent).decode("latin-1"))
+
+cv2.imdecode = _keep
+atexit.register(_dump_recent)
+"""
+
+
+def _run_dry_sweep_process(tmp_path: Path, prelude: str = "") -> Report:
+    """Run the real dry-sweep command under the child audit hook; report what happened."""
     import subprocess
 
     work, home, tmp = tmp_path / "work", tmp_path / "home", tmp_path / "tmp"
@@ -466,7 +577,7 @@ def test_dry_sweep_process_leaves_no_files(tmp_path: Path) -> None:
     env.update(HOME=str(home), TMPDIR=str(tmp), TEMP=str(tmp), TMP=str(tmp))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     proc = subprocess.run(
-        [sys.executable, "-m", "wearreport.fetch", "--dry-run"],
+        [sys.executable, "-c", CHILD, prelude],
         cwd=work,
         env=env,
         capture_output=True,
@@ -475,9 +586,51 @@ def test_dry_sweep_process_leaves_no_files(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr.decode(errors="replace")
     assert b"frames fetched: 50" in proc.stdout
-    report = Report(output=(proc.stdout + proc.stderr).decode(errors="replace"))
+    stderr = proc.stderr.decode(errors="replace")
+    report = Report(output=proc.stdout.decode(errors="replace") + MARKER.sub("", stderr))
+    for kind, text in MARKER.findall(stderr):
+        (report.escapes if kind == "escape" else report.writes).append(f"{kind}: {text}")
     _scan([work, home, tmp], report)
-    report.assert_clean()
+    return report
+
+
+def test_dry_sweep_process_leaves_no_files(tmp_path: Path) -> None:
+    """The real command, from interpreter start to exit: covers import-time and exit-time
+    writes, and atexit callbacks registered by the engine."""
+    _run_dry_sweep_process(tmp_path).assert_clean()
+
+
+def test_dry_sweep_process_catches_an_atexit_writer(tmp_path: Path) -> None:
+    """Canary: frames dumped at exit to an unwatched directory (/dev/shm on Linux)."""
+    shm = Path("/dev/shm")  # noqa: S108  (the point: a shared place nobody watches)
+    outside = (shm if shm.is_dir() and os.access(shm, os.W_OK) else tmp_path) / (
+        f"wearreport-canary-{os.getpid()}"
+    )
+    prelude = f"PATH = {str(outside)!r}\n" + ATEXIT_CANARY
+    try:
+        report = _run_dry_sweep_process(tmp_path, prelude)
+        assert outside.exists()  # the leak really happened
+    finally:
+        outside.unlink(missing_ok=True)
+    assert any(w.startswith("atexit: ") for w in report.writes), report.writes
+    assert any(str(outside) in w and "mode='a'" in w for w in report.writes), report.writes
+    assert report.created == []  # invisible to the directory scan
+    with pytest.raises(AssertionError):
+        report.assert_clean()
+
+
+def test_child_hook_reports_writes_after_the_sweep(tmp_path: Path) -> None:
+    """Canary: an exit-time os.open() with write flags, from a plain atexit callback."""
+    target = tmp_path / "late"
+    prelude = (
+        "import atexit, os\n"
+        f"atexit.register(lambda: os.close(os.open({str(target)!r}, os.O_WRONLY | os.O_CREAT)))\n"
+    )
+    report = _run_dry_sweep_process(tmp_path, prelude)
+    assert target.exists()
+    assert any(str(target) in w for w in report.writes), report.writes
+    with pytest.raises(AssertionError):
+        report.assert_clean()
 
 
 @pytest.mark.parametrize(
@@ -495,6 +648,8 @@ def test_dry_sweep_process_leaves_no_files(tmp_path: Path) -> None:
         (_leak_imwrite, {"blocked"}),
         (_leak_open_image_path, {"blocked"}),
         (_leak_log, {"output"}),
+        (_leak_log_extra, {"output"}),
+        (_leak_log_raw_bytes_extra, {"output"}),
     ],
     ids=lambda v: getattr(v, "__name__", "")[len("_leak_") :],
 )
