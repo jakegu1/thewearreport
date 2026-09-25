@@ -52,7 +52,9 @@ implement face detection, face recognition, re-identification, or tracking of in
 across frames. Publish aggregates only.
 
 **INV-2 Licenses.** Runtime dependencies must be permissively licensed (MIT, BSD,
-Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, CC0). No AGPL, GPL, SSPL, BUSL or non-commercial
+Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, Zlib, CC0). The exact list is `ALLOWED_SPDX` in
+`scripts/license_check.py`. Only an OSI-approved permissive licence may be added to it, and
+only with a justification in the PR. No AGPL, GPL, SSPL, BUSL or non-commercial
 licenses. In particular **`ultralytics` must never be a dependency** (AGPL-3.0). Data
 sources are limited to TfL, the Met Office and the US National Weather Service.
 Open-Meteo may be used only in local development and tests behind an explicit flag,
@@ -104,7 +106,7 @@ Created by the bootstrap task; later tasks must keep these working.
 | Detector | YOLOX-s ONNX via onnxruntime (CPU) |
 | Language and tools | Python 3.12, `uv`, `ruff`, `mypy --strict`, `pytest` |
 | Scheduling | GitHub Actions cron during London daytime |
-| Aggregate storage | JSON Lines on the orphan `data` branch, validated by JSON Schema |
+| Aggregate storage | One immutable JSON record per sweep on the orphan `data` branch (records concatenate into JSON Lines), validated by JSON Schema |
 | Weather | Met Office DataHub (UK), NWS (US) |
 
 If you believe a decided choice is wrong, say so with evidence in the PR. Do not change
@@ -116,6 +118,11 @@ it unilaterally.
 - Structured JSON logs. Never log image data or URLs containing tokens.
 - Tests assert behaviour, including failure paths (timeouts, malformed input, partial
   failures). Do not test mocks.
+- Treat external data as hostile. A parser of a network response or data file turns every
+  failure into the module's typed error. That includes `ValueError`, `TypeError`, `KeyError`,
+  `UnicodeDecodeError`, `RecursionError` (deep nesting) and `OverflowError` (huge numbers,
+  out-of-range dates). Raise it `from None` when the original message could echo a secret.
+  Cap response sizes. Tests include these pathological inputs.
 - Never skip, disable or weaken a test or check to make CI pass.
 - Code, comments, commits and PRs in English.
 
