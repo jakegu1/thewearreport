@@ -42,6 +42,7 @@ from __future__ import annotations
 import builtins
 import contextlib
 import io
+import json
 import os
 import re
 import socket
@@ -57,7 +58,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from wearreport import benchmark, detect, fetch
+from wearreport import aggregate, benchmark, cli, detect, fetch, registry
 from wearreport._cv import cv2
 from wearreport.testing.fake_cameras import FakeCameraServer, synthetic_jpeg
 
@@ -799,4 +800,122 @@ def test_benchmark_process_leaves_no_files(tmp_path: Path) -> None:
     report = _run_dry_sweep_process(tmp_path, prelude)
     assert "median ms per frame: " in report.output
     assert "| yolox_s |" in report.output and "| yolox_m |" in report.output
+    report.assert_clean()
+
+
+# The sweep pipeline (T-005) --------------------------------------------------------------
+#
+# `wearreport sweep --dry-run` runs the whole pipeline (registry, fetch, detector, weather,
+# record, publish) against the fake camera server, with the real detector model, in process
+# under `guarded` and as a child process from start to exit. Unlike a fetch-only sweep it
+# must create files: exactly one record and status.json, in the new directory it prints.
+# Everything else is as strict as above, and every file is still scanned for image bytes.
+# These tests need the model, which `make setup` fetches and CI provides: they fail, never
+# skip, when it is missing.
+
+PIPELINE_MODEL = "yolox_s.onnx"
+PIPELINE_CAMERAS = 6
+RECORD_NAME = re.compile(r"sweeps/\d{4}/\d{2}/\d{2}/\d{8}T\d{4}Z\.json")
+WEATHER_ENV = ("METOFFICE_API_KEY", "WEARREPORT_DEV_WEATHER", "WEARREPORT_ENV")
+
+
+def _require_pipeline_model() -> None:
+    if not detect.model_path(PIPELINE_MODEL).is_file():
+        pytest.fail(f"{PIPELINE_MODEL} is missing; run make setup")
+
+
+def _pipeline_cameras(server: FakeCameraServer) -> list[Any]:
+    """Two cameras showing people, one 404, one corrupt frame, two frames of noise."""
+    cams = server.cameras(PIPELINE_CAMERAS)
+    server.serve_body(cams[0].id, PEOPLE_FIXTURE.read_bytes())
+    server.serve_body(cams[1].id, PEOPLE_FIXTURE.read_bytes())
+    server.serve_404(cams[2].id)
+    server.serve_corrupt(cams[3].id)
+    return cams
+
+
+def _accept_published(report: Report, tmp: Path) -> dict[str, Any]:
+    """Check that the dry run left exactly its record and status.json in one new directory
+    under `tmp`, take them (and only them) off the report, and return the record."""
+    match = re.search(r"^directory: (.+)$", report.output, re.MULTILINE)
+    assert match, report.output
+    directory = Path(match.group(1).strip())
+    assert directory.parent == tmp, directory
+    entries = sorted(directory.rglob("*"))
+    files = [p.relative_to(directory).as_posix() for p in entries if p.is_file()]
+    assert len(files) == 2 and "status.json" in files, files
+    (record_name,) = [f for f in files if f != "status.json"]
+    assert RECORD_NAME.fullmatch(record_name), record_name
+    record_file = directory / record_name
+    dirs = [p for p in entries if p.is_dir()]
+    assert dirs == [p for p in reversed(record_file.parents) if directory in p.parents], dirs
+
+    published = {str(directory)} | {str(p) for p in entries}
+    report.created = [c for c in report.created if c not in published]
+    inside = str(directory) + os.sep
+    report.writes = [
+        w for w in report.writes if not (inside in w or w.endswith(" " + str(directory)))
+    ]
+    record: dict[str, Any] = json.loads(record_file.read_text(encoding="utf-8"))
+    aggregate.check_record(record)  # counts only: exactly the schema's fields
+    assert record["cameras_listed"] == PIPELINE_CAMERAS
+    assert record["frames_ok"] == 4 and record["persons_total"] >= 2
+    return record
+
+
+def test_pipeline_dry_run_writes_only_the_record_and_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _require_pipeline_model()
+    for var in WEATHER_ENV:  # no weather provider: no request leaves the machine
+        monkeypatch.delenv(var, raising=False)
+    canary = _canary(_leak_os_open) if os.environ.get(CANARY_ENV) == "1" else None
+    with (
+        guarded(tmp_path, monkeypatch, capsys, caplog) as report,
+        canary or contextlib.nullcontext(),
+        FakeCameraServer() as server,
+    ):
+        cams = _pipeline_cameras(server)
+        monkeypatch.setattr(registry, "list_cameras", lambda app_key, **kwargs: cams)
+        assert cli.main(["sweep", "--dry-run", "--model", PIPELINE_MODEL]) == 0
+    record = _accept_published(report, tmp_path / "tmp")
+    assert set(record["per_camera"]) == {cams[0].id, cams[1].id}
+    report.assert_clean()
+
+
+PIPELINE_PRELUDE = r"""
+import os
+for var in WEATHER_ENV:
+    os.environ.pop(var, None)
+
+from wearreport import cli, registry
+from wearreport.testing.fake_cameras import FakeCameraServer
+
+with FakeCameraServer() as server:
+    cams = server.cameras(CAMERAS)
+    with open(PEOPLE, "rb") as fh:
+        people = fh.read()
+    server.serve_body(cams[0].id, people)
+    server.serve_body(cams[1].id, people)
+    server.serve_404(cams[2].id)
+    server.serve_corrupt(cams[3].id)
+    registry.list_cameras = lambda app_key, **kwargs: cams
+    assert cli.main(["sweep", "--dry-run", "--model", MODEL]) == 0
+"""
+
+
+def test_pipeline_process_writes_only_the_record_and_status(tmp_path: Path) -> None:
+    """The sweep command in a child process from interpreter start to exit: onnxruntime,
+    the JSON log handler and the publisher included."""
+    _require_pipeline_model()
+    prelude = (
+        f"WEATHER_ENV = {WEATHER_ENV!r}\nCAMERAS = {PIPELINE_CAMERAS}\n"
+        f"MODEL = {PIPELINE_MODEL!r}\nPEOPLE = {str(PEOPLE_FIXTURE)!r}\n" + PIPELINE_PRELUDE
+    )
+    report = _run_dry_sweep_process(tmp_path, prelude)
+    assert '"message": "sweep published"' in report.output  # the JSON logs were checked too
+    _accept_published(report, tmp_path / "tmp")
     report.assert_clean()

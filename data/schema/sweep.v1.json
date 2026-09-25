@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jakegu1/thewearreport/blob/main/data/schema/sweep.v1.json",
+  "title": "Sweep record (v1)",
+  "description": "Aggregate counts from one sweep of the TfL JamCams. One record per file at sweeps/YYYY/MM/DD/<sweep_id>.json on the data branch. Counts only: no images, boxes or coordinates of people. Rules the schema cannot express, enforced by wearreport.aggregate.check_record: sweep_id is the minute of started_at; finished_at is not before started_at; frames_ok plus every frames_failed count equals cameras_listed; persons_total and umbrellas_total are the sums over per_camera; per_camera has at most frames_ok entries. check_record is authoritative and stricter than this schema (for example on calendar dates, integer counts written as floats and trailing newlines): a consumer that must reject every invalid record uses it.",
+  "type": "object",
+  "required": [
+    "schema",
+    "sweep_id",
+    "started_at",
+    "finished_at",
+    "source",
+    "cameras_listed",
+    "frames_ok",
+    "frames_failed",
+    "persons_total",
+    "umbrellas_total",
+    "per_camera",
+    "weather",
+    "engine_version",
+    "model",
+    "model_sha256",
+    "attribution"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "sweep.v1" },
+    "sweep_id": {
+      "description": "The UTC minute the sweep started, YYYYMMDDTHHMMZ.",
+      "type": "string",
+      "pattern": "^[0-9]{4}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3])[0-5][0-9]Z$"
+    },
+    "started_at": { "$ref": "#/$defs/utc_time" },
+    "finished_at": { "$ref": "#/$defs/utc_time" },
+    "source": { "const": "tfl-jamcam" },
+    "cameras_listed": {
+      "description": "Cameras the registry listed as available, each fetched once.",
+      "$ref": "#/$defs/count"
+    },
+    "frames_ok": {
+      "description": "Frames fetched, decoded and run through the detector.",
+      "$ref": "#/$defs/count"
+    },
+    "frames_failed": {
+      "description": "Frames that failed, by error category: timeout, http (a status outside 2xx or an oversized body), decode, network, detect (the detector refused the frame or failed on it), invalid_id (a camera the registry listed with an id that cannot be published; it was not fetched). The first five are always present; invalid_id is present only when it is at least 1, and a missing category means 0.",
+      "type": "object",
+      "required": ["timeout", "http", "decode", "network", "detect"],
+      "additionalProperties": false,
+      "properties": {
+        "timeout": { "$ref": "#/$defs/count" },
+        "http": { "$ref": "#/$defs/count" },
+        "decode": { "$ref": "#/$defs/count" },
+        "network": { "$ref": "#/$defs/count" },
+        "detect": { "$ref": "#/$defs/count" },
+        "invalid_id": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "persons_total": { "$ref": "#/$defs/count" },
+    "umbrellas_total": { "$ref": "#/$defs/count" },
+    "per_camera": {
+      "description": "Counts per camera id, for cameras where anything was detected. Cameras with no detection and failed frames are absent.",
+      "type": "object",
+      "maxProperties": 2000,
+      "propertyNames": { "$ref": "#/$defs/camera_id" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["persons", "umbrellas"],
+        "additionalProperties": false,
+        "properties": {
+          "persons": { "$ref": "#/$defs/count" },
+          "umbrellas": { "$ref": "#/$defs/count" }
+        },
+        "not": { "const": { "persons": 0, "umbrellas": 0 } }
+      }
+    },
+    "weather": {
+      "description": "Conditions in central London at the forecast time step nearest started_at, or null when none was available.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["temp_c", "apparent_c", "precip_mm", "observed_at", "source"],
+          "additionalProperties": false,
+          "properties": {
+            "temp_c": { "type": "number" },
+            "apparent_c": { "type": "number" },
+            "precip_mm": { "type": "number", "minimum": 0 },
+            "observed_at": { "$ref": "#/$defs/utc_time" },
+            "source": { "enum": ["metoffice", "openmeteo"] }
+          }
+        }
+      ]
+    },
+    "engine_version": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z.+_-]{1,64}$"
+    },
+    "model": {
+      "description": "The detector model the sweep loaded, e.g. yolox_m.",
+      "type": "string",
+      "pattern": "^[a-z0-9_]{1,32}$"
+    },
+    "model_sha256": {
+      "description": "SHA-256 of the model file the sweep loaded.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "attribution": {
+      "description": "Attribution statements for the data sources this record used (AGENTS.md INV-5).",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "prefixItems": [{ "const": "Powered by TfL Open Data" }],
+      "items": {
+        "enum": [
+          "Powered by TfL Open Data",
+          "Powered by Met Office data",
+          "Weather data by Open-Meteo.com"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0 },
+    "utc_time": {
+      "description": "UTC, ISO 8601, whole seconds: YYYY-MM-DDTHH:MM:SSZ.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+    },
+    "camera_id": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$" }
+  }
+}

@@ -19,8 +19,8 @@ setup: ## Install uv (if missing), Python 3.12, dependencies, gitleaks and the m
 	sh scripts/install_gitleaks.sh
 	$(MAKE) model
 
-model: ## Download and verify the YOLOX-s model into .models/ (add YOLOX-m: sh scripts/fetch_model.sh --with-m)
-	sh scripts/fetch_model.sh
+model: ## Download and verify the YOLOX-s and YOLOX-m models into .models/
+	sh scripts/fetch_model.sh --with-m
 
 check: lint format-check typecheck test schemas licenses privacy secrets public-guard ## Everything CI runs
 
