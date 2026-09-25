@@ -55,7 +55,11 @@ across frames. Publish aggregates only.
 Apache-2.0, ISC, PSF, MPL-2.0, 0BSD, Zlib, CC0). The exact list is `ALLOWED_SPDX` in
 `scripts/license_check.py`. Only an OSI-approved permissive licence may be added to it, and
 only with a justification in the PR. No AGPL, GPL, SSPL, BUSL or non-commercial
-licenses. In particular **`ultralytics` must never be a dependency** (AGPL-3.0). Data
+licenses. Native libraries bundled inside a permissive wheel are acceptable when they are
+dynamically linked and this project never redistributes them. Examples are FFmpeg (LGPL-2.1)
+in `opencv-python-headless` and the GCC runtime libraries under the GCC Runtime Library
+Exception. The PR's dependency table must list them. `scripts/license_check.py` reads
+package metadata only, so these libraries are the reviewer's to check. In particular **`ultralytics` must never be a dependency** (AGPL-3.0). Data
 sources are limited to TfL, the Met Office and the US National Weather Service.
 Open-Meteo may be used only in local development and tests behind an explicit flag,
 never in production (its free tier is non-commercial).
