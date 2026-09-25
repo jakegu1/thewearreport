@@ -211,12 +211,20 @@ def sample(
 ) -> list[Sample]:
     """Up to `n` frames with at least `min_persons` person detections, chosen uniformly at
     random (reservoir sampling, so at most `n` frames are held) and returned in the order
-    they came in."""
+    they came in.
+
+    A frame on which the detector raises DetectorError is skipped, and the number skipped
+    is printed to stderr: only the count, never a camera id or image data."""
     rng = random.Random(seed)  # noqa: S311  (sampling, not security)
     kept: list[tuple[int, Sample]] = []
-    seen = 0
+    seen = skipped = 0
     for frame in frames:
-        persons = tuple(d for d in detector.detect(frame) if d.label == "person")
+        try:
+            found = detector.detect(frame)
+        except detect.DetectorError:
+            skipped += 1
+            continue
+        persons = tuple(d for d in found if d.label == "person")
         if len(persons) < min_persons:
             continue
         if len(kept) < n:
@@ -226,6 +234,12 @@ def sample(
             if slot < n:
                 kept[slot] = (seen, Sample(frame, persons))
         seen += 1
+    if skipped:
+        print(
+            f"spotcheck: skipped {skipped} frame(s) the detector could not read",
+            file=sys.stderr,
+            flush=True,
+        )
     return [s for _, s in sorted(kept, key=lambda pair: pair[0])]
 
 

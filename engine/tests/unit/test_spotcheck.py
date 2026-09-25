@@ -328,6 +328,37 @@ def test_sample_can_pick_every_qualifying_frame_and_keeps_order() -> None:
     assert picked == {0, 2, 3, 5, 6}
 
 
+def test_sample_skips_a_frame_the_detector_fails_on_and_prints_only_the_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class FailsOnSecond:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def detect(self, frame: npt.NDArray[np.uint8]) -> list[detect.Detection]:
+            self.calls += 1
+            if self.calls == 2:
+                raise detect.DetectorError("model output has NaN or infinite values")
+            return [detect.Detection("person", 0.9, _box(k)) for k in range(3)]
+
+    frames = [np.full((H, W, 3), 10 * i, dtype=np.uint8) for i in range(3)]
+    detector = FailsOnSecond()
+    chosen = spotcheck.sample(frames, detector, n=5, min_persons=3, seed=0)
+    assert [int(s.frame[0, 0, 0]) for s in chosen] == [0, 20]
+    assert detector.calls == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "spotcheck: skipped 1 frame(s) the detector could not read\n"
+
+
+def test_sample_prints_nothing_when_no_frame_is_skipped(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    frames = [np.zeros((H, W, 3), dtype=np.uint8)]
+    spotcheck.sample(frames, Stub([3]), n=1, min_persons=3, seed=0)
+    assert capsys.readouterr() == ("", "")
+
+
 def test_sample_ignores_umbrellas() -> None:
     class Umbrellas:
         def detect(self, frame: npt.NDArray[np.uint8]) -> list[detect.Detection]:
