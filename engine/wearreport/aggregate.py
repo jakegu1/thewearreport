@@ -6,7 +6,11 @@ the per-camera counts. Privacy (AGENTS.md INV-1): each frame is dropped as soon 
 detector has seen it, and only counts leave the detection loop: no boxes, coordinates,
 scores or pixels reach the record or the logs. Honesty (INV-6): every camera the
 registry listed appears in exactly one of `frames_ok` and `frames_failed`, and nothing is
-estimated or filled in; a sweep whose weather is unavailable records `null`.
+estimated or filled in; a sweep whose weather is unavailable records `null`. A camera id
+the registry lists more than once counts once. An id that cannot be published as a record
+key is never fetched and never appears in `per_camera`, but it still counts in
+`cameras_listed` and under `frames_failed.invalid_id`, a category that is present only
+when it is at least 1 (a missing category means 0).
 
 `check_record` enforces the schema (data/schema/sweep.v1.json) and the rules between
 fields that a JSON Schema cannot express. The publisher runs it before writing a record
@@ -34,6 +38,8 @@ logger = logging.getLogger("wearreport.aggregate")
 SCHEMA_VERSION: Final = "sweep.v1"
 SOURCE: Final = "tfl-jamcam"
 ERROR_KINDS: Final[tuple[str, ...]] = (*fetch.ERROR_KINDS, "detect")
+# Listed ids that cannot be published; this category is present only when it is non-zero.
+INVALID_ID: Final = "invalid_id"
 TFL_ATTRIBUTION: Final = "Powered by TfL Open Data"
 WEATHER_ATTRIBUTION: Final[Mapping[str, str]] = {
     "metoffice": weather.METOFFICE_ATTRIBUTION,
@@ -158,8 +164,10 @@ def build_record(
 ) -> Record:
     """The sweep.v1 record for one sweep: one observation per camera the registry listed.
 
-    Raises RecordError when the result would not be a valid record (a duplicate or
-    malformed camera id, an unknown error category, a negative count...).
+    An observation with error INVALID_ID stands for a listed id that cannot be published;
+    its camera_id is only used to detect duplicates. Raises RecordError when the result
+    would not be a valid record (a duplicate camera id, a malformed id in per_camera, an
+    unknown error category, a negative count...).
     """
     failed: Counter[str] = Counter()
     per_camera: dict[str, dict[str, int]] = {}
@@ -169,12 +177,14 @@ def build_record(
             raise RecordError("duplicate camera id")
         seen.add(obs.camera_id)
         if obs.error is not None:
-            if obs.error not in ERROR_KINDS:
+            if obs.error not in ERROR_KINDS and obs.error != INVALID_ID:
                 raise RecordError("unknown error category")
             failed[obs.error] += 1
         elif obs.persons or obs.umbrellas:
             per_camera[obs.camera_id] = {"persons": obs.persons, "umbrellas": obs.umbrellas}
     frames_failed = {kind: failed[kind] for kind in ERROR_KINDS}
+    if failed[INVALID_ID]:
+        frames_failed[INVALID_ID] = failed[INVALID_ID]
     attribution = [TFL_ATTRIBUTION]
     if weather is not None:
         attribution.append(WEATHER_ATTRIBUTION[weather.source])
@@ -230,6 +240,18 @@ def _number(value: object, what: str) -> float:
     return float(value)
 
 
+def _check_frames_failed(value: object) -> int:
+    """The total of a frames_failed object: the five categories, plus invalid_id >= 1."""
+    required = frozenset(ERROR_KINDS)
+    if isinstance(value, dict) and INVALID_ID in value:
+        fields = _object(value, required | {INVALID_ID}, "frames_failed")
+        if _count(fields[INVALID_ID], "frames_failed count") < 1:
+            raise RecordError("frames_failed.invalid_id is present but not at least 1")
+    else:
+        fields = _object(value, required, "frames_failed")
+    return sum(_count(v, "frames_failed count") for v in fields.values())
+
+
 def _check_weather(value: object) -> None:
     if value is None:
         return
@@ -256,7 +278,8 @@ def check_record(record: object) -> None:
 
     Covers everything data/schema/sweep.v1.json says, plus: sweep_id is the minute of
     started_at, finished_at is not earlier, the counts add up, and the attribution names
-    exactly the sources used.
+    exactly the sources used. frames_failed has the five categories of ERROR_KINDS, and
+    also invalid_id when that count is at least 1.
     """
     rec = _object(record, RECORD_KEYS, "record")
     if rec["schema"] != SCHEMA_VERSION or rec["source"] != SOURCE:
@@ -269,8 +292,7 @@ def check_record(record: object) -> None:
         raise RecordError("finished_at is before started_at")
     listed = _count(rec["cameras_listed"], "cameras_listed")
     ok = _count(rec["frames_ok"], "frames_ok")
-    failed = _object(rec["frames_failed"], frozenset(ERROR_KINDS), "frames_failed")
-    if ok + sum(_count(v, "frames_failed count") for v in failed.values()) != listed:
+    if ok + _check_frames_failed(rec["frames_failed"]) != listed:
         raise RecordError("frames_ok and frames_failed do not add up to cameras_listed")
     per_camera = rec["per_camera"]
     if not isinstance(per_camera, dict) or len(per_camera) > min(ok, MAX_CAMERAS):
@@ -306,20 +328,32 @@ def _default_list_cameras() -> Sequence[registry.Camera]:
     return registry.list_cameras(load_settings().tfl_app_key)
 
 
-def usable_cameras(cameras: Sequence[registry.Camera]) -> list[registry.Camera]:
-    """Cameras whose id can be published, each once; the registry is external data."""
+def usable_cameras(
+    cameras: Sequence[registry.Camera],
+) -> tuple[list[registry.Camera], list[str]]:
+    """Split the listed cameras into those whose id can be published and the ids that
+    cannot. Each id counts once: a duplicate keeps its first listing. The registry is
+    external data, so the unusable ids are never logged or published."""
     if len(cameras) > MAX_CAMERAS:
         raise SweepError(f"the registry lists more than {MAX_CAMERAS} cameras")
     kept: dict[str, registry.Camera] = {}
+    invalid: dict[str, None] = {}
     for camera in cameras:
-        if CAMERA_ID.fullmatch(camera.id) and camera.id not in kept:
+        if camera.id in kept or camera.id in invalid:
+            continue
+        if CAMERA_ID.fullmatch(camera.id):
             kept[camera.id] = camera
+        else:
+            invalid[camera.id] = None
     if len(kept) != len(cameras):
         logger.warning(
-            "cameras skipped: malformed or duplicate id",
-            extra={"skipped": len(cameras) - len(kept)},
+            "cameras not fetched: malformed or duplicate id",
+            extra={
+                "invalid_ids": len(invalid),
+                "duplicates": len(cameras) - len(kept) - len(invalid),
+            },
         )
-    return list(kept.values())
+    return list(kept.values()), list(invalid)
 
 
 def detect_counts(detector: detect.Detector, results: list[fetch.FrameResult]) -> list[Observation]:
@@ -380,12 +414,13 @@ def run_sweep(
         listed = (list_cameras or _default_list_cameras)()
     except registry.RegistryError as exc:
         raise SweepError(str(exc)) from None
-    cameras = usable_cameras(listed)
+    cameras, invalid = usable_cameras(listed)
     results = (fetch_frames or fetch.fetch_sweep)(cameras)
     if [r.camera_id for r in results] != [c.id for c in cameras]:
         raise SweepError("fetch results do not match the cameras listed")
     observations = detect_counts(detector, results)
     del results
+    observations += [Observation(camera_id, INVALID_ID) for camera_id in invalid]
     finished_at = started_at + timedelta(seconds=max(0.0, monotonic() - clock_start))
     record = build_record(
         observations,

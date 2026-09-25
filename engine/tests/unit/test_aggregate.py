@@ -15,7 +15,7 @@ import jsonschema
 import numpy as np
 import pytest
 
-from wearreport import aggregate, detect, fetch, registry, weather
+from wearreport import aggregate, detect, fetch, publish, registry, weather
 
 SCHEMA = json.loads(
     (Path(__file__).resolve().parents[3] / "data" / "schema" / "sweep.v1.json").read_text()
@@ -170,6 +170,9 @@ BOTH_REJECT: list[tuple[str, Mutation]] = [
     ("count is a fraction", lambda r: r.update(persons_total=2.5)),
     ("frames_failed missing kind", lambda r: r["frames_failed"].pop("detect")),
     ("frames_failed extra kind", lambda r: r["frames_failed"].update(dns=0)),
+    ("frames_failed invalid_id zero", lambda r: r["frames_failed"].update(invalid_id=0)),
+    ("frames_failed invalid_id string", lambda r: r["frames_failed"].update(invalid_id="1")),
+    ("frames_failed invalid_id bool", lambda r: r["frames_failed"].update(invalid_id=True)),
     ("per_camera list", lambda r: r.update(per_camera=[])),
     (
         "per_camera id with slash",
@@ -199,6 +202,7 @@ ONLY_CHECK_REJECTS: list[tuple[str, Mutation]] = [
     ("sweep_id other minute", lambda r: r.update(sweep_id="20260715T1231Z")),
     ("finished before started", lambda r: r.update(finished_at="2026-07-15T12:30:04Z")),
     ("counts do not add up", lambda r: r.update(frames_ok=4)),
+    ("invalid_id not in cameras_listed", lambda r: r["frames_failed"].update(invalid_id=1)),
     ("persons_total not the sum", lambda r: r.update(persons_total=3)),
     ("umbrellas_total not the sum", lambda r: r.update(umbrellas_total=0)),
     ("more per_camera than frames_ok", lambda r: r.update(frames_ok=1, cameras_listed=2)),
@@ -227,6 +231,23 @@ def test_check_record_enforces_rules_between_fields(mutate: Mutation) -> None:
     mutate(record)
     with pytest.raises(aggregate.RecordError):
         aggregate.check_record(record)
+
+
+def test_schema_and_check_record_accept_invalid_id_that_adds_up() -> None:
+    record = _valid()
+    record["frames_failed"]["invalid_id"] = 2
+    record["cameras_listed"] += 2
+    VALIDATOR.validate(record)
+    aggregate.check_record(record)
+
+
+def test_build_record_emits_invalid_id_only_when_an_id_was_dropped() -> None:
+    record = _build([_obs("A", p=1), _obs("../x", "invalid_id"), _obs("a b", "invalid_id")])
+    VALIDATOR.validate(record)
+    assert record["cameras_listed"] == 3 and record["frames_ok"] == 1
+    assert record["frames_failed"]["invalid_id"] == 2
+    assert record["per_camera"] == {"A": {"persons": 1, "umbrellas": 0}}
+    assert "invalid_id" not in _build([_obs("A", p=1), _obs("B", "timeout")])["frames_failed"]
 
 
 @pytest.mark.parametrize(
@@ -367,14 +388,79 @@ def test_run_sweep_with_every_frame_failing() -> None:
     }
 
 
-def test_run_sweep_skips_duplicate_and_unpublishable_camera_ids(
+def test_run_sweep_counts_duplicate_ids_once_and_unpublishable_ids_as_failed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    cams = [_camera("A"), _camera("A"), _camera("bad id"), _camera("B")]
+    cams = [_camera("A"), _camera("A"), _camera("bad id"), _camera("B"), _camera("bad id")]
     record = _sweep(cams, _FakeDetector([1, 1]))
-    assert record["cameras_listed"] == 2
+    VALIDATOR.validate(record)
+    assert record["cameras_listed"] == 3 and record["frames_ok"] == 2
+    assert record["frames_failed"]["invalid_id"] == 1
     assert set(record["per_camera"]) == {"A", "B"}
-    assert any(getattr(r, "skipped", None) == 2 for r in caplog.records)
+    assert any(
+        getattr(r, "invalid_ids", None) == 1 and getattr(r, "duplicates", None) == 2
+        for r in caplog.records
+    )
+    assert "bad id" not in caplog.text + json.dumps(record)
+
+
+# A registry with ten entries: nine unique ids, of which six cannot be published.
+HOSTILE_REGISTRY = (
+    "JamCams_00001.01",
+    "JamCams_00001.02",
+    "../x",
+    "a" * 65,
+    "café",
+    "nul\x00id",
+    "JamCams_00001.01",
+    "sp ace",
+    "x/y",
+    "ok_1",
+)
+
+
+def test_run_sweep_keeps_unpublishable_ids_in_the_denominator() -> None:
+    fetched: list[str] = []
+
+    def fetch_frames(cams: Sequence[registry.Camera]) -> list[fetch.FrameResult]:
+        fetched.extend(c.id for c in cams)
+        return _results(cams, {})
+
+    clock = iter([100.0, 101.0])
+    record = aggregate.run_sweep(
+        _FakeDetector([1, 2, 3]),
+        DIGEST,
+        model_name="yolox_m",
+        list_cameras=lambda: [_camera(c) for c in HOSTILE_REGISTRY],
+        fetch_frames=fetch_frames,
+        conditions=lambda at: None,
+        now=lambda: T0,
+        monotonic=lambda: next(clock),
+    )
+    VALIDATOR.validate(record)
+    aggregate.check_record(record)
+    assert fetched == ["JamCams_00001.01", "JamCams_00001.02", "ok_1"]
+    assert record["cameras_listed"] == len(set(HOSTILE_REGISTRY)) == 9
+    assert record["frames_ok"] == 3
+    assert record["frames_failed"] == {
+        "timeout": 0,
+        "http": 0,
+        "decode": 0,
+        "network": 0,
+        "detect": 0,
+        "invalid_id": 6,
+    }
+    assert set(record["per_camera"]) == {"JamCams_00001.01", "JamCams_00001.02", "ok_1"}
+    # 3 usable frames out of 9 listed cameras is not a successful sweep.
+    assert not publish.is_success(record)
+
+
+def test_run_sweep_with_only_safe_ids_has_exactly_five_failure_categories() -> None:
+    cams = [_camera("JamCams_00001.01"), _camera("ok_1"), _camera("ok_1")]
+    record = _sweep(cams, _FakeDetector([1, 0]))
+    assert record["cameras_listed"] == 2
+    assert set(record["frames_failed"]) == {"timeout", "http", "decode", "network", "detect"}
+    assert publish.is_success(record)
 
 
 def test_run_sweep_fetches_a_duplicated_camera_once_from_its_first_listing() -> None:

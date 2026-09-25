@@ -42,7 +42,7 @@
       "$ref": "#/$defs/count"
     },
     "frames_failed": {
-      "description": "Frames that failed, by error category: timeout, http (a status outside 2xx or an oversized body), decode, network, detect (the detector refused the frame or failed on it).",
+      "description": "Frames that failed, by error category: timeout, http (a status outside 2xx or an oversized body), decode, network, detect (the detector refused the frame or failed on it), invalid_id (a camera the registry listed with an id that cannot be published; it was not fetched). The first five are always present; invalid_id is present only when it is at least 1, and a missing category means 0.",
       "type": "object",
       "required": ["timeout", "http", "decode", "network", "detect"],
       "additionalProperties": false,
@@ -51,7 +51,8 @@
         "http": { "$ref": "#/$defs/count" },
         "decode": { "$ref": "#/$defs/count" },
         "network": { "$ref": "#/$defs/count" },
-        "detect": { "$ref": "#/$defs/count" }
+        "detect": { "$ref": "#/$defs/count" },
+        "invalid_id": { "type": "integer", "minimum": 1 }
       }
     },
     "persons_total": { "$ref": "#/$defs/count" },
