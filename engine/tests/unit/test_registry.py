@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import http.client
-import io
 import json
 import logging
 import socket
 import threading
 import time
 import urllib.error
-import urllib.request
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,14 +37,6 @@ def _place(place_id: str = "cam", **overrides: object) -> dict[str, Any]:
         else:
             place[key] = value
     return place
-
-
-class _Response(io.BytesIO):
-    def __enter__(self) -> _Response:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
 
 def _never_sleep(seconds: float) -> None:
@@ -201,19 +191,6 @@ def test_app_key_is_url_encoded() -> None:
     assert urls == ["https://api.tfl.gov.uk/Place/Type/JamCam?app_key=a+b%26c"]
 
 
-def test_http_fetch_sends_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[urllib.request.Request] = []
-
-    def fake_urlopen(req: urllib.request.Request, timeout: float) -> _Response:
-        seen.append(req)
-        return _Response(b"[]")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    assert registry.http_fetch("https://example.test/x", 30) == b"[]"
-    assert seen[0].full_url == "https://example.test/x"
-    assert seen[0].get_header("User-agent", "").startswith("wearreport")
-
-
 # Command line ---------------------------------------------------------------------------
 
 
@@ -222,11 +199,11 @@ def test_main_uses_app_key_from_settings(
 ) -> None:
     urls: list[str] = []
 
-    def fake_urlopen(req: urllib.request.Request, timeout: float) -> _Response:
-        urls.append(req.full_url)
-        return _Response(FIXTURE.read_bytes())
+    def fake_bounded_get(url: str, *, timeout_s: float, max_bytes: int) -> bytes:
+        urls.append(url)
+        return FIXTURE.read_bytes()
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(registry, "bounded_get", fake_bounded_get)
     monkeypatch.setenv("TFL_APP_KEY", "k123")
     assert registry.main() == 0
     assert urls == ["https://api.tfl.gov.uk/Place/Type/JamCam?app_key=k123"]
@@ -239,10 +216,10 @@ def test_main_uses_app_key_from_settings(
 def test_main_reports_failure_with_exit_code_1(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def fake_urlopen(req: urllib.request.Request, timeout: float) -> _Response:
+    def fake_bounded_get(url: str, *, timeout_s: float, max_bytes: int) -> bytes:
         raise urllib.error.URLError("offline")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(registry, "bounded_get", fake_bounded_get)
     monkeypatch.delenv("TFL_APP_KEY", raising=False)
     sleeps: list[float] = []
     assert registry.main(sleep=sleeps.append) == 1
@@ -296,16 +273,6 @@ def test_body_at_the_cap_is_parsed_and_over_it_is_refused() -> None:
     with pytest.raises(registry.RegistryError, match="exceeds"):
         registry.list_cameras(None, fetch=over, sleep=_never_sleep)
     assert calls == [1]  # a deterministic refusal is not retried
-
-
-def test_http_fetch_reads_at_most_one_byte_past_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Endless(_Response):
-        def read(self, size: int | None = -1) -> bytes:
-            assert size is not None and size > 0, "unbounded read"
-            return b" " * size
-
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: Endless(b""))
-    assert len(registry.http_fetch("https://example.test/x", 30)) == registry.MAX_BODY_BYTES + 1
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 418, 451])
@@ -514,3 +481,119 @@ def test_bounded_get_leaves_no_timer_thread_behind() -> None:
     while threading.active_count() > before and time.monotonic() < deadline:
         time.sleep(0.05)
     assert threading.active_count() <= before
+
+
+# http_fetch: the registry's fetch goes through bounded_get ----------------------------
+
+
+@pytest.fixture
+def allow_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let http_fetch reach the plain-HTTP test server; everything else stays real."""
+    real = registry.bounded_get
+
+    def bounded_get(url: str, *, timeout_s: float, max_bytes: int) -> bytes:
+        return real(url, timeout_s=timeout_s, max_bytes=max_bytes, schemes=("http",))
+
+    monkeypatch.setattr(registry, "bounded_get", bounded_get)
+
+
+@pytest.mark.parametrize("url", ["http://example.test/x", "file:///etc/passwd", "ftp://x/y"])
+def test_http_fetch_is_https_only_and_does_not_retry_a_refused_scheme(url: str) -> None:
+    with pytest.raises(registry.RegistryError, match="must use HTTPS") as info:
+        registry.http_fetch(url, 30)
+    assert "example.test" not in str(info.value)
+    calls: list[int] = []
+
+    def fetch(_: str, timeout: float) -> bytes:
+        calls.append(1)
+        return registry.http_fetch(url, timeout)
+
+    with pytest.raises(registry.RegistryError, match="must use HTTPS"):
+        registry.list_cameras(None, fetch=fetch, sleep=_never_sleep)
+    assert calls == [1]
+
+
+@pytest.mark.usefixtures("allow_http")
+def test_http_fetch_returns_the_body_and_sends_the_user_agent() -> None:
+    agents: list[str] = []
+
+    def ok(h: _Handler) -> None:
+        agents.append(h.headers["User-Agent"])
+        h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(ok) as (url, hits):
+        assert registry.http_fetch(url, 5) == b"[]"
+    assert hits == ["/x"]
+    assert agents[0].startswith("wearreport")
+
+
+@pytest.mark.usefixtures("allow_http")
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_http_fetch_never_follows_a_redirect(status: int) -> None:
+    def redirect(h: _Handler) -> None:
+        if h.path == "/x":
+            h.reply(status, b"", Location="/elsewhere", **{"Content-Length": "0"})
+        else:
+            h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(redirect) as (url, hits):
+        with pytest.raises(urllib.error.HTTPError) as info:
+            registry.http_fetch(url, 5)
+        assert info.value.code == status
+        info.value.close()
+        assert hits == ["/x"]
+        # Through the retry loop: each attempt is one request, and none reaches the target.
+        with pytest.raises(registry.RegistryError, match="after 3 attempts"):
+            registry.list_cameras(
+                None, fetch=lambda _, t: registry.http_fetch(url, t), sleep=lambda s: None
+            )
+    assert hits == ["/x"] * 4
+
+
+@pytest.mark.usefixtures("allow_http")
+def test_http_fetch_trickled_headers_hit_the_deadline() -> None:
+    def trickle(h: _Handler) -> None:
+        with contextlib.suppress(OSError):
+            h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+            for _ in range(60):
+                h.wfile.write(b"X")
+                h.wfile.flush()
+                time.sleep(0.9)
+
+    with _serve(trickle) as (url, hits):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            registry.http_fetch(url, 1)
+        assert time.monotonic() - started < 2
+    assert hits == ["/x"]
+
+
+def _oversized_declared(h: _Handler) -> None:
+    h.send_response(200)
+    h.send_header("Content-Length", str(registry.MAX_BODY_BYTES + 1))
+    h.end_headers()
+    with contextlib.suppress(OSError):
+        h.wfile.write(b" " * 1000)
+
+
+def _oversized_streamed(h: _Handler) -> None:
+    h.send_response(200)
+    h.end_headers()
+    chunk = b" " * (1024 * 1024)
+    with contextlib.suppress(OSError):
+        for _ in range(registry.MAX_BODY_BYTES // len(chunk) + 2):
+            h.wfile.write(chunk)
+
+
+@pytest.mark.usefixtures("allow_http")
+@pytest.mark.parametrize("serve", [_oversized_declared, _oversized_streamed])
+def test_http_fetch_oversized_body_is_a_registry_error_and_not_retried(serve: Any) -> None:
+    with _serve(serve) as (url, hits):
+        with pytest.raises(registry.RegistryError, match="exceeds") as info:
+            registry.http_fetch(url, 5)
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+        with pytest.raises(registry.RegistryError, match="exceeds"):
+            registry.list_cameras(
+                None, fetch=lambda _, t: registry.http_fetch(url, t), sleep=_never_sleep
+            )
+    assert hits == ["/x", "/x"]

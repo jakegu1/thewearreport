@@ -70,19 +70,26 @@ class Registry:
 
 
 def http_fetch(url: str, timeout: float) -> bytes:
-    """GET `url` with the standard library and return the body.
+    """GET `url` once through bounded_get and return the body.
 
-    Reads at most MAX_BODY_BYTES + 1 bytes, so an oversized body is detected without
-    being held in memory.
+    HTTPS only, no redirects, one wall-clock deadline of `timeout` seconds, and a body cap
+    of MAX_BODY_BYTES. A URL that is not HTTPS and an oversized body raise RegistryError,
+    which is never retried.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-        body: bytes = resp.read(MAX_BODY_BYTES + 1)
-    return body
+    try:
+        return bounded_get(url, timeout_s=timeout, max_bytes=MAX_BODY_BYTES)
+    except SchemeNotAllowed:
+        raise RegistryError("JamCam registry URL must use HTTPS") from None
+    except BodyTooLarge:
+        raise RegistryError(f"JamCam registry response exceeds {MAX_BODY_BYTES} bytes") from None
 
 
 class BodyTooLarge(Exception):
     """A response body is, or declares itself, larger than the caller's cap."""
+
+
+class SchemeNotAllowed(ValueError):
+    """The URL's scheme is not one the caller allows; nothing was requested."""
 
 
 def bounded_get(
@@ -90,7 +97,8 @@ def bounded_get(
 ) -> bytes:
     """GET `url` in exactly one request and return its body.
 
-    - Only URLs whose scheme is in `schemes` are opened (ValueError otherwise).
+    - Only URLs whose scheme is in `schemes` are opened (SchemeNotAllowed, a ValueError,
+      otherwise).
     - Redirects are never followed: a 3xx raises urllib.error.HTTPError, as any other
       status outside 2xx does.
     - One wall-clock deadline of `timeout_s` covers connecting, the TLS handshake (and a
@@ -105,7 +113,7 @@ def bounded_get(
     """
     scheme = urllib.parse.urlsplit(url).scheme
     if scheme not in schemes:
-        raise ValueError(f"URL scheme {scheme!r} is not allowed")
+        raise SchemeNotAllowed(f"URL scheme {scheme!r} is not allowed")
     with _Deadline(timeout_s) as deadline:
         try:
             body = _get(url, timeout_s, max_bytes, deadline)
