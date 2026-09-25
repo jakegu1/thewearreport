@@ -35,6 +35,8 @@ def _meta(name: str = "pkg", **fields: str | list[str]) -> Message:
         "GPL-3.0-only OR MIT",
         "(Apache-2.0 OR MIT) AND BSD-3-Clause",
         "Apache-2.0 WITH LLVM-exception",
+        "Zlib",
+        "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",  # numpy
     ],
 )
 def test_allowed_expressions(expression: str) -> None:
