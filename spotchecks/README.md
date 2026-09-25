@@ -30,7 +30,9 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
 It renders them into a new directory `$TMPDIR/wearreport-spotcheck-XXXXXXXX` (mode 0700)
-and prints its path and the numbering:
+and prints its path and the numbering. It refuses to start when that temporary directory
+lies inside this repository or any git work tree, where a `git add` could commit the
+images; set `TMPDIR` to a directory outside it.
 
 - `crops` mode: one image per detection (`crop-0001.png`, ...), the box grown by half its
   width on each side and half its height above and below, clipped to the frame, and

@@ -22,6 +22,7 @@ build/
 *.bmp
 !fixtures/**/*.png
 !fixtures/**/*.jpg
+**/wearreport-spotcheck-*/
 
 # Secrets and local env
 .env

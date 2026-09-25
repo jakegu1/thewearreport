@@ -36,7 +36,8 @@ with `tempfile.mkdtemp(prefix=TEMP_PREFIX)` (mode 0700) and always deletes:
 The static privacy guard exempts exactly this file from its binary-open rules
 (`IMAGE_WRITE_EXEMPTION` in scripts/privacy_guard.py); every other rule still applies,
 and no other engine module may import this one. The tool refuses to run when `CI` or
-`GITHUB_ACTIONS` is set to anything, before any network access.
+`GITHUB_ACTIONS` is non-empty, and when the temporary directory lies inside this
+repository or any git work tree, before any network access.
 
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
 in fixtures/detect/ (no network). Its statistics describe those photos, not the
@@ -142,7 +143,8 @@ LABEL_COLOUR = (255, 255, 255)
 LABEL_BACKGROUND = (0, 0, 0)
 
 DRY_RUN_CAMERAS = 12
-FIXTURE_DIR = Path(__file__).resolve().parents[3] / "fixtures" / "detect"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FIXTURE_DIR = REPO_ROOT / "fixtures" / "detect"
 DRY_RUN_FIXTURES = ("people_aldgate.jpg", "umbrella_rain.jpg")
 
 
@@ -1037,6 +1039,20 @@ def _ci_variables() -> list[str]:
     return [name for name in CI_VARIABLES if os.environ.get(name, "") != ""]
 
 
+def _check_temp_dir(tmpdir: Path) -> None:
+    """Refuse a temporary directory inside this repository or any git work tree, where a
+    `git add` could commit the rendered images. That includes the current directory,
+    which tempfile falls back to when no usual temporary directory is writable."""
+    resolved = tmpdir.resolve()
+    inside = resolved.is_relative_to(REPO_ROOT)
+    inside = inside or any(os.path.lexists(d / ".git") for d in (resolved, *resolved.parents))
+    if inside:
+        raise SpotcheckError(
+            f"the temporary directory {resolved} is inside a git work tree, where the "
+            "rendered images could be committed; set TMPDIR to a directory outside it"
+        )
+
+
 def _check_out_dir(out_dir: Path) -> None:
     existing = out_dir
     while not os.path.lexists(existing):
@@ -1107,6 +1123,7 @@ def _run(
     guard: _SignalGuard,
 ) -> int:
     mode: Mode = args.mode
+    _check_temp_dir(Path(tempfile.gettempdir()))
     out_dir = Path(args.out_dir)
     if args.dry_run and out_dir.resolve() == Path(DEFAULT_OUT_DIR).resolve():
         raise SpotcheckError("--dry-run needs an --out-dir other than spotchecks/")

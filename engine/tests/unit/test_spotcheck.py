@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -386,6 +387,78 @@ def test_unwritable_out_dir_is_refused_before_the_sweep(env: Path, tmp_path: Pat
     blocker.write_text("x", encoding="utf-8")
     assert _run(["--n", "1"], blocker / "out", pipeline=_untouchable(), reviewer=Scripted()) == 1
     assert list(env.iterdir()) == []
+
+
+def _use_tempdir(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for var in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(var, str(path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+
+
+def _refused_temp_dir(capsys: pytest.CaptureFixture[str], out: Path) -> None:
+    code = _run(["--n", "1"], out, pipeline=_untouchable(), reviewer=Scripted())
+    assert code == 1
+    assert "inside a git work tree" in capsys.readouterr().err
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("dot_git", ["directory", "file"])
+def test_temp_dir_inside_a_git_work_tree_is_refused(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dot_git: str,
+) -> None:
+    tree = tmp_path / "clone"
+    tree.mkdir()
+    if dot_git == "directory":
+        (tree / ".git").mkdir()
+    else:
+        (tree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")  # a worktree
+    _use_tempdir(monkeypatch, tree / "fixtures")
+    _refused_temp_dir(capsys, tmp_path / "out")
+    assert _leftovers(tree / "fixtures") == []
+
+
+def test_temp_dir_inside_this_repository_is_refused(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "checkout"  # a repository root without .git, e.g. an export
+    monkeypatch.setattr(spotcheck, "REPO_ROOT", root)
+    _use_tempdir(monkeypatch, root / "fixtures")
+    _refused_temp_dir(capsys, tmp_path / "out")
+    _use_tempdir(monkeypatch, tmp_path / "elsewhere")
+    args = ["--n", "1", "--min-persons", "1"]
+    assert _run(args, tmp_path / "out", pipeline=_pipeline([1]), reviewer=Scripted()) == 0
+
+
+def test_temp_dir_falling_back_to_a_work_tree_is_refused(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tree = tmp_path / "clone"
+    (tree / ".git").mkdir(parents=True)
+    monkeypatch.chdir(tree)
+    monkeypatch.setattr(tempfile, "tempdir", ".")  # what gettempdir() falls back to
+    _refused_temp_dir(capsys, tmp_path / "out")
+
+
+def test_review_directories_are_git_ignored_even_under_fixtures() -> None:
+    git = shutil.which("git")
+    assert git is not None
+    root = Path(spotcheck.__file__).resolve().parents[3]
+    for path in ("fixtures/wearreport-spotcheck-abc/crop-0001.png", "x/wearreport-spotcheck-1/n"):
+        result = subprocess.run(
+            [git, "check-ignore", "--no-index", "-q", path], cwd=root, check=False
+        )
+        assert result.returncode == 0, path
 
 
 @pytest.mark.parametrize("name", ["", "../x", "a" * 65, "x\ny", "-x", "é"])
