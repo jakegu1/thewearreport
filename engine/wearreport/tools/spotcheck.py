@@ -1053,6 +1053,16 @@ def _check_temp_dir(tmpdir: Path) -> None:
         )
 
 
+def _is_real_spotchecks(out_dir: Path) -> bool:
+    """True for the repository's spotchecks/ (or a directory in it), from wherever the
+    tool runs, and for the default spelling relative to the current directory. Dry-run
+    statistics describe the fixtures, and must never be mixed with real ones (INV-6)."""
+    resolved = out_dir.resolve()
+    return resolved.is_relative_to((REPO_ROOT / DEFAULT_OUT_DIR).resolve()) or (
+        resolved == Path(DEFAULT_OUT_DIR).resolve()
+    )
+
+
 def _check_out_dir(out_dir: Path) -> None:
     existing = out_dir
     while not os.path.lexists(existing):
@@ -1125,7 +1135,7 @@ def _run(
     mode: Mode = args.mode
     _check_temp_dir(Path(tempfile.gettempdir()))
     out_dir = Path(args.out_dir)
-    if args.dry_run and out_dir.resolve() == Path(DEFAULT_OUT_DIR).resolve():
+    if args.dry_run and _is_real_spotchecks(out_dir):
         raise SpotcheckError("--dry-run needs an --out-dir other than spotchecks/")
     _check_out_dir(out_dir)
     if reviewer is None:

@@ -483,6 +483,38 @@ def test_dry_run_refuses_the_default_out_dir_spelled_differently(env: Path) -> N
     assert spotcheck.main(args, reviewer=Scripted()) == 1
 
 
+@pytest.mark.parametrize("relative", ["spotchecks", "spotchecks/sub", "engine/../spotchecks"])
+def test_dry_run_refuses_the_repository_spotchecks_from_any_directory(
+    env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relative: str,
+) -> None:
+    root = tmp_path / "checkout"
+    (root / "engine").mkdir(parents=True)
+    (root / "spotchecks").mkdir()
+    monkeypatch.setattr(spotcheck, "REPO_ROOT", root)
+    monkeypatch.chdir(root / "engine")  # run from engine/, as the review did
+    args = ["--dry-run", "--n", "1", "--reviewer", "t", "--out-dir", f"../{relative}"]
+    assert spotcheck.main(args, pipeline=_untouchable(), reviewer=Scripted()) == 1
+    assert "--dry-run needs an --out-dir" in capsys.readouterr().err
+    assert [p.name for p in (root / "spotchecks").iterdir()] == []
+
+
+def test_dry_run_may_write_next_to_the_repository_spotchecks(
+    env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "checkout"
+    (root / "engine").mkdir(parents=True)
+    monkeypatch.setattr(spotcheck, "REPO_ROOT", root)
+    monkeypatch.chdir(root / "engine")
+    args = ["--dry-run", "--n", "1", "--min-persons", "1", "--reviewer", "t"]
+    args += ["--out-dir", "../spotchecks-dry"]
+    assert spotcheck.main(args, pipeline=_pipeline([1]), reviewer=Scripted(), today=DAY) == 0
+    assert (root / "spotchecks-dry" / f"{DAY.isoformat()}.json").is_file()
+
+
 # In-process review paths --------------------------------------------------------------
 
 
