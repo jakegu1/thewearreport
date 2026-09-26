@@ -321,6 +321,42 @@ def test_bedrock_auth_errors_with_the_injected_credential_report_no_message(
 
 
 @pytest.mark.parametrize(
+    "echoed",
+    ["a" * 20, "Z9_-" * 6, "UnrecognizedClient0Exception", "lowercaseexceptionnames"],
+)
+def test_deepinfra_long_key_like_runs_are_redacted_without_a_known_token(
+    server: Any, echoed: str
+) -> None:
+    fake = server(error(422, f"bad input {echoed}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert echoed not in str(caught.value)
+    assert "bad input [redacted]." in str(caught.value)
+
+
+def test_deepinfra_runs_under_twenty_characters_and_error_names_are_kept(server: Any) -> None:
+    kept = "a" * 19 + " ModelNotReadyException ValidationError"
+    fake = server(error(422, kept))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert kept in str(caught.value)
+
+
+def test_bedrock_error_kinds_that_echo_the_token_are_redacted(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"  # noqa: S105  (made up)
+    monkeypatch.setenv(judge.TOKEN_ENV, token)
+    fake = server(Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": f"Bad{token}:x"}))
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(2), endpoint=fake.url
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert token not in str(caught.value) and token[:12] not in str(caught.value)
+
+
+@pytest.mark.parametrize(
     "body",
     [
         {"detail": "Model is not available"},
