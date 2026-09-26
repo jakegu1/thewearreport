@@ -55,15 +55,15 @@ tools/       Repository checks (public guard)
 Requires Linux x86_64 (CI runs `ubuntu-24.04`), `make`, `curl` and `git`.
 
 ```bash
-make setup   # installs uv 0.12.18 if missing, Python 3.12, dependencies and gitleaks
-make check   # everything CI runs: lint, format, types, tests, licences, privacy, secrets, public guard
+make setup   # installs uv 0.12.18 if missing, Python 3.12, dependencies, gitleaks and actionlint
+make check   # everything CI runs: lint, format, types, tests, licences, privacy, secrets, workflow lint, public guard
 make test    # tests only
 make help    # list all targets
 ```
 
 `make setup` installs the pinned uv release into `~/.local/bin` when it is not already
-on `PATH`, and gitleaks into `.tools/bin/`. Both downloads are verified against pinned
-SHA-256 checksums.
+on `PATH`, and gitleaks and actionlint (both MIT, development tools only) into
+`.tools/bin/`. Every download is verified against a pinned SHA-256 checksum.
 
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
@@ -75,6 +75,43 @@ Copy it to `.env` (never committed) and fill in the values you need.
 | Secret scan | `make secrets` | no credentials in git history (INV-3) |
 | Public guard | `make public-guard` | no private material in the repository (INV-9) |
 | Schema validation | `make schemas` | `data/schema/` is valid JSON Schema and samples validate |
+
+## Operations
+
+[`.github/workflows/sweep.yml`](./.github/workflows/sweep.yml) runs one sweep every 20
+minutes from 07:00 to 20:40 London time (cron `*/20 7-20 * * *` with
+`timezone: "Europe/London"`, 42 runs a day). Scheduled and manual runs start from the
+default branch only.
+
+- **Gate.** The first job checks the London time again and skips the sweep outside
+  07:00–21:00, for example when a scheduled run starts late. It also refuses a manual run
+  started from any branch other than the default branch: every branch carries the
+  workflow, and a run there would sweep and publish with that branch's unreviewed code.
+- **One run at a time.** All runs share one concurrency group. A queued run waits, and a
+  run that is publishing is never cancelled.
+- **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the
+  SHA-256 of both models on every run, and the sweep checks it again when it loads YOLOX-m.
+- **Timeout.** The sweep job stops after 15 minutes.
+- **Publishing.** The sweep job checks out the `data` branch shallow and sparse:
+  `status.json` and the last three UTC days of records. If none of those records is a
+  success and the previous `status.json` does not report one, it adds older days until
+  the newest success is in the tree, so `consecutive_failures` counts every failure since.
+  If the branch does not exist, the job creates it as an orphan. The job stages only new `sweeps/**/*.json` records and
+  `status.json`, checks the staged list, then commits and pushes. It is the only job with
+  `contents: write`.
+- **Alert.** A failed sweep is a sweep job that fails (for example, the registry is
+  unreachable, so no record is written) or a published record that is not a success
+  (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert
+  job opens an issue labelled `ops-alert` with the failure summary. While it is open, a
+  further failure comments on it only when the failed stage changes, or when there has
+  been no such note for an hour. The next successful sweep closes it. Runs skipped by the
+  gate are ignored. The alert job is the only job with `issues: write`.
+- **Manual run.** Actions → sweep → Run workflow. Tick `force_fail` to fail the sweep job
+  before it does anything, which tests the alert without publishing. Manual runs obey the
+  gate too.
+
+Repository secrets: `METOFFICE_API_KEY` (required), `TFL_APP_KEY` (optional). The
+workflow never runs on pull requests, so fork code never sees them.
 
 ## License
 

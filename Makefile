@@ -5,24 +5,26 @@
 UV ?= $(shell command -v uv 2>/dev/null || echo $(HOME)/.local/bin/uv)
 RUN := $(UV) run --locked
 GITLEAKS := .tools/bin/gitleaks
+ACTIONLINT := .tools/bin/actionlint
 PY_SRC := engine scripts
 
 .PHONY: help setup check test lint format format-check typecheck schemas licenses \
-	privacy secrets public-guard sweep-dry model
+	privacy secrets workflows public-guard sweep-dry model
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
-setup: ## Install uv (if missing), Python 3.12, dependencies, gitleaks and the model
+setup: ## Install uv (if missing), Python 3.12, dependencies, gitleaks, actionlint and the model
 	@command -v $(UV) >/dev/null 2>&1 || sh scripts/install_uv.sh
 	$(UV) sync --locked
 	sh scripts/install_gitleaks.sh
+	sh scripts/install_actionlint.sh
 	$(MAKE) model
 
 model: ## Download and verify the YOLOX-s and YOLOX-m models into .models/
 	sh scripts/fetch_model.sh --with-m
 
-check: lint format-check typecheck test schemas licenses privacy secrets public-guard ## Everything CI runs
+check: lint format-check typecheck test schemas licenses privacy secrets workflows public-guard ## Everything CI runs
 
 test: ## Run the test suite
 	$(RUN) pytest
@@ -50,6 +52,9 @@ privacy: ## Static privacy guard over engine/ (INV-1)
 
 secrets: ## gitleaks over the full git history (INV-3)
 	$(GITLEAKS) git --no-banner --redact .
+
+workflows: ## actionlint over .github/workflows/ (shellcheck and pyflakes off: same result everywhere)
+	$(ACTIONLINT) -shellcheck= -pyflakes=
 
 public-guard: ## Private-material guard, working tree and history (INV-9)
 	python3 tools/public_guard.py
