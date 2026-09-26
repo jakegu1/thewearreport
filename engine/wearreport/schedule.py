@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import http.client
 import json
 import logging
 import os
@@ -342,10 +343,10 @@ class GitHub:
         """Send one request under /repos/OWNER/NAME and return (status, parsed JSON).
 
         2xx responses, and statuses in `allow`, are returned; anything else raises
-        GitHubError. For GET and PATCH (idempotent), network errors, 429 and 5xx are
-        retried `retries` times with a growing pause; a POST is sent once, so a lost
-        response cannot open a second issue. Redirects are not followed. The token never
-        appears in an error.
+        GitHubError. For GET and PATCH (idempotent), network errors, malformed HTTP
+        responses, 429 and 5xx are retried `retries` times with a growing pause; a POST
+        is sent once, so a lost response cannot open a second issue. Redirects are not
+        followed. The token never appears in an error.
         """
         url = f"{self._api_url}/repos/{self.repo}{path}"
         if query:
@@ -367,7 +368,9 @@ class GitHub:
                 self._sleep(2.0**attempt)
             try:
                 status, raw = self._transport(method, url, data, headers, self._timeout)
-            except (OSError, ValueError) as exc:  # URLError, timeouts, bad responses
+            # URLError, timeouts, malformed responses (http.client: BadStatusLine,
+            # IncompleteRead, LineTooLong and the rest of HTTPException)
+            except (OSError, ValueError, http.client.HTTPException) as exc:
                 logger.warning(
                     "GitHub request failed", extra={"request": what, "error": type(exc).__name__}
                 )

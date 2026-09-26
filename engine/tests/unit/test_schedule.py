@@ -3,9 +3,11 @@ the GitHub client and the alert."""
 
 from __future__ import annotations
 
+import http.client
 import http.server
 import io
 import json
+import socketserver
 import threading
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
@@ -448,6 +450,85 @@ def test_urllib_transport_does_not_follow_redirects(server: str) -> None:
 def test_urllib_transport_times_out(server: str) -> None:
     with pytest.raises(OSError):
         schedule._urllib_transport("GET", f"{server}/slow", None, {}, 0.2)
+
+
+# Raw HTTP replies a well-behaved server never sends; http.client raises HTTPException
+# subclasses (not OSError or ValueError) for each.
+BROKEN_REPLIES = {
+    "/garbage": b"garbage\r\n\r\n",  # BadStatusLine
+    "/chunked": (  # IncompleteRead: a chunk shorter than announced
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\nshort"
+    ),
+    "/longheader": b"HTTP/1.1 200 OK\r\nX-Long: " + b"a" * 70_000 + b"\r\n\r\n",  # LineTooLong
+}
+
+
+class _BrokenHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        request_line = self.rfile.readline().decode("latin-1")
+        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        path = request_line.split(" ")[1] if " " in request_line else "/"
+        self.wfile.write(BROKEN_REPLIES.get(path, b"garbage\r\n\r\n"))
+
+
+@pytest.fixture
+def broken_server() -> Iterator[str]:
+    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _BrokenHandler)
+    httpd.daemon_threads = True
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.parametrize("path", sorted(BROKEN_REPLIES))
+def test_urllib_transport_raises_http_exceptions_on_broken_replies(
+    broken_server: str, path: str
+) -> None:
+    with pytest.raises(http.client.HTTPException):
+        schedule._urllib_transport("GET", f"{broken_server}{path}", None, {}, 5.0)
+
+
+@pytest.mark.parametrize("path", sorted(BROKEN_REPLIES))
+def test_client_turns_broken_replies_into_github_errors_after_retrying(
+    broken_server: str, path: str
+) -> None:
+    calls: list[str] = []
+
+    def transport(
+        method: str, url: str, body: bytes | None, headers: Mapping[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        calls.append(method)
+        return schedule._urllib_transport(method, f"{broken_server}{path}", body, headers, timeout)
+
+    with pytest.raises(schedule.GitHubError, match="3 attempts") as info:
+        schedule.GitHub(REPO, "s3cret", transport=transport, sleep=lambda _: None).request(
+            "GET", "/x"
+        )
+    assert "s3cret" not in str(info.value)
+    assert calls == ["GET", "GET", "GET"]  # within the existing bound
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        http.client.BadStatusLine("garbage"),
+        http.client.IncompleteRead(b"short", 16),
+        http.client.LineTooLong("header line"),
+        http.client.RemoteDisconnected("closed"),
+    ],
+)
+def test_client_retries_a_get_after_an_http_exception(exc: Exception) -> None:
+    script = Script(exc, _ok({"ok": 1}))
+    assert _gh(script).request("GET", "/x") == (200, {"ok": 1})
+    post = Script(exc, _ok({"ok": 1}))
+    with pytest.raises(schedule.GitHubError, match=r"1 attempt$"):
+        _gh(post).request("POST", "/x", body={})  # a POST is still sent once
+    assert len(post.replies) == 1
 
 
 # Reading run history and issues --------------------------------------------------------
