@@ -842,3 +842,51 @@ def test_deepinfra_aws_error_names_stay_readable(server: Any, name: str) -> None
     with pytest.raises(judge.JudgeError) as caught:
         deepinfra(fake).classify(crop())
     assert f"failed: {name}." in str(caught.value)
+
+
+# Made up. Digits among long runs of letters: reduced to letters, it is no longer the token.
+BEDROCK_TOKEN = "Fake9Token5Made4Up6ByTheTestSuiteOnly7ForRedaction"  # noqa: S105
+
+
+@pytest.mark.parametrize("known", [True, False])
+def test_bedrock_an_error_type_echoing_the_token_leaves_no_fragment(
+    server: Any, monkeypatch: pytest.MonkeyPatch, known: bool
+) -> None:
+    token = BEDROCK_TOKEN
+    if known:
+        monkeypatch.setenv(judge.TOKEN_ENV, token)
+    else:
+        monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
+    fake = server(Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": f"{token}:http://x/"}))
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(2),
+        endpoint=fake.url,
+        injected_credential=not known,
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    exc = caught.value
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert _fragments(token, shown) == []
+    assert _fragments(re.sub(r"[^A-Za-z]", "", token), shown) == []
+    assert str(exc).startswith("Bedrock answered HTTP 400")
+
+
+def test_bedrock_a_throttling_error_type_is_still_read(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, BEDROCK_TOKEN)
+    throttled = Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": "ThrottlingException:x"})
+    fake = server(throttled)
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(100),
+        endpoint=fake.url,
+        sleep=lambda _: None,
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert str(caught.value) == "Bedrock answered HTTP 400 ThrottlingException"
+    # Retried: the kind was read through the redaction.
+    assert len(fake.requests) == judge.MAX_RETRIES + 1

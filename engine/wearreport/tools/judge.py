@@ -1218,7 +1218,9 @@ class BedrockClassifier(_HostedClassifier):
 
     def _error_kind(self, exc: urllib.error.HTTPError, raw: bytes) -> str:
         kind = (exc.headers.get("x-amzn-ErrorType") or "") if exc.headers else ""
-        return self._redact(re.sub(r"[^A-Za-z]", "", kind.split(":", 1)[0])[:64])
+        # Redact the raw value first: once reduced to letters, an echoed token no longer
+        # matches the token or looks key-like.
+        return re.sub(r"[^A-Za-z]", "", self._redact(kind.split(":", 1)[0]))[:64]
 
     def _retryable(self, status: int, kind: str) -> bool:
         return status == 429 or status >= 500 or kind == "ThrottlingException"
