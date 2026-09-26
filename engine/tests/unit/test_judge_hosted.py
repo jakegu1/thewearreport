@@ -9,6 +9,7 @@ where a test checks that an unmarked image is refused.
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.server
 import json
 import re
@@ -40,6 +41,7 @@ class Reply:
     delay: float = 0.0
     drip: float = 0.0  # seconds between the body's bytes, sent one at a time
     headers: dict[str, str] = field(default_factory=dict)
+    raw: Callable[[Any], None] | None = None  # writes the whole reply itself, status line on
 
 
 def chat(
@@ -90,6 +92,11 @@ class FakeServer:
                 reply = fake.replies.pop(0) if len(fake.replies) > 1 else fake.replies[0]
                 if reply.delay:
                     time.sleep(reply.delay)
+                if reply.raw is not None:
+                    self.close_connection = True
+                    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                        reply.raw(self.wfile)
+                    return
                 try:
                     self.send_response(reply.status)
                     self.send_header("Content-Type", "application/json")
@@ -350,6 +357,80 @@ def test_deepinfra_a_slowly_sent_reply_ends_at_the_request_deadline(
         clf.classify(crop())
     assert time.monotonic() - start < 1.8
     assert len(fake.requests) == 1  # a timeout is not retried
+
+
+STALL_SECONDS = 8.0  # how long each stalling server below keeps sending, at most
+
+
+def _drip(wfile: Any, head: bytes, unit: bytes, pause: float) -> None:
+    """Send `head`, then `unit` again and again, each well within a read timeout, until the
+    client goes away or STALL_SECONDS pass."""
+    wfile.write(head)
+    wfile.flush()
+    end = time.monotonic() + STALL_SECONDS
+    while time.monotonic() < end:
+        wfile.write(unit)
+        wfile.flush()
+        time.sleep(pause)
+
+
+CHUNKED_HEAD = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
+
+
+def _trailer_flood(body: bytes) -> Reply:
+    # A whole chunked body and its final chunk, then trailer lines that never end.
+    head = CHUNKED_HEAD + b"%x\r\n" % len(body) + body + b"\r\n0\r\n"
+    return Reply(raw=lambda w: _drip(w, head, b"X-Pad: " + b"a" * 1000 + b"\r\n", 0.0005))
+
+
+def _slow_chunk_size(body: bytes) -> Reply:
+    # A chunk-size line that grows one byte at a time.
+    return Reply(raw=lambda w: _drip(w, CHUNKED_HEAD + b"%x" % len(body), b";", 0.2))
+
+
+def _slow_headers(body: bytes) -> Reply:
+    # A header that grows one byte at a time, before the body.
+    return Reply(raw=lambda w: _drip(w, b"HTTP/1.1 200 OK\r\nX-Slow: ", b"a", 0.2))
+
+
+def _hosted(backend: str, fake: FakeServer) -> judge.DeepInfraClassifier | judge.BedrockClassifier:
+    if backend == "deepinfra":
+        return deepinfra(fake, timeout=1.0)
+    return judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(100),
+        endpoint=fake.url,
+        timeout=1.0,
+        sleep=lambda seconds: None,
+        injected_credential=True,
+    )
+
+
+@pytest.mark.parametrize("backend", ["deepinfra", "bedrock"])
+@pytest.mark.parametrize("stall", [_trailer_flood, _slow_chunk_size, _slow_headers])
+def test_a_reply_stalled_inside_http_client_ends_at_the_request_deadline(
+    server: Any, monkeypatch: pytest.MonkeyPatch, backend: str, stall: Callable[[bytes], Reply]
+) -> None:
+    # http.client reads trailers, chunk-size lines and headers without returning to the
+    # body loop, so each byte arriving in time would hold the request for STALL_SECONDS.
+    monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
+    body = (chat() if backend == "deepinfra" else converse()).body
+    fake = server(stall(body))
+    clf = _hosted(backend, fake)
+    start = time.monotonic()
+    with pytest.raises(judge.JudgeError, match="timed out after 1 s"):
+        clf.classify(crop())
+    assert time.monotonic() - start < 1.8
+    assert len(fake.requests) == 1  # a timeout is not retried
+
+
+def test_a_chunked_reply_that_ends_in_time_is_read_whole(server: Any) -> None:
+    body = chat("person").body
+    reply = CHUNKED_HEAD + b"%x\r\n" % len(body) + body + b"\r\n0\r\nX-Done: 1\r\n\r\n"
+    fake = server(Reply(raw=lambda w: w.write(reply)))
+    assert deepinfra(fake, timeout=1.0).classify(crop()) == "person"
 
 
 def test_deepinfra_a_reply_larger_than_one_chunk_is_read_whole(server: Any) -> None:

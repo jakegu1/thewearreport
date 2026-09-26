@@ -83,6 +83,7 @@ for _key in [k for k in os.environ if k.startswith(RUNTIME_ENV_PREFIXES)]:
 
 import argparse  # noqa: E402
 import base64  # noqa: E402
+import contextlib  # noqa: E402
 import ctypes  # noqa: E402
 import hashlib  # noqa: E402
 import http.client  # noqa: E402
@@ -94,6 +95,7 @@ import re  # noqa: E402
 import resource  # noqa: E402
 import socket  # noqa: E402
 import ssl  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.parse  # noqa: E402
@@ -835,6 +837,102 @@ def _set_read_timeout(response: Any, seconds: float) -> None:
         layer = getattr(layer, "raw", None) or getattr(layer, "fp", None)
 
 
+class _Watchdog:
+    """Shuts a request's socket down when the request's deadline passes. http.client reads
+    the status line, the headers, chunk-size lines and trailers without returning to
+    _read_capped, so only closing the socket under it bounds every read in time."""
+
+    def __init__(self, seconds: float) -> None:
+        self.fired = False
+        self._lock = threading.Lock()
+        self._sock: socket.socket | None = None
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+    def attach(self, sock: socket.socket | None) -> None:
+        """Watch `sock`, the request's connected socket; shut it at once if already late."""
+        with self._lock:
+            self._sock = sock
+            fired = self.fired
+        if fired:
+            _shut(sock)
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            sock = self._sock
+        _shut(sock)
+
+
+def _shut(sock: socket.socket | None) -> None:
+    """End every read and write on `sock`, from any thread. The plain socket's shutdown is
+    used even for a TLS socket, so the TLS state is left to the thread reading it."""
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):  # already closed
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+class _WatchedHTTPConnection(http.client.HTTPConnection):
+    watchdog: _Watchdog | None = None
+
+    def connect(self) -> None:
+        super().connect()
+        if self.watchdog is not None:
+            self.watchdog.attach(self.sock)
+
+
+class _WatchedHTTPSConnection(http.client.HTTPSConnection):
+    watchdog: _Watchdog | None = None
+
+    def connect(self) -> None:
+        super().connect()
+        if self.watchdog is not None:
+            self.watchdog.attach(self.sock)
+
+
+def _watched(
+    cls: type[_WatchedHTTPConnection] | type[_WatchedHTTPSConnection],
+    watchdog: Callable[[], _Watchdog | None],
+) -> Callable[..., http.client.HTTPConnection]:
+    """A connection factory for urllib that hands each connection the current watchdog."""
+
+    def connection(*args: Any, **kwargs: Any) -> http.client.HTTPConnection:
+        made = cls(*args, **kwargs)
+        made.watchdog = watchdog()
+        return made
+
+    return connection
+
+
+class _WatchedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, watchdog: Callable[[], _Watchdog | None]) -> None:
+        super().__init__()
+        self._watchdog = watchdog
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_watched(_WatchedHTTPConnection, self._watchdog), req=req)
+
+
+class _WatchedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, watchdog: Callable[[], _Watchdog | None]) -> None:
+        super().__init__(context=ssl.create_default_context())
+        self._watchdog = watchdog
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(
+            _watched(_WatchedHTTPSConnection, self._watchdog),
+            req=req,
+            context=self._context,  # type: ignore[attr-defined]
+        )
+
+
 def _read_capped(response: Any, provider: str, deadline: float) -> bytes:
     """The reply body, read in chunks: at most MAX_RESPONSE_BYTES, and all of it before
     `deadline` (time.monotonic()), so a server that sends slowly cannot hold a request."""
@@ -848,7 +946,9 @@ def _read_capped(response: Any, provider: str, deadline: float) -> bytes:
         chunk = response.read1(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
         if not isinstance(chunk, bytes):
             raise JudgeError(f"{provider} sent a malformed reply")
-        if not chunk:
+        if not chunk:  # the end, or the watchdog shut the socket
+            if time.monotonic() >= deadline:
+                raise _DeadlinePassed(f"{provider} took too long to send its reply")
             return b"".join(chunks)
         chunks.append(chunk)
         size += len(chunk)
@@ -915,12 +1015,14 @@ class _HostedClassifier:
         self._url = url
         self._token = token  # sent as a bearer token when not None
         self._closed = False
+        self._watchdog: _Watchdog | None = None  # the current request's
         # The system's proxy settings apply, except to a server on this machine.
         proxies = urllib.request.ProxyHandler({} if local else None)
         self._opener = urllib.request.build_opener(
             proxies,
             _NoRedirect(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            _WatchedHTTPHandler(lambda: self._watchdog),
+            _WatchedHTTPSHandler(lambda: self._watchdog),
         )
 
     def classify(self, image: Image) -> Answer:
@@ -973,6 +1075,32 @@ class _HostedClassifier:
         )
         timed_out = f"the request timed out after {self._timeout:g} s"
         deadline = time.monotonic() + self._timeout  # for the whole request
+        watchdog = _Watchdog(self._timeout)
+        self._watchdog = watchdog
+        watchdog.start()
+        try:
+            status, raw, kind = self._exchange(request, deadline)
+        except (TimeoutError, _DeadlinePassed):
+            raise JudgeError(timed_out) from None
+        except urllib.error.URLError as exc:
+            if watchdog.fired or isinstance(exc.reason, TimeoutError):
+                raise JudgeError(timed_out) from None
+            raise JudgeError(
+                f"cannot reach {self.provider} ({type(exc.reason).__name__})"
+            ) from None
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            if watchdog.fired:  # the socket was shut under a read: a reset, IncompleteRead
+                raise JudgeError(timed_out) from None
+            raise JudgeError(f"the request failed ({type(exc).__name__})") from None
+        finally:
+            watchdog.cancel()
+            self._watchdog = None
+        if watchdog.fired or time.monotonic() >= deadline:
+            raise JudgeError(timed_out)
+        return status, raw, kind
+
+    def _exchange(self, request: urllib.request.Request, deadline: float) -> tuple[int, bytes, str]:
+        """Send `request` and read its reply: the HTTP status, the body and the error type."""
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
                 return response.status, _read_capped(response, self.provider, deadline), ""
@@ -983,19 +1111,7 @@ class _HostedClassifier:
                 raw = b""
             finally:
                 exc.close()
-            if time.monotonic() >= deadline:
-                raise JudgeError(timed_out) from None
             return exc.code, raw, self._error_kind(exc, raw)
-        except (TimeoutError, _DeadlinePassed):
-            raise JudgeError(timed_out) from None
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, TimeoutError):
-                raise JudgeError(timed_out) from None
-            raise JudgeError(
-                f"cannot reach {self.provider} ({type(exc.reason).__name__})"
-            ) from None
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            raise JudgeError(f"the request failed ({type(exc).__name__})") from None
 
     def _message(self, data: object) -> str:
         """The error message in a provider's error body, or ''."""
