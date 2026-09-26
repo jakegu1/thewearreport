@@ -1,0 +1,20 @@
+{
+  "schema": "status.v1",
+  "generated_at": "2026-09-26T19:09:31Z",
+  "last_sweep_id": "20260926T1906Z",
+  "last_sweep_at": "2026-09-26T19:06:27Z",
+  "sweeps_24h": 1,
+  "successful_sweeps_24h": 1,
+  "success_rate_24h": 1.0,
+  "success_rule": "frames_ok >= 90% of cameras_listed, and cameras_listed > 0",
+  "daytime_sweeps_24h": 1,
+  "median_persons_daytime_24h": 939,
+  "median_rule": "median persons_total over successful sweeps started in London daytime",
+  "daytime": "07:00-21:00 Europe/London",
+  "consecutive_failures": 0,
+  "records_invalid": 0,
+  "attribution": [
+    "Powered by TfL Open Data",
+    "Powered by Met Office data"
+  ]
+}
