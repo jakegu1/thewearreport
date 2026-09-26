@@ -1,6 +1,10 @@
 """Acceptance tests for T-029 (spot-check judge bake-off: a licensed gold set and a local
 open vision model). The task contract: do not edit.
 
+Amended by the lead decision on T-029 (no local model passes the quality bar, so none is
+chosen): AC5 now requires that no model is chosen and that this state fails closed; the
+tests that need weights use one bake-off candidate (PROBE) instead of the chosen model.
+
 Every image in these tests is synthetic, a committed control crop, or a crop of an
 openly licensed gold-set source image. No test reads a camera frame.
 
@@ -56,8 +60,11 @@ def _require(what: str) -> None:
     pytest.skip(f"{what} is missing")
 
 
-def _chosen() -> judge.Candidate:
-    return judge.CANDIDATES[judge.CHOSEN]
+PROBE = "qwen3.5-2b"  # the smallest Qwen3.5 candidate: the runtime checks that need weights
+
+
+def _probe() -> judge.Candidate:
+    return judge.CANDIDATES[PROBE]
 
 
 def _weights_present(candidate: judge.Candidate) -> bool:
@@ -67,8 +74,8 @@ def _weights_present(candidate: judge.Candidate) -> bool:
 
 
 @pytest.fixture(scope="module")
-def chosen_judge() -> Iterator[judge.Judge]:
-    candidate = _chosen()
+def probe_judge() -> Iterator[judge.Judge]:
+    candidate = _probe()
     if not _weights_present(candidate):
         _require(f"the weights of {candidate.name}")
     jd = judge.Judge(candidate)
@@ -408,12 +415,12 @@ def test_ac3_importing_the_runtime_leaves_no_files(tmp_path: Path) -> None:
 
 
 def test_ac3_inference_leaves_no_files(tmp_path: Path) -> None:
-    if not _weights_present(_chosen()):
+    if not _weights_present(_probe()):
         _require("the judge weights")
     code = (
         "import numpy as np\n"
         "from wearreport.tools import judge\n"
-        "jd = judge.Judge(judge.CANDIDATES[judge.CHOSEN])\n"
+        f"jd = judge.Judge(judge.CANDIDATES[{PROBE!r}])\n"
         "print(jd.classify(np.full((120, 60, 3), 90, np.uint8)))\n"
         "jd.close()\n"
     )
@@ -442,7 +449,7 @@ def test_ac3_import_refuses_a_runtime_loaded_without_the_settings(tmp_path: Path
 
 
 def test_ac3_judge_refuses_weights_that_are_not_pinned(tmp_path: Path) -> None:
-    candidate = _chosen()
+    candidate = _probe()
     (tmp_path / candidate.model_file).write_bytes(b"GGUF not really a model")
     (tmp_path / candidate.mmproj_file).write_bytes(b"GGUF not really a projector")
     with pytest.raises(judge.JudgeError):
@@ -451,31 +458,31 @@ def test_ac3_judge_refuses_weights_that_are_not_pinned(tmp_path: Path) -> None:
         judge.Judge(candidate, model_dir=tmp_path / "missing")
 
 
-def test_ac3_classifies_with_every_socket_blocked(chosen_judge: judge.Judge, offline: None) -> None:
+def test_ac3_classifies_with_every_socket_blocked(probe_judge: judge.Judge, offline: None) -> None:
     frame = _synthetic_frame()
     image = goldset.render_crop(frame, (150.0, 80.0, 181.0, 201.0), 1)
-    assert chosen_judge.classify(image) in get_args(judge.Answer)
+    assert probe_judge.classify(image) in get_args(judge.Answer)
     with pytest.raises(AssertionError):
         socket.create_connection(("192.0.2.1", 80))  # the block is in force
 
 
-def test_ac3_runs_on_cpu_within_16_gb(chosen_judge: judge.Judge) -> None:
+def test_ac3_runs_on_cpu_within_16_gb(probe_judge: judge.Judge) -> None:
     assert judge.DEFAULT_THREADS == 4
-    chosen_judge.classify(np.full((160, 80, 3), 120, np.uint8))
+    probe_judge.classify(np.full((160, 80, 3), 120, np.uint8))
     peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     assert peak_kib < 16 * 1024 * 1024
 
 
-def test_ac3_fetch_judge_model_pins_the_chosen_weights() -> None:
+def test_ac3_fetch_judge_model_pins_every_candidate() -> None:
     script = FETCH_JUDGE.read_text()
-    candidate = _chosen()
     assert SAFE_CURL in script and "--max-time" in script and "--retry" in script
-    for name, digest in (
-        (candidate.model_file, candidate.model_sha256),
-        (candidate.mmproj_file, candidate.mmproj_sha256),
-    ):
-        assert name in script and digest in script, name
-    assert candidate.revision in script and candidate.repo in script
+    for candidate in judge.CANDIDATES.values():
+        for name, digest in (
+            (candidate.model_file, candidate.model_sha256),
+            (candidate.mmproj_file, candidate.mmproj_sha256),
+        ):
+            assert name in script and digest in script, name
+        assert candidate.revision in script and candidate.repo in script
     assert not re.search(r"authorization|HF_TOKEN|api[_-]?key", script, re.IGNORECASE)
 
 
@@ -483,9 +490,9 @@ def test_ac3_fetch_judge_model_fails_closed(tmp_path: Path) -> None:
     env = _fake_curl(tmp_path, "printf 'not a model'")
     dest = tmp_path / "judge"
     dest.mkdir()
-    (dest / _chosen().model_file).write_bytes(b"corrupted")
+    (dest / _probe().model_file).write_bytes(b"corrupted")
     (dest / ".x.part.abc123").write_bytes(b"stale")
-    proc = _sh(FETCH_JUDGE, env, "--dest", str(dest))
+    proc = _sh(FETCH_JUDGE, env, "--model", PROBE, "--dest", str(dest))
     assert proc.returncode != 0
     assert list(dest.iterdir()) == []
     log = (tmp_path / "curl.log").read_text()
@@ -497,7 +504,7 @@ def test_ac3_weights_are_ignored_and_never_committed() -> None:
     git = shutil.which("git")
     assert git is not None
     ignored = subprocess.run(
-        [git, "check-ignore", "-q", f"{rel}/{_chosen().model_file}"], cwd=ROOT, check=False
+        [git, "check-ignore", "-q", f"{rel}/{_probe().model_file}"], cwd=ROOT, check=False
     )
     assert ignored.returncode == 0
     tracked = subprocess.run(
@@ -659,8 +666,33 @@ def test_ac5_two_model_agreement() -> None:
     assert judge.agree("unsure", "person") == "unsure"
 
 
-def test_ac5_a_chosen_model_is_pinned() -> None:
-    assert judge.CHOSEN in judge.CANDIDATES
+def test_ac5_no_model_is_chosen_and_that_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert judge.CHOSEN is None
+    # The fetch script, run as the judge workflow runs it, downloads nothing and fails.
+    env = _fake_curl(tmp_path, "printf 'a model'")
+    dest = tmp_path / "judge"
+    dest.mkdir()
+    (dest / "kept").write_bytes(b"x")
+    proc = _sh(FETCH_JUDGE, env, "--dest", str(dest))
+    assert proc.returncode != 0
+    assert "no judge model is chosen" in proc.stderr
+    assert not (tmp_path / "curl.log").exists()
+    assert sorted(p.name for p in dest.iterdir()) == ["kept"]
+    # The command line refuses the chosen model, and opens no judge.
+    opened: list[judge.Candidate] = []
+
+    def open_judge(candidate: judge.Candidate) -> judge.Classifier:
+        opened.append(candidate)
+        raise AssertionError("a judge was opened")
+
+    def crops() -> Iterator[judge.Crop]:
+        yield "person", np.zeros((40, 20, 3), np.uint8)
+
+    code = judge.main(["--bakeoff", "--models", "chosen"], open_judge=open_judge, crops=crops)
+    assert code != 0 and opened == []
+    assert "no judge model is chosen" in capsys.readouterr().err
 
 
 def test_ac5_judge_workflow_is_manual_read_only_and_pinned() -> None:
