@@ -1,6 +1,7 @@
-"""sweep.yml's own scripts, run for real: the data-branch checkout widens its sparse window
-until the failure streak's start is in it, so the published consecutive_failures traces
-back to the records (INV-6).
+"""sweep.yml's own scripts, run for real: the gate refuses manual runs from other
+branches, and the data-branch checkout widens its sparse window until the failure
+streak's start is in it, so the published consecutive_failures traces back to the
+records (INV-6).
 
 Uses the acceptance tests' reader for the workflow and their step runner, so these tests
 run exactly the scripts the acceptance tests run.
@@ -9,14 +10,26 @@ run exactly the scripts the acceptance tests run.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.acceptance.test_t_007 import WORKFLOW, _children, _env, _git, _run_step, _steps, _tool
+from tests.acceptance.test_t_007 import (
+    ROOT,
+    WORKFLOW,
+    _children,
+    _env,
+    _git,
+    _run_step,
+    _steps,
+    _tool,
+)
 from wearreport import aggregate, publish
 
 
@@ -29,6 +42,65 @@ def jobs() -> dict[str, list[str]]:
 def _script(jobs: dict[str, list[str]], job: str, name_part: str) -> str:
     [step] = [s for s in _steps(jobs[job]) if name_part in s.get("name", "")]
     return step["run"]
+
+
+def _gate(jobs: dict[str, list[str]], tmp_path: Path, event: str, ref: str) -> list[str]:
+    """Run the gate step's script at noon London time as `event` on `ref`, with the
+    values its env maps from the github context. Returns its GITHUB_OUTPUT lines."""
+    [step] = [s for s in _steps(jobs["gate"]) if s.get("id") == "gate"]
+    env_map = dict(re.findall(r"^\s*(\w+): \$\{\{ ([\w.]+) \}\}$", step["env"], re.MULTILINE))
+    assert env_map == {
+        "EVENT": "github.event_name",
+        "REF": "github.ref",
+        "DEFAULT_BRANCH": "github.event.repository.default_branch",
+    }
+    context = {
+        "github.event_name": event,
+        "github.ref": ref,
+        "github.event.repository.default_branch": "main",
+    }
+    shim = tmp_path / "bin"
+    shim.mkdir(exist_ok=True)
+    (shim / "python3").unlink(missing_ok=True)
+    # a fixed clock: `gate` reads --now only from its arguments, so wrap python3
+    (shim / "python3").write_text(
+        f'#!/bin/sh\nif [ "$3" = gate ]; then set -- "$@" --now 2026-07-15T11:00:00Z; fi\n'
+        f'exec {sys.executable} "$@"\n'
+    )
+    (shim / "python3").chmod(0o755)
+    output = tmp_path / "output"
+    output.write_text("")
+    env = _env(
+        PATH=f"{shim}{os.pathsep}{os.environ['PATH']}",
+        GITHUB_OUTPUT=str(output),
+        **{name: context[value] for name, value in env_map.items()},
+    )
+    del env["PYTHONPATH"]  # the step sets its own
+    result = subprocess.run(
+        [_tool("bash"), "-e", "-c", step["run"]],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return output.read_text().splitlines()
+
+
+@pytest.mark.parametrize(
+    ("event", "ref", "expected"),
+    [
+        ("schedule", "refs/heads/main", "open=true"),
+        ("workflow_dispatch", "refs/heads/main", "open=true"),
+        ("workflow_dispatch", "refs/heads/task/t-999-x", "open=false"),
+        ("workflow_dispatch", "refs/tags/v1", "open=false"),
+    ],
+)
+def test_the_gate_step_refuses_manual_runs_from_other_refs(
+    tmp_path: Path, jobs: dict[str, list[str]], event: str, ref: str, expected: str
+) -> None:
+    assert _gate(jobs, tmp_path, event, ref) == [expected]
 
 
 def _record(started: datetime, *, ok: bool) -> Any:

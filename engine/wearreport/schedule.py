@@ -3,8 +3,11 @@
 Run by `.github/workflows/sweep.yml` as `python3 -m wearreport.schedule COMMAND`, with no
 dependencies installed, so this module uses the standard library only.
 
-  gate [--now TIME]           print `open=true` in London daytime (07:00-21:00), else
-                              `open=false` (a GITHUB_OUTPUT line); exit 0
+  gate [--now TIME] [--event E --ref R --default-branch B]
+                              print `open=true` in London daytime (07:00-21:00), else
+                              `open=false` (a GITHUB_OUTPUT line); exit 0. With the
+                              event, `open=false` too for a manual run from a ref other
+                              than the default branch
   outcome --status PATH       print `outcome=success|failure` and `consecutive_failures=N`
                               from status.json; exit 1 unless the newest sweep succeeded
   check-staged                read `git diff --cached --name-status` on stdin; exit 1
@@ -104,6 +107,16 @@ def is_open(moment: datetime) -> bool:
         raise ValueError("the gate needs a timezone-aware time")
     local = moment.astimezone(ZoneInfo(LONDON_TZ)).time()
     return DAY_START <= local < DAY_END
+
+
+def ref_allowed(event: str, ref: str, default_branch: str) -> bool:
+    """Whether a run of `event` on `ref` may sweep: scheduled runs always (GitHub starts
+    them from the default branch only); any other run only from refs/heads/<default
+    branch>, so a dispatch on a task branch never runs its unreviewed code with the
+    secrets and the write token."""
+    if event == "schedule":
+        return True
+    return bool(default_branch) and ref == f"refs/heads/{default_branch}"
 
 
 def _parse_now(text: str) -> datetime:
@@ -576,6 +589,9 @@ def _parser() -> argparse.ArgumentParser:
     commands = ap.add_subparsers(dest="command", required=True)
     gate = commands.add_parser("gate", help="is it London daytime?")
     gate.add_argument("--now", help="YYYY-MM-DDTHH:MM:SSZ (default: the current time)")
+    gate.add_argument("--event", help="github.event_name; also needs --ref, --default-branch")
+    gate.add_argument("--ref", help="github.ref")
+    gate.add_argument("--default-branch", help="the repository's default branch")
     outcome = commands.add_parser("outcome", help="did the newest published sweep succeed?")
     outcome.add_argument("--status", type=Path, required=True)
     commands.add_parser("check-staged", help="check `git diff --cached --name-status` on stdin")
@@ -649,6 +665,19 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
     try:
         if args.command == "gate":
             now = datetime.now(UTC) if args.now is None else _parse_now(args.now)
+            given = [x is not None for x in (args.event, args.ref, args.default_branch)]
+            if any(given) and not all(given):
+                raise ScheduleError("--event, --ref and --default-branch go together")
+            if args.event is not None and not ref_allowed(
+                args.event, args.ref, args.default_branch
+            ):
+                print("open=false")
+                print(
+                    f"::error::{args.event} runs start from the default branch only; "
+                    f"refusing {args.ref!r}",
+                    file=sys.stderr,
+                )
+                return 0
             print(f"open={'true' if is_open(now) else 'false'}")
             return 0
         if args.command == "outcome":

@@ -74,6 +74,42 @@ def test_gate_command_defaults_to_now(capsys: pytest.CaptureFixture[str]) -> Non
     assert capsys.readouterr().out.strip() in {"open=true", "open=false"}
 
 
+@pytest.mark.parametrize(
+    ("event", "ref", "default_branch", "allowed"),
+    [
+        ("schedule", "refs/heads/main", "main", True),
+        ("schedule", "", "", True),  # GitHub starts scheduled runs on the default branch
+        ("workflow_dispatch", "refs/heads/main", "main", True),
+        ("workflow_dispatch", "refs/heads/task/t-999-x", "main", False),
+        ("workflow_dispatch", "refs/tags/main", "main", False),
+        ("workflow_dispatch", "refs/heads/main", "", False),  # unknown default: refuse
+        ("workflow_dispatch", "refs/heads/", "", False),
+        ("workflow_dispatch", "refs/heads/mainx", "main", False),
+        ("push", "refs/heads/task/x", "main", False),
+    ],
+)
+def test_ref_allowed(event: str, ref: str, default_branch: str, allowed: bool) -> None:
+    assert schedule.ref_allowed(event, ref, default_branch) is allowed
+
+
+def test_gate_command_refuses_a_manual_run_from_another_branch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    noon = ["--now", "2026-07-15T12:00:00Z"]
+    args = ["--event", "workflow_dispatch", "--default-branch", "main"]
+    assert schedule.main(["gate", *noon, *args, "--ref", "refs/heads/task/x"]) == 0
+    out, err = capsys.readouterr()
+    assert out.splitlines() == ["open=false"]
+    assert "refs/heads/task/x" in err
+    assert schedule.main(["gate", *noon, *args, "--ref", "refs/heads/main"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["open=true"]
+
+
+def test_gate_command_needs_all_three_ref_arguments(capsys: pytest.CaptureFixture[str]) -> None:
+    assert schedule.main(["gate", "--event", "workflow_dispatch", "--ref", "refs/heads/x"]) == 1
+    assert "go together" in capsys.readouterr().err
+
+
 # status.json ---------------------------------------------------------------------------
 
 

@@ -84,7 +84,9 @@ minutes from 07:00 to 20:40 London time (cron `*/20 7-20 * * *` with
 default branch only.
 
 - **Gate.** The first job checks the London time again and skips the sweep outside
-  07:00–21:00, for example when a scheduled run starts late.
+  07:00–21:00, for example when a scheduled run starts late. It also refuses a manual run
+  started from any branch other than the default branch: every branch carries the
+  workflow, and a run there would sweep and publish with that branch's unreviewed code.
 - **One run at a time.** All runs share one concurrency group. A queued run waits, and a
   run that is publishing is never cancelled.
 - **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the

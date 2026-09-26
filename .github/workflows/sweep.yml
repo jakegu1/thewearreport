@@ -44,10 +44,18 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: engine/wearreport
-      - name: Gate on London daytime
+      # Manual runs from any ref but the default branch are refused: every branch
+      # carries this file, and its code would run with the secrets and the write token.
+      - name: Gate on London daytime and the default branch
         id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          PYTHONPATH=engine python3 -m wearreport.schedule gate >> "${GITHUB_OUTPUT}"
+          PYTHONPATH=engine python3 -m wearreport.schedule gate \
+            --event "${EVENT}" --ref "${REF}" --default-branch "${DEFAULT_BRANCH}" \
+            >> "${GITHUB_OUTPUT}"
           cat "${GITHUB_OUTPUT}"
 
   sweep:
