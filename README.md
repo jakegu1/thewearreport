@@ -102,8 +102,9 @@ default branch only.
 - **Alert.** A failed sweep is a sweep job that fails (for example, the registry is
   unreachable, so no record is written) or a published record that is not a success
   (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert
-  job opens an issue labelled `ops-alert` with the failure summary. If one is already open,
-  the job comments on it instead. The next successful sweep closes it. Runs skipped by the
+  job opens an issue labelled `ops-alert` with the failure summary. While it is open, a
+  further failure comments on it only when the failed stage changes, or when there has
+  been no such note for an hour. The next successful sweep closes it. Runs skipped by the
   gate are ignored. The alert job is the only job with `issues: write`.
 - **Manual run.** Actions → sweep → Run workflow. Tick `force_fail` to fail the sweep job
   before it does anything, which tests the alert without publishing. Manual runs obey the

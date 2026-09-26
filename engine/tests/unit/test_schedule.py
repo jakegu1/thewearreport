@@ -13,6 +13,7 @@ from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -704,3 +705,198 @@ def test_alert_command_skips_runs_without_a_sweep(capsys: pytest.CaptureFixture[
     }
     assert schedule.main(argv, env) == 0
     assert "alert: nothing" in capsys.readouterr().out
+
+
+# Alert noise: while the issue is open ---------------------------------------------------
+
+
+T0 = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
+
+
+def _iso(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class Tracker:
+    """An in-memory GitHub that stamps issues and comments with a settable clock and an
+    author, and lists comments with `since` the way the REST API does. Every earlier run
+    failed, so the streak is always past the threshold."""
+
+    def __init__(self) -> None:
+        self.now = T0
+        self.issue: dict[str, Any] | None = None
+        self.comments: list[dict[str, Any]] = []
+        self.comment_listing: tuple[int, bytes] | None = None  # override the reply
+
+    def __call__(
+        self, method: str, url: str, body: bytes | None, headers: Mapping[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        path, _, query = url.removeprefix(f"https://api.github.com/repos/{REPO}").partition("?")
+        payload = json.loads(body) if body else None
+        if method == "GET" and path == "/issues":
+            return _ok([] if self.issue is None else [self.issue])
+        if method == "GET" and path.startswith("/actions/workflows/"):
+            return _ok({"workflow_runs": [{"id": 1, "status": "completed"}]})
+        if method == "GET" and path == "/actions/runs/1/jobs":
+            return _ok({"jobs": [_job("gate", "success"), _job("sweep", "failure")]})
+        if method == "GET" and path.startswith("/labels/"):
+            return _ok({"name": schedule.ALERT_LABEL})
+        if method == "POST" and path == "/issues":
+            assert payload is not None
+            self.issue = {"number": 3, "state": "open", "created_at": _iso(self.now)}
+            self.issue["body"] = payload["body"]
+            return 201, b'{"number": 3}'
+        if method == "GET" and path == "/issues/3/comments":
+            if self.comment_listing is not None:
+                return self.comment_listing
+            since = _utc(parse_qs(query)["since"][0])
+            return _ok([c for c in self.comments if _utc(c["created_at"]) >= since])
+        if method == "POST" and path == "/issues/3/comments":
+            assert payload is not None
+            self.comment(payload["body"])
+            return 201, b"{}"
+        raise AssertionError(f"unexpected request {method} {path}")
+
+    def comment(self, body: str, login: str = schedule.NOTICE_AUTHOR) -> None:
+        self.comments.append({"body": body, "created_at": _iso(self.now), "user": {"login": login}})
+
+    def fail(self, minutes: int, stage: str) -> schedule.Action:
+        self.now = T0 + timedelta(minutes=minutes)
+        return schedule.alert(
+            schedule.GitHub(REPO, "s3cret", transport=self, sleep=lambda _: None),
+            run_id=100 + minutes,
+            branch="main",
+            current=schedule.Outcome.FAILURE,
+            stage=stage,
+            record_failures=5,
+            server_url="https://github.com",
+            now=self.now,
+        )
+
+
+def _utc(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def test_an_open_issue_is_noted_on_a_stage_change_or_hourly() -> None:
+    gh = Tracker()
+    quiet, comment = schedule.Action.QUIET, schedule.Action.COMMENT
+    assert gh.fail(0, "sweep") is schedule.Action.OPEN
+    assert "<!-- ops-alert stage=sweep -->" in gh.issue["body"]  # type: ignore[index]
+    assert gh.fail(20, "sweep") is quiet  # same stage, 20 minutes after the issue
+    assert gh.fail(40, "publish") is comment  # the stage changed
+    assert gh.fail(60, "publish") is quiet
+    assert gh.fail(80, "publish") is quiet
+    assert gh.fail(100, "publish") is comment  # an hour since the last notice
+    assert gh.fail(120, "publish") is quiet
+    assert gh.fail(140, "sweep") is comment
+    assert [schedule._notice_stage(c["body"]) for c in gh.comments] == [
+        "publish",
+        "publish",
+        "sweep",
+    ]
+    # at most one comment an hour per stage: 3 comments in 140 minutes, not 7
+    assert len(gh.comments) == 3
+
+
+def test_notices_from_anyone_else_do_not_quiet_the_alert() -> None:
+    gh = Tracker()
+    gh.fail(0, "sweep")
+    gh.issue["created_at"] = _iso(T0 - timedelta(hours=2))  # type: ignore[index]
+    gh.now = T0 + timedelta(minutes=10)
+    gh.comment("quoting <!-- ops-alert stage=sweep -->", login="someone")
+    gh.comment("no marker here")
+    assert gh.fail(20, "sweep") is schedule.Action.COMMENT
+
+
+def test_a_gone_issue_has_no_notices() -> None:
+    gh = Tracker()
+    gh.fail(0, "sweep")
+    gh.comment_listing = (404, b'{"message": "Not Found"}')
+    gh.issue["created_at"] = None  # type: ignore[index]
+    assert gh.fail(20, "sweep") is schedule.Action.COMMENT
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        _ok({"comments": []}),
+        _ok([1]),
+        _ok(
+            [
+                {
+                    "body": "<!-- ops-alert stage=sweep -->",
+                    "created_at": 5,
+                    "user": {"login": schedule.NOTICE_AUTHOR},
+                }
+            ]
+        ),
+        _ok(
+            [
+                {
+                    "body": "<!-- ops-alert stage=sweep -->",
+                    "created_at": "yesterday",
+                    "user": {"login": schedule.NOTICE_AUTHOR},
+                }
+            ]
+        ),
+        _ok(
+            [
+                {
+                    "body": "x",
+                    "created_at": "2026-13-40T99:00:00Z",
+                    "user": {"login": schedule.NOTICE_AUTHOR},
+                }
+            ]
+        ),
+        (200, b"[" * 100_000),
+    ],
+)
+def test_last_notice_rejects_malformed_comment_listings(listing: tuple[int, bytes]) -> None:
+    gh = Tracker()
+    gh.fail(0, "sweep")
+    gh.comment_listing = listing
+    with pytest.raises(schedule.GitHubError):
+        gh.fail(20, "sweep")
+
+
+@pytest.mark.parametrize("created_at", [7, "2026-07-15 09:00", "2026-02-30T09:00:00Z"])
+def test_last_notice_rejects_a_malformed_issue_time(created_at: Any) -> None:
+    gh = Tracker()
+    gh.fail(0, "sweep")
+    gh.issue["created_at"] = created_at  # type: ignore[index]
+    with pytest.raises(schedule.GitHubError):
+        gh.fail(20, "sweep")
+
+
+@pytest.mark.parametrize(
+    ("stage", "notice", "minutes_later", "expected"),
+    [
+        ("sweep", None, 0, True),
+        ("sweep", "sweep", 20, False),
+        ("sweep", "sweep", 59, False),
+        ("sweep", "sweep", 60, True),
+        ("sweep", "publish", 1, True),
+    ],
+)
+def test_worth_a_comment(
+    stage: str, notice: str | None, minutes_later: int, expected: bool
+) -> None:
+    last = None if notice is None else (T0, notice)
+    now = T0 + timedelta(minutes=minutes_later)
+    assert schedule.worth_a_comment(stage, last, now) is expected
+
+
+@pytest.mark.parametrize(
+    ("body", "stage"),
+    [
+        ("<!-- ops-alert stage=sweep -->", "sweep"),
+        ("<!-- ops-alert stage=sweep -->\n<!-- ops-alert stage=publish -->", "publish"),
+        ("<!-- ops-alert stage=<script> -->", None),
+        ("<!-- ops-alert stage=bogus -->", None),
+        (None, None),
+        (["<!-- ops-alert stage=sweep -->"], None),
+    ],
+)
+def test_notice_stage(body: Any, stage: str | None) -> None:
+    assert schedule._notice_stage(body) == stage

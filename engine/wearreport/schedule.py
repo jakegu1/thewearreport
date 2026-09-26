@@ -25,7 +25,9 @@ run. The count is at least status.json's `consecutive_failures` (failed records)
 a sweep that exits 1 writes no record and one that publishes a failed record exits 0,
 and the workflow fails its sweep job for both. At ALERT_THRESHOLD failures in a row an
 issue labelled ALERT_LABEL is opened, or the open one gets a comment; the next success
-comments and closes it.
+comments and closes it. While the issue is open, a failure adds a comment only when its
+failed stage differs from the newest notice's, or when there has been no notice for
+QUIET_PERIOD; each notice carries a hidden marker naming its stage.
 
 The GitHub API is external data: responses are size-capped and every malformed one
 raises GitHubError. Each request has a timeout and a bounded number of retries.
@@ -47,7 +49,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlencode, urlsplit
@@ -67,6 +69,11 @@ STAGES: Final = frozenset(
 )
 # Previous runs read when counting failures; more than the threshold needs.
 LOOKBACK_RUNS: Final = 20
+# While the issue is open, a failure in the same stage as the newest notice is noted at
+# most this often (a stage change is always noted).
+QUIET_PERIOD: Final = timedelta(hours=1)
+NOTICE_MARKER = re.compile(r"<!-- ops-alert stage=([a-z]+) -->")
+NOTICE_AUTHOR: Final = "github-actions[bot]"
 
 API_URL: Final = "https://api.github.com"
 TIMEOUT_SECONDS: Final = 10.0
@@ -138,6 +145,7 @@ class Outcome(enum.StrEnum):
 class Action(enum.StrEnum):
     OPEN = "open"
     COMMENT = "comment"
+    QUIET = "quiet"  # the issue is open and this failure adds nothing new yet
     CLOSE = "close"
     NOTHING = "nothing"
 
@@ -451,19 +459,79 @@ def previous_outcomes(gh: GitHub, *, run_id: int, branch: str) -> Iterator[tuple
         yield other, run_outcome(_items(jobs, "jobs", "run jobs"))
 
 
-def open_alert_issue(gh: GitHub) -> int | None:
-    """The number of the oldest open issue labelled ALERT_LABEL, or None."""
+def _oldest_open_alert_issue(gh: GitHub) -> tuple[int, Mapping[str, Any]] | None:
     _, issues = gh.request(
         "GET",
         "/issues",
         query={"labels": ALERT_LABEL, "state": "open", "per_page": "100"},
     )
-    numbers = [
-        _positive_int(issue.get("number"), "issues")
+    found = [
+        (_positive_int(issue.get("number"), "issues"), issue)
         for issue in _items(issues, None, "issues")
         if "pull_request" not in issue and issue.get("state") == "open"
     ]
-    return min(numbers, default=None)
+    return min(found, key=lambda item: item[0], default=None)
+
+
+def open_alert_issue(gh: GitHub) -> int | None:
+    """The number of the oldest open issue labelled ALERT_LABEL, or None."""
+    found = _oldest_open_alert_issue(gh)
+    return None if found is None else found[0]
+
+
+def _timestamp(value: Any, what: str) -> datetime | None:
+    """A GitHub `YYYY-MM-DDTHH:MM:SSZ` time; None when absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GitHubError(f"{what}: unexpected response")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        raise GitHubError(f"{what}: unexpected response") from None
+
+
+def _notice_stage(body: Any) -> str | None:
+    """The stage named by the last notice marker in `body`, or None."""
+    if not isinstance(body, str):
+        return None
+    stages = [stage for stage in NOTICE_MARKER.findall(body) if stage in STAGES]
+    return stages[-1] if stages else None
+
+
+def last_notice(
+    gh: GitHub, number: int, issue: Mapping[str, Any], now: datetime
+) -> tuple[datetime, str] | None:
+    """(time, stage) of the newest failure notice on the open alert issue within the
+    last QUIET_PERIOD, or None. A notice is the issue itself, or a comment by
+    NOTICE_AUTHOR, carrying a NOTICE_MARKER. An issue that is gone (404) has none."""
+    since = now - QUIET_PERIOD
+    notices: list[tuple[datetime, str]] = []
+    created, stage = _timestamp(issue.get("created_at"), "issues"), _notice_stage(issue.get("body"))
+    if created is not None and stage is not None and created > since:
+        notices.append((created, stage))
+    status, comments = gh.request(
+        "GET",
+        f"/issues/{number}/comments",
+        query={"since": since.strftime("%Y-%m-%dT%H:%M:%SZ"), "per_page": "100"},
+        allow=(404,),
+    )
+    if status != 404:
+        for comment in _items(comments, None, "issue comments"):
+            user = comment.get("user")
+            if not isinstance(user, dict) or user.get("login") != NOTICE_AUTHOR:
+                continue
+            created = _timestamp(comment.get("created_at"), "issue comments")
+            stage = _notice_stage(comment.get("body"))
+            if created is not None and stage is not None and created > since:
+                notices.append((created, stage))
+    return max(notices, default=None)
+
+
+def worth_a_comment(stage: str, notice: tuple[datetime, str] | None, now: datetime) -> bool:
+    """Whether a failure in `stage` should comment on the open alert issue, given its
+    newest notice: when there is none within QUIET_PERIOD, or it named another stage."""
+    return notice is None or notice[1] != stage or now - notice[0] >= QUIET_PERIOD
 
 
 def _ensure_label(gh: GitHub) -> None:
@@ -502,7 +570,12 @@ def _failure_text(failures: int, ctx: _Context, failed_runs: Sequence[str]) -> s
     if failed_runs:
         lines += ["", "Earlier failed runs, newest first:"]
         lines += [f"- {url}" for url in failed_runs]
-    lines += ["", "This issue is closed automatically after the next successful sweep."]
+    lines += [
+        "",
+        "This issue is closed automatically after the next successful sweep. Further",
+        "failures are noted when the failed stage changes, or hourly otherwise.",
+        f"<!-- ops-alert stage={ctx.stage} -->",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -515,8 +588,10 @@ def alert(
     stage: str,
     record_failures: int | None,
     server_url: str,
+    now: datetime | None = None,
 ) -> Action:
     """Count consecutive failures including this run and act on the alert issue."""
+    now = datetime.now(UTC) if now is None else now
     if current is Outcome.NONE:
         _log(Action.NOTHING, 0, None)
         return Action.NOTHING
@@ -526,7 +601,8 @@ def alert(
         stage=stage if stage in STAGES else "unknown",
         record_failures=record_failures,
     )
-    issue = open_alert_issue(gh)
+    found = _oldest_open_alert_issue(gh)
+    issue = None if found is None else found[0]
     if current is Outcome.SUCCESS:
         action = decide(current, 0, issue is not None)
         if action is Action.CLOSE and issue is not None:
@@ -551,6 +627,10 @@ def alert(
             failed_runs.append(f"{base}/{other}")
     failures = max(1 + consecutive_failures(history), record_failures or 0)
     action = decide(current, failures, issue is not None)
+    if action is Action.COMMENT and found is not None:
+        notice = last_notice(gh, found[0], found[1], now)
+        if not worth_a_comment(ctx.stage, notice, now):
+            action = Action.QUIET
     text = _failure_text(failures, ctx, failed_runs)
     if action is Action.OPEN:
         _ensure_label(gh)
