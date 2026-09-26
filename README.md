@@ -91,8 +91,10 @@ default branch only.
   SHA-256 of both models on every run, and the sweep checks it again when it loads YOLOX-m.
 - **Timeout.** The sweep job stops after 15 minutes.
 - **Publishing.** The sweep job checks out the `data` branch shallow and sparse:
-  `status.json` and the last three UTC days of records. If the branch does not exist, the
-  job creates it as an orphan. The job stages only new `sweeps/**/*.json` records and
+  `status.json` and the last three UTC days of records. If none of those records is a
+  success and the previous `status.json` does not report one, it adds older days until
+  the newest success is in the tree, so `consecutive_failures` counts every failure since.
+  If the branch does not exist, the job creates it as an orphan. The job stages only new `sweeps/**/*.json` records and
   `status.json`, checks the staged list, then commits and pushes. It is the only job with
   `contents: write`.
 - **Alert.** A failed sweep is a sweep job that fails (for example, the registry is

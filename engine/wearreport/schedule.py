@@ -9,6 +9,9 @@ dependencies installed, so this module uses the standard library only.
                               from status.json; exit 1 unless the newest sweep succeeded
   check-staged                read `git diff --cached --name-status` on stdin; exit 1
                               unless it only adds records and adds or updates status.json
+  streak-closed --data-dir D  exit 0 when the checked-out data branch in D shows where the
+                              failure streak ends (a successful record, or a status.json
+                              whose newest sweep succeeded), else exit 1
   alert --gate-result R --sweep-result R [--stage S] [--record-failures N]
                               open, comment on or close the `ops-alert` issue
 
@@ -33,6 +36,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import time as time_module
 import urllib.error
@@ -74,6 +78,9 @@ RECORD_PATH = re.compile(
     rf"sweeps/([0-9]{{4}})/([0-9]{{2}})/([0-9]{{2}})/({SWEEP_ID.pattern})\.json"
 )
 STATUS_PATH: Final = "status.json"
+# wearreport.publish's success rule and record size cap (a test keeps them equal).
+SUCCESS_NUMERATOR, SUCCESS_DENOMINATOR = 9, 10
+MAX_RECORD_BYTES: Final = 1024 * 1024
 
 
 class ScheduleError(RuntimeError):
@@ -188,6 +195,57 @@ def decide(current: Outcome, failures: int, issue_open: bool) -> Action:
     if current is Outcome.FAILURE and failures >= ALERT_THRESHOLD:
         return Action.COMMENT if issue_open else Action.OPEN
     return Action.NOTHING
+
+
+# Sparse data branch --------------------------------------------------------------------
+
+
+def record_succeeded(path: Path) -> bool:
+    """Whether the record file at `path` is a sweep that succeeded under the publisher's
+    rule (at least 90% of the cameras listed gave a usable frame). Anything unreadable
+    or malformed is not a success, as the publisher leaves it out of status.json."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_RECORD_BYTES + 1)
+        if len(data) > MAX_RECORD_BYTES:
+            return False
+        record = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):  # includes UnicodeDecodeError
+        return False
+    if not isinstance(record, dict):
+        return False
+    listed, ok = record.get("cameras_listed"), record.get("frames_ok")
+    if type(listed) is not int or type(ok) is not int:
+        return False
+    return listed > 0 and ok * SUCCESS_DENOMINATOR >= listed * SUCCESS_NUMERATOR
+
+
+def streak_closed(data_dir: Path) -> bool:
+    """Whether the checked-out part of the data branch shows where the current failure
+    streak ends, so that status.json's `consecutive_failures` can be counted from it.
+
+    True when status.json says the newest published sweep succeeded (older records
+    cannot change the count), or when a checked-out record succeeded. Records must be
+    regular files under their own date, sweeps/YYYY/MM/DD/, with no symlinked directory
+    on the way.
+    """
+    try:
+        if status_failures(data_dir / STATUS_PATH) == 0:
+            return True
+    except ScheduleError:
+        pass  # no usable status.json: look at the records
+    for path in sorted((data_dir / "sweeps").glob("*/*/*/*.json"), reverse=True):
+        relative = path.relative_to(data_dir)
+        m = RECORD_PATH.fullmatch(relative.as_posix())
+        if not m or m.group(4)[0:8] != "".join(m.group(1, 2, 3)):
+            continue
+        if any((data_dir / parent).is_symlink() for parent in list(relative.parents)[:-1]):
+            continue
+        if record_succeeded(path):
+            return True
+    return False
 
 
 # Staged paths --------------------------------------------------------------------------
@@ -515,6 +573,10 @@ def _parser() -> argparse.ArgumentParser:
     outcome = commands.add_parser("outcome", help="did the newest published sweep succeed?")
     outcome.add_argument("--status", type=Path, required=True)
     commands.add_parser("check-staged", help="check `git diff --cached --name-status` on stdin")
+    streak = commands.add_parser(
+        "streak-closed", help="does the checked-out data branch show where the streak ends?"
+    )
+    streak.add_argument("--data-dir", type=Path, required=True)
     al = commands.add_parser("alert", help="open, comment on or close the alert issue")
     al.add_argument("--gate-result", required=True)
     al.add_argument("--sweep-result", required=True)
@@ -593,6 +655,10 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
             print(f"outcome={'success' if failures == 0 else 'failure'}")
             print(f"consecutive_failures={failures}")
             return 0 if failures == 0 else 1
+        if args.command == "streak-closed":
+            closed = streak_closed(args.data_dir)
+            print(f"streak-closed: {'yes' if closed else 'no'}")
+            return 0 if closed else 1
         if args.command == "check-staged":
             for path in check_staged(sys.stdin):
                 print(f"staged: {path}")

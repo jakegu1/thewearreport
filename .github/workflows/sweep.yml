@@ -108,13 +108,28 @@ jobs:
           git ls-remote --exit-code --heads origin refs/heads/data > /dev/null || rc=$?
           if [ "${rc}" -eq 0 ]; then
             # status.json and the last three UTC days of records: enough for the 24 h
-            # window and a recent success. Older days stay in git, not in the tree.
+            # window. Older days stay in git, not in the tree, unless needed below.
             git sparse-checkout set --no-cone /status.json \
               "/sweeps/$(date -u -d '2 days ago' +%Y/%m/%d)/" \
               "/sweeps/$(date -u -d '1 day ago' +%Y/%m/%d)/" \
               "/sweeps/$(date -u +%Y/%m/%d)/"
             git fetch -q --depth=1 --no-tags origin refs/heads/data
             git checkout -q -b data FETCH_HEAD
+            # consecutive_failures counts back to the newest success, however old. While
+            # the checked-out days do not show it, add older days, newest first, until
+            # they do or the history ends. The fetched tip already holds every record,
+            # so no deeper fetch is needed.
+            oldest="sweeps/$(date -u -d '2 days ago' +%Y/%m/%d)"
+            while read -r day; do
+              [[ "${day}" < "${oldest}" ]] || continue
+              if PYTHONPATH="${GITHUB_WORKSPACE}/engine" \
+                python3 -m wearreport.schedule streak-closed --data-dir .; then
+                break
+              fi
+              git sparse-checkout add "/${day}/"
+            done < <(git ls-tree -r --name-only HEAD -- sweeps \
+              | sed -n 's#^\(sweeps/[0-9]\{4\}/[0-9]\{2\}/[0-9]\{2\}\)/[^/]*$#\1#p' \
+              | sort -ru)
           elif [ "${rc}" -eq 2 ]; then
             echo "the data branch does not exist yet: starting it as an orphan"
             git checkout -q --orphan data

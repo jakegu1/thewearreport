@@ -8,7 +8,7 @@ import io
 import json
 import threading
 from collections.abc import Iterator, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +117,122 @@ def test_outcome_command_prints_the_count(
     path = _status(tmp_path, b'{"consecutive_failures": 2}')
     assert schedule.main(["outcome", "--status", str(path)]) == 1
     assert capsys.readouterr().out.splitlines() == ["outcome=failure", "consecutive_failures=2"]
+
+
+# The sparse data branch ----------------------------------------------------------------
+
+
+def test_success_rule_and_record_cap_match_the_publisher() -> None:
+    assert (schedule.SUCCESS_NUMERATOR, schedule.SUCCESS_DENOMINATOR) == (
+        publish.SUCCESS_NUMERATOR,
+        publish.SUCCESS_DENOMINATOR,
+    )
+    assert schedule.MAX_RECORD_BYTES == publish.MAX_RECORD_BYTES
+
+
+def _sweep(started: datetime, usable: int) -> Any:
+    observations = [
+        aggregate.Observation(f"C{i:04d}", None if i < usable else "timeout") for i in range(10)
+    ]
+    return aggregate.build_record(
+        observations,
+        started_at=started,
+        finished_at=started + timedelta(minutes=4),
+        weather=None,
+        engine_version="0.0.0",
+        model_name="yolox_m",
+        model_sha256="b" * 64,
+    )
+
+
+@pytest.mark.parametrize("usable", [0, 5, 8, 9, 10])
+def test_record_succeeded_agrees_with_the_publisher(tmp_path: Path, usable: int) -> None:
+    record = _sweep(datetime(2026, 7, 15, 12, 0, tzinfo=UTC), usable)
+    path = tmp_path / "r.json"
+    path.write_bytes(publish.serialize(record))
+    assert schedule.record_succeeded(path) is publish.is_success(record)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"not json",
+        b"\xff\xfe",
+        b"[" * 100_000 + b"]" * 100_000,
+        b"[]",
+        b'{"cameras_listed": 0, "frames_ok": 0}',
+        b'{"cameras_listed": 10, "frames_ok": true}',
+        b'{"cameras_listed": 10.0, "frames_ok": 10}',
+        b'{"cameras_listed": "10", "frames_ok": 10}',
+        b'{"frames_ok": 10}',
+        b'{"cameras_listed": 10, "frames_ok": 10}' + b" " * schedule.MAX_RECORD_BYTES,
+    ],
+)
+def test_record_succeeded_is_false_for_malformed_files(tmp_path: Path, data: bytes) -> None:
+    path = tmp_path / "r.json"
+    path.write_bytes(data)
+    assert schedule.record_succeeded(path) is False
+
+
+def test_record_succeeded_is_false_for_a_missing_file_or_a_directory(tmp_path: Path) -> None:
+    assert schedule.record_succeeded(tmp_path / "absent.json") is False
+    assert schedule.record_succeeded(tmp_path) is False
+
+
+def _put(data_dir: Path, record: Any) -> Path:
+    path = publish.record_path(data_dir, record["sweep_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(publish.serialize(record))
+    return path
+
+
+def test_streak_closed_by_a_successful_record(tmp_path: Path) -> None:
+    started = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+    _put(tmp_path, _sweep(started, 5))
+    assert schedule.streak_closed(tmp_path) is False
+    _put(tmp_path, _sweep(started - timedelta(days=1), 10))
+    assert schedule.streak_closed(tmp_path) is True
+
+
+def test_streak_closed_by_a_status_whose_newest_sweep_succeeded(tmp_path: Path) -> None:
+    assert schedule.streak_closed(tmp_path) is False  # nothing at all: keep looking
+    _status(tmp_path, b'{"consecutive_failures": 2}')
+    assert schedule.streak_closed(tmp_path) is False
+    _status(tmp_path, b'{"consecutive_failures": 0}')
+    assert schedule.streak_closed(tmp_path) is True
+
+
+def test_streak_closed_ignores_misplaced_and_symlinked_records(tmp_path: Path) -> None:
+    record = _sweep(datetime(2026, 7, 15, 12, 0, tzinfo=UTC), 10)
+    real = _put(tmp_path / "elsewhere", record)
+    # under the wrong date
+    wrong_date = tmp_path / "wrong-date"
+    moved = wrong_date / "sweeps" / "2026" / "07" / "16" / real.name
+    moved.parent.mkdir(parents=True)
+    moved.write_bytes(real.read_bytes())
+    assert schedule.streak_closed(wrong_date) is False
+    # a symlinked record file
+    link_file = tmp_path / "link-file"
+    linked = publish.record_path(link_file, record["sweep_id"])
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(real)
+    assert schedule.streak_closed(link_file) is False
+    # a record reached through a symlinked directory
+    link_dir = tmp_path / "link-dir"
+    (link_dir / "sweeps").mkdir(parents=True)
+    (link_dir / "sweeps" / "2026").symlink_to(tmp_path / "elsewhere" / "sweeps" / "2026")
+    assert publish.record_path(link_dir, record["sweep_id"]).is_file()
+    assert schedule.streak_closed(link_dir) is False
+    # and the real one does close the streak
+    assert schedule.streak_closed(tmp_path / "elsewhere") is True
+
+
+def test_streak_closed_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert schedule.main(["streak-closed", "--data-dir", str(tmp_path)]) == 1
+    _status(tmp_path, b'{"consecutive_failures": 0}')
+    assert schedule.main(["streak-closed", "--data-dir", str(tmp_path)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["streak-closed: no", "streak-closed: yes"]
 
 
 # Outcomes and decisions ----------------------------------------------------------------
