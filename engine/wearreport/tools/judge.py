@@ -750,6 +750,9 @@ PNG_SUFFIX = ".png"  # the format each crop is sent in, encoded in memory
 MAX_RESPONSE_BYTES = 1 << 20
 READ_CHUNK_BYTES = 1 << 16
 MAX_ERROR_CHARS = 200
+# Refusals of the credential: their messages can echo a key in any form, so only the status
+# and the error kind are reported.
+AUTH_STATUSES = frozenset({401, 403, 407})
 FILTERED_STOPS = frozenset({"content_filtered", "guardrail_intervened"})
 DEEPINFRA_ORIGIN = "https://api.deepinfra.com"
 DEEPINFRA_PATH = "/v1/openai/chat/completions"
@@ -1002,13 +1005,16 @@ class _HostedClassifier:
         return ""
 
     def _describe(self, status: int, kind: str, raw: bytes) -> str:
-        """An error for a failed request, with the service's message, never a credential."""
+        """An error for a failed request, with the service's message, never a credential.
+        A refusal of the credential (AUTH_STATUSES) carries no message at all."""
+        text = f"{self.provider} answered HTTP {status}" + (f" {kind}" if kind else "")
+        if status in AUTH_STATUSES:
+            return text
         try:
             message = self._message(json.loads(raw.decode("utf-8")))
         except (ValueError, TypeError, UnicodeDecodeError, RecursionError, OverflowError):
             message = ""
         message = self._redact(message)
-        text = f"{self.provider} answered HTTP {status}" + (f" {kind}" if kind else "")
         return text + (f": {message}" if message else "")
 
     def _redact(self, text: str) -> str:

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -238,20 +239,78 @@ def test_deepinfra_server_errors_are_retried_at_most_three_times(server: Any) ->
     assert len(fake.requests) == 1 + judge.MAX_RETRIES
 
 
-@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422])
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 407, 422])
 def test_deepinfra_client_errors_are_not_retried(server: Any, status: int) -> None:
     fake = server(error(status, "bad request"))
-    with pytest.raises(judge.JudgeError, match=f"DeepInfra answered HTTP {status}: bad request"):
+    with pytest.raises(judge.JudgeError, match=f"DeepInfra answered HTTP {status}"):
         deepinfra(fake).classify(crop())
     assert len(fake.requests) == 1
 
 
 def test_deepinfra_errors_redact_an_echoed_bearer_credential(server: Any) -> None:
     secret = "di-" + "s" * 40
-    fake = server(error(401, f"invalid key Bearer {secret}"))
+    fake = server(error(400, f"invalid key Bearer {secret}"))
     with pytest.raises(judge.JudgeError) as caught:
         deepinfra(fake).classify(crop())
     assert secret not in str(caught.value) and "Bearer [redacted]" in str(caught.value)
+
+
+ECHOED_KEY = "FAKEKEY0123456789abcdef"  # made up; no "Bearer" in front of it
+
+
+@pytest.mark.parametrize("status", sorted(judge.AUTH_STATUSES))
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": {"message": f"Invalid API key: {ECHOED_KEY}"}},
+        {"detail": f"Invalid API key: {ECHOED_KEY}"},
+        {"error": f"Invalid API key: {ECHOED_KEY}"},
+        {"message": f"Invalid API key: {ECHOED_KEY}"},
+    ],
+)
+def test_deepinfra_auth_errors_report_only_the_status(
+    server: Any, status: int, body: dict[str, Any]
+) -> None:
+    fake = server(Reply(status=status, body=json.dumps(body).encode()))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    exc = caught.value
+    assert str(exc) == f"DeepInfra answered HTTP {status}"
+    assert ECHOED_KEY[:8] not in str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert len(fake.requests) == 1  # a refused credential is not retried
+
+
+def test_a_deepinfra_run_never_prints_a_key_echoed_on_401(
+    server: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = server(error(401, f"Invalid API key: {ECHOED_KEY}"))
+    code = judge.deepinfra_main(_argv("--max-requests", "3"), crops=_crops(4), endpoint=fake.url)
+    out = capsys.readouterr()
+    assert code == 0 and "not run: DeepInfra answered HTTP 401" in out.out
+    assert ECHOED_KEY[:8] not in out.out + out.err
+
+
+@pytest.mark.parametrize("status", sorted(judge.AUTH_STATUSES))
+def test_bedrock_auth_errors_with_the_injected_credential_report_no_message(
+    server: Any, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
+    fake = server(
+        Reply(
+            status=status,
+            body=json.dumps({"message": f"The security token {ECHOED_KEY} is invalid"}).encode(),
+            headers={"x-amzn-ErrorType": "UnrecognizedClientException:http://internal/"},
+        )
+    )
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(2),
+        endpoint=fake.url,
+        injected_credential=True,
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert str(caught.value) == f"Bedrock answered HTTP {status} UnrecognizedClientException"
 
 
 @pytest.mark.parametrize(

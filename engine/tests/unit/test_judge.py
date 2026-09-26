@@ -340,9 +340,9 @@ def test_partial_tokens_in_an_error_message_are_redacted(monkeypatch: pytest.Mon
     monkeypatch.setenv(judge.TOKEN_ENV, token)
     clf = judge.BedrockClassifier(next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(1))
     raw = ('{"message": "bad key ' + token[5:30] + " or " + token + '\\u0007"}').encode()
-    text = clf._describe(403, "AccessDeniedException", raw)
+    text = clf._describe(400, "ValidationException", raw)
     assert token[5:30] not in text and token not in text and "\x07" not in text
-    assert text.startswith("Bedrock answered HTTP 403 AccessDeniedException: bad key")
+    assert text.startswith("Bedrock answered HTTP 400 ValidationException: bad key")
 
 
 def test_a_closed_bedrock_classifier_refuses_to_answer(monkeypatch: pytest.MonkeyPatch) -> None:
