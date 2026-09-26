@@ -161,8 +161,11 @@ def current_outcome(gate_result: str, sweep_result: str) -> Outcome:
 
 
 def run_outcome(jobs: Sequence[Mapping[str, Any]]) -> Outcome:
-    """A finished run's outcome from its jobs (as the jobs API lists them)."""
-    by_name = {job.get("name"): job for job in jobs}
+    """A finished run's outcome from its jobs (as the jobs API lists them). Raises
+    GitHubError when a job's name is not a string."""
+    if any(type(job.get("name")) is not str for job in jobs):
+        raise GitHubError("run jobs: unexpected response")
+    by_name = {job["name"]: job for job in jobs}
     gate, sweep = by_name.get(GATE_JOB), by_name.get(SWEEP_JOB)
     if gate is not None and gate.get("conclusion") == "failure":
         return Outcome.FAILURE

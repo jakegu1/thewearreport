@@ -534,6 +534,22 @@ def test_client_retries_a_get_after_an_http_exception(exc: Exception) -> None:
 # Reading run history and issues --------------------------------------------------------
 
 
+@pytest.mark.parametrize("name", [["x"], {"a": 1}, None, 7, True, 1.5])
+def test_run_outcome_rejects_a_job_name_that_is_not_a_string(name: Any) -> None:
+    with pytest.raises(schedule.GitHubError):
+        schedule.run_outcome([_job("gate", "success"), {"name": name, "conclusion": "success"}])
+
+
+@pytest.mark.parametrize("name", [["x"], {"a": 1}, None, 7])
+def test_previous_outcomes_rejects_hostile_job_names(name: Any) -> None:
+    script = Script(
+        _ok({"workflow_runs": [{"id": 7, "status": "completed"}]}),
+        _ok({"jobs": [{"name": name, "conclusion": "failure", "steps": []}]}),
+    )
+    with pytest.raises(schedule.GitHubError):
+        list(schedule.previous_outcomes(_gh(script), run_id=8, branch="main"))
+
+
 @pytest.mark.parametrize(
     "listing",
     [
