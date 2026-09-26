@@ -1154,7 +1154,10 @@ class DeepInfraClassifier(_HostedClassifier):
         if not isinstance(choices, list) or not choices:
             raise JudgeError(f"{p} sent a malformed reply (no choices)")
         choice = _dict(choices[0], "a choice", p)
-        if choice.get("finish_reason") in DEEPINFRA_FILTERED:
+        finish = choice.get("finish_reason")
+        if finish is not None and not isinstance(finish, str):
+            raise JudgeError(f"{p} sent a malformed reply (the finish reason is not text)")
+        if finish in DEEPINFRA_FILTERED:
             return "unsure"
         message = _dict(choice.get("message"), "the message", p)
         content = message.get("content")

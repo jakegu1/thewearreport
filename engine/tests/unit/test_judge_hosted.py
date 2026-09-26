@@ -295,6 +295,9 @@ def test_deepinfra_redirects_are_not_followed(server: Any) -> None:
         Reply(body=b'{"choices": ["person"]}'),
         Reply(body=b'{"choices": [{"message": "person"}]}'),
         Reply(body=b'{"choices": [{"message": {"content": ["person"]}}]}'),
+        Reply(body=b'{"choices": [{"finish_reason": [], "message": {"content": "person"}}]}'),
+        Reply(body=b'{"choices": [{"finish_reason": {}, "message": {"content": "person"}}]}'),
+        Reply(body=b'{"choices": [{"finish_reason": 1, "message": {"content": "person"}}]}'),
         Reply(body=b" " * (judge.MAX_RESPONSE_BYTES + 1)),
     ],
 )
@@ -434,6 +437,22 @@ def test_a_deepinfra_run_stops_at_max_requests_and_prints_usage(
     assert "request limit" in out
     assert "requests 3, input tokens 900, output tokens 6" in out
     assert f"region {judge.DEEPINFRA_REGION}" in out
+
+
+@pytest.mark.parametrize("finish", ["[]", "{}"])
+def test_a_hostile_finish_reason_ends_one_model_not_the_run(
+    server: Any, capsys: pytest.CaptureFixture[str], finish: str
+) -> None:
+    body = {"choices": [{"finish_reason": json.loads(finish), "message": {"content": "person"}}]}
+    fake = server(Reply(body=json.dumps(body).encode()))
+    a, b = list(judge.DEEPINFRA)[:2]
+    code = judge.deepinfra_main(
+        _argv("--max-requests", "5", models=f"{a},{b}"), crops=_crops(4), endpoint=fake.url
+    )
+    out = capsys.readouterr().out
+    assert code == 0 and len(fake.requests) == 2  # one request per model, then its error
+    assert out.count("finish reason is not text") == 2
+    assert "requests made" in out
 
 
 def test_a_deepinfra_run_reports_cost_heights_agreement_and_writes_nothing(
