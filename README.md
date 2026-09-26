@@ -76,6 +76,38 @@ Copy it to `.env` (never committed) and fill in the values you need.
 | Public guard | `make public-guard` | no private material in the repository (INV-9) |
 | Schema validation | `make schemas` | `data/schema/` is valid JSON Schema and samples validate |
 
+## Operations
+
+[`.github/workflows/sweep.yml`](./.github/workflows/sweep.yml) runs one sweep every 20
+minutes from 07:00 to 20:40 London time (cron `*/20 7-20 * * *` with
+`timezone: "Europe/London"`, 42 runs a day). Scheduled and manual runs start from the
+default branch only.
+
+- **Gate.** The first job checks the London time again and skips the sweep outside
+  07:00–21:00, for example when a scheduled run starts late.
+- **One run at a time.** All runs share one concurrency group. A queued run waits, and a
+  run that is publishing is never cancelled.
+- **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the
+  SHA-256 of both models on every run, and the sweep checks it again when it loads YOLOX-m.
+- **Timeout.** The sweep job stops after 15 minutes.
+- **Publishing.** The sweep job checks out the `data` branch shallow and sparse:
+  `status.json` and the last three UTC days of records. If the branch does not exist, the
+  job creates it as an orphan. The job stages only new `sweeps/**/*.json` records and
+  `status.json`, checks the staged list, then commits and pushes. It is the only job with
+  `contents: write`.
+- **Alert.** A failed sweep is a sweep job that fails (for example, the registry is
+  unreachable, so no record is written) or a published record that is not a success
+  (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert
+  job opens an issue labelled `ops-alert` with the failure summary. If one is already open,
+  the job comments on it instead. The next successful sweep closes it. Runs skipped by the
+  gate are ignored. The alert job is the only job with `issues: write`.
+- **Manual run.** Actions → sweep → Run workflow. Tick `force_fail` to fail the sweep job
+  before it does anything, which tests the alert without publishing. Manual runs obey the
+  gate too.
+
+Repository secrets: `METOFFICE_API_KEY` (required), `TFL_APP_KEY` (optional). The
+workflow never runs on pull requests, so fork code never sees them.
+
 ## License
 
 Code: [Apache-2.0](./LICENSE). Data: see [DATA-LICENSE.md](./DATA-LICENSE.md).

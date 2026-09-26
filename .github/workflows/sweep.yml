@@ -1,0 +1,210 @@
+name: sweep
+
+# One sweep every 20 minutes in London daytime, published to the `data` branch (T-007).
+# Cron and workflow_dispatch run from the default branch only. See README.md § Operations.
+#
+# Jobs:
+#   gate   is it 07:00-21:00 Europe/London? (defence in depth behind the cron timezone)
+#   sweep  run one sweep and push its record and status.json; the only job that writes
+#          contents, and only to the `data` branch
+#   alert  after three consecutive failed sweeps open (or comment on) the `ops-alert`
+#          issue; close it after a success. The only job that writes issues.
+#
+# Nothing here runs on pull requests, so repository secrets never reach fork code.
+
+on:
+  schedule:
+    - cron: "*/20 7-20 * * *"
+      timezone: "Europe/London"
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Fail the sweep before it starts (tests the alert; publishes nothing)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One group for every sweep: runs never overlap (status.json assumes it), and a queued
+# run never cancels one in progress, so a publishing run always finishes.
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      open: ${{ steps.gate.outputs.open }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: engine/wearreport
+      - name: Gate on London daytime
+        id: gate
+        run: |
+          PYTHONPATH=engine python3 -m wearreport.schedule gate >> "${GITHUB_OUTPUT}"
+          cat "${GITHUB_OUTPUT}"
+
+  sweep:
+    needs: gate
+    if: needs.gate.outputs.open == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      stage: ${{ steps.result.outputs.stage }}
+      consecutive_failures: ${{ steps.record.outputs.consecutive_failures }}
+    env:
+      DATA_DIR: ${{ runner.temp }}/data
+      DATA_REMOTE: https://github.com/${{ github.repository }}.git
+    steps:
+      - name: Forced failure (manual alert test; nothing is published)
+        id: forced
+        if: inputs.force_fail
+        run: |
+          echo "force_fail is set: failing before the sweep starts" >&2
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+      - name: Install dependencies
+        id: install
+        run: uv sync --locked --no-dev
+      - name: Restore the models
+        id: models-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .models
+          key: yolox-${{ hashFiles('scripts/fetch_model.sh') }}
+      - name: Fetch or verify the models (SHA-256 checked on every run)
+        id: models
+        run: sh scripts/fetch_model.sh --with-m
+      - name: Save the models
+        if: steps.models-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .models
+          key: yolox-${{ hashFiles('scripts/fetch_model.sh') }}
+      - name: Check out the data branch (shallow, sparse; orphan on first publish)
+        id: checkout-data
+        run: |
+          set -euo pipefail
+          git init -q "${DATA_DIR}"
+          cd "${DATA_DIR}"
+          git remote add origin "${DATA_REMOTE}"
+          rc=0
+          git ls-remote --exit-code --heads origin refs/heads/data > /dev/null || rc=$?
+          if [ "${rc}" -eq 0 ]; then
+            # status.json and the last three UTC days of records: enough for the 24 h
+            # window and a recent success. Older days stay in git, not in the tree.
+            git sparse-checkout set --no-cone /status.json \
+              "/sweeps/$(date -u -d '2 days ago' +%Y/%m/%d)/" \
+              "/sweeps/$(date -u -d '1 day ago' +%Y/%m/%d)/" \
+              "/sweeps/$(date -u +%Y/%m/%d)/"
+            git fetch -q --depth=1 --no-tags origin refs/heads/data
+            git checkout -q -b data FETCH_HEAD
+          elif [ "${rc}" -eq 2 ]; then
+            echo "the data branch does not exist yet: starting it as an orphan"
+            git checkout -q --orphan data
+          else
+            echo "cannot list the remote branches (git exit ${rc})" >&2
+            exit 1
+          fi
+      - name: Sweep
+        id: sweep
+        env:
+          WEARREPORT_ENV: production
+          METOFFICE_API_KEY: ${{ secrets.METOFFICE_API_KEY }}
+          TFL_APP_KEY: ${{ secrets.TFL_APP_KEY }}
+        run: uv run --locked --no-dev wearreport sweep --data-dir "${DATA_DIR}"
+      - name: Commit and push to the data branch
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "${DATA_DIR}"
+          # Explicit paths only: new record files (sweeps/**/*.json; records are immutable,
+          # so only untracked ones) and status.json. Never everything (-A or the dot).
+          git ls-files -z --others --exclude-standard -- ':(glob)sweeps/**/*.json' \
+            | xargs -0 -r git add --
+          git add -- status.json
+          git diff --cached --name-status \
+            | PYTHONPATH="${GITHUB_WORKSPACE}/engine" python3 -m wearreport.schedule check-staged
+          if git diff --cached --quiet; then
+            echo "nothing new to publish (the record was already there)"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Add sweep records (run ${GITHUB_RUN_ID})"
+          auth="$(printf 'x-access-token:%s' "${GITHUB_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git -c http.extraheader="AUTHORIZATION: basic ${auth}" \
+            push -q origin HEAD:refs/heads/data
+      - name: Did the published sweep succeed?
+        id: record
+        run: |
+          PYTHONPATH=engine python3 -m wearreport.schedule outcome \
+            --status "${DATA_DIR}/status.json" >> "${GITHUB_OUTPUT}"
+      - name: Result
+        id: result
+        if: always()
+        env:
+          FORCED: ${{ steps.forced.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          MODELS: ${{ steps.models.outcome }}
+          CHECKOUT_DATA: ${{ steps.checkout-data.outcome }}
+          SWEEP: ${{ steps.sweep.outcome }}
+          PUBLISH: ${{ steps.publish.outcome }}
+          RECORD: ${{ steps.record.outcome }}
+        run: |
+          stage=unknown
+          if [ "${FORCED}" = failure ]; then stage=forced
+          elif [ "${INSTALL}" != success ] || [ "${MODELS}" != success ]; then stage=setup
+          elif [ "${CHECKOUT_DATA}" != success ]; then stage=checkout
+          elif [ "${SWEEP}" != success ]; then stage=sweep
+          elif [ "${PUBLISH}" != success ]; then stage=publish
+          elif [ "${RECORD}" != success ]; then stage=record
+          else stage=none
+          fi
+          echo "stage=${stage}" >> "${GITHUB_OUTPUT}"
+          echo "stage=${stage}"
+
+  alert:
+    needs: [gate, sweep]
+    # Also after a failed gate, so a broken gate cannot silence every sweep unnoticed.
+    if: ${{ !cancelled() && (needs.gate.outputs.open == 'true' || needs.gate.result == 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: engine/wearreport
+      - name: Open, update or close the ops-alert issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          SWEEP_RESULT: ${{ needs.sweep.result }}
+          SWEEP_STAGE: ${{ needs.sweep.outputs.stage }}
+          RECORD_FAILURES: ${{ needs.sweep.outputs.consecutive_failures }}
+        run: |
+          PYTHONPATH=engine python3 -m wearreport.schedule alert \
+            --gate-result "${GATE_RESULT}" --sweep-result "${SWEEP_RESULT}" \
+            --stage "${SWEEP_STAGE}" \
+            --record-failures "${RECORD_FAILURES}"
