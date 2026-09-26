@@ -1522,10 +1522,12 @@ def bakeoff(
             for r in runs
             if r.usage is not None and (h := priced(r.name)) is not None
         )
+        missing = sum(u.missing for u in metered)
         emit(
             f"requests made {sum(u.requests for u in metered)}, "
             f"input tokens {sum(u.input_tokens for u in metered)}, "
             f"output tokens {sum(u.output_tokens for u in metered)}, cost ${total:.4f}"
+            + (f" (a lower bound: usage missing from {missing} replies)" if missing else "")
         )
     hosted = [r for r in passing if priced(r.name) is not None]
     local = [r for r in passing if priced(r.name) is None]
@@ -1575,13 +1577,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _names(requested: str | None, registry: dict[str, Any], default: list[str]) -> list[str]:
-    """The candidate names asked for, `chosen` resolved; raises ValueError with the message
-    to print when a name is refused."""
+    """The candidate names asked for, `chosen` resolved and each name once (a repeat would
+    spend requests on the same model twice); raises ValueError with the message to print
+    when a name is refused."""
     names = default if requested is None else [n.strip() for n in requested.split(",")]
     names = [n for n in names if n]
     if "chosen" in names and CHOSEN is None:
         raise ValueError(NO_CHOSEN_MODEL)
     names = [CHOSEN if n == "chosen" and CHOSEN is not None else n for n in names]
+    names = list(dict.fromkeys(names))
     unknown = [n for n in names if n not in registry]
     if unknown or not names:
         raise ValueError(f"unknown candidate {unknown[0] if unknown else ''!r}")

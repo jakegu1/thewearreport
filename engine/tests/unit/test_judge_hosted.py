@@ -569,6 +569,39 @@ def test_a_deepinfra_run_reports_cost_heights_agreement_and_writes_nothing(
         assert "http" not in text and "messages" not in text
 
 
+def test_a_model_named_twice_runs_once(server: Any, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = server(chat("person"))
+    a, b = list(judge.DEEPINFRA)[:2]
+    code = judge.deepinfra_main(
+        _argv("--max-requests", "20", models=f"{a},{b},{a}"), crops=_crops(4), endpoint=fake.url
+    )
+    out = capsys.readouterr().out
+    assert code == 0 and len(fake.requests) == 8
+    assert f"agreement of {a} and {a}" not in out and f"agreement of {a} and {b}" in out
+
+
+def test_the_run_total_is_a_lower_bound_when_usage_is_missing(
+    server: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = json.loads(chat("person").body)
+    del body["usage"]
+    fake = server(chat("person"), Reply(body=json.dumps(body).encode()), chat("person"))
+    code = judge.deepinfra_main(_argv("--max-requests", "3"), crops=_crops(3), endpoint=fake.url)
+    total = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("requests made")
+    )
+    assert code == 0
+    assert total.endswith("(a lower bound: usage missing from 1 replies)")
+
+
+def test_the_run_total_is_not_marked_when_usage_is_complete(
+    server: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = server(chat("person"))
+    judge.deepinfra_main(_argv("--max-requests", "3"), crops=_crops(3), endpoint=fake.url)
+    assert "lower bound" not in capsys.readouterr().out
+
+
 def test_deepinfra_refuses_names_of_other_backends(capsys: pytest.CaptureFixture[str]) -> None:
     for name in (next(iter(judge.HOSTED)), next(iter(judge.CANDIDATES)), "chosen"):
         argv = ["--bakeoff", "--max-requests", "5", "--models", name]
