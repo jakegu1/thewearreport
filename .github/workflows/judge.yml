@@ -1,0 +1,49 @@
+name: judge
+
+# Confirms the spot-check judge on a hosted runner (4 vCPU): downloads the chosen model's
+# weights and the gold set's licensed source photos (both SHA-256 pinned), runs the tests
+# that need them, and times the chosen model on the whole gold set. Manual only; it uses
+# no secrets and writes nothing back. See engine/wearreport/tools/judge.py.
+#
+# No model is chosen (no candidate passes the quality bar), so this workflow fails closed:
+# the fetch step exits non-zero and nothing runs.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: judge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  judge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # Tests that need the weights or the gold set fail, instead of skipping, without them.
+      WEARREPORT_REQUIRE_JUDGE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Runner
+        run: nproc && free -g
+      - name: Fetch the judge weights (SHA-256 verified)
+        run: sh scripts/fetch_judge_model.sh
+      - name: Fetch the gold-set source photos (SHA-256 verified)
+        run: sh scripts/fetch_goldset.sh
+      - name: Tests that need the weights and the gold set
+        run: >-
+          uv run --locked pytest engine/tests/acceptance/test_t_029.py
+          engine/tests/unit/test_judge.py engine/tests/unit/test_goldset.py
+      - name: Chosen model on the whole gold set (accuracy, timing, memory)
+        run: uv run --locked python -m wearreport.tools.judge --bakeoff --models chosen
