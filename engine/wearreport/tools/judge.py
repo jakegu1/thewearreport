@@ -763,6 +763,11 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})  # a local fake server (
 _MODEL_ID = re.compile(r"[A-Za-z0-9][\w.:-]{0,127}")
 _DEEPINFRA_MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]{0,63}/[A-Za-z0-9][\w.-]{0,127}")
 _TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
+# With no token known, any long run of key-like characters in an error is redacted: it may
+# be an echoed key. Service error names (CamelCase words ending in Exception or Error, such
+# as UnrecognizedClientException) are kept: they are not keys, and they explain the error.
+_KEY_LIKE = re.compile(r"[A-Za-z0-9_-]{20,}")
+_ERROR_NAME = re.compile(r"(?:[A-Z][a-z]+){1,8}(?:Exception|Error)")
 
 
 class RequestLimitReached(JudgeError):
@@ -1143,6 +1148,10 @@ class _HostedClassifier:
             for word in words:
                 if word in token or token in word:
                     text = text.replace(word, "[redacted]")
+        else:
+            text = _KEY_LIKE.sub(
+                lambda m: m[0] if _ERROR_NAME.fullmatch(m[0]) else "[redacted]", text
+            )
         return text[:MAX_ERROR_CHARS]
 
     def _add_usage(self, input_tokens: int | None, output_tokens: int | None) -> None:
@@ -1207,7 +1216,7 @@ class BedrockClassifier(_HostedClassifier):
 
     def _error_kind(self, exc: urllib.error.HTTPError, raw: bytes) -> str:
         kind = (exc.headers.get("x-amzn-ErrorType") or "") if exc.headers else ""
-        return re.sub(r"[^A-Za-z]", "", kind.split(":", 1)[0])[:64]
+        return self._redact(re.sub(r"[^A-Za-z]", "", kind.split(":", 1)[0])[:64])
 
     def _retryable(self, status: int, kind: str) -> bool:
         return status == 429 or status >= 500 or kind == "ThrottlingException"
