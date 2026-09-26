@@ -32,7 +32,7 @@ trap '[ -z "${PART}" ] || rm -f "${PART}"; [ -z "${LIST}" ] || rm -f "${LIST}"' 
 trap 'exit 1' HUP INT TERM
 
 # One line per source: id, SHA-256, URL. Ids and digests are checked here; each URL must
-# be https and free of spaces.
+# be https and free of spaces and control characters.
 LIST="$(mktemp)"
 python3 - "${MANIFEST}" > "${LIST}" <<'PY'
 import json, re, sys
@@ -43,6 +43,7 @@ for s in data["sources"]:
         re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", s["id"])
         and re.fullmatch(r"[0-9a-f]{64}", s["sha256"])
         and re.fullmatch(r"https://[^\s]+", s["url"])
+        and s["url"].isprintable()
     )
     if not ok:
         sys.exit(f"fetch_goldset: malformed source entry {str(s.get('id'))[:40]!r}")
