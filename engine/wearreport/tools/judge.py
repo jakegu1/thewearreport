@@ -1,10 +1,13 @@
 """The spot-check judge: a vision-language model that tells whether a detection crop shows
 a person, and the bake-off that chooses it. The model is either open weights run locally
-on the CPU (CANDIDATES) or a model hosted by Amazon Bedrock (HOSTED).
+on the CPU (CANDIDATES) or a model hosted by Amazon Bedrock (HOSTED) or DeepInfra
+(DEEPINFRA).
 
   python -m wearreport.tools.judge --bakeoff [--models A,B] [--subset all|screen]
       [--limit N] [--threads 4]
   python -m wearreport.tools.judge --bakeoff --backend bedrock --max-requests N
+      [--models A,B] [--subset all|screen] [--limit N]
+  python -m wearreport.tools.judge_deepinfra --bakeoff --max-requests N
       [--models A,B] [--subset all|screen] [--limit N]
 
 `--bakeoff` runs every candidate of the backend (or those named) over the gold set
@@ -19,14 +22,18 @@ agreement, and the verdict: the most accurate local model, or the cheapest hoste
 by measured cost per 300 crops, that passes. The output is counts, timings and costs
 only: no item, file, URL, image or request.
 
-Hosted models (`BedrockClassifier`) are called through the Bedrock Converse API with the
-standard library only, one crop per request, as a PNG built in memory. The bearer token
-is read from AWS_BEARER_TOKEN_BEDROCK and never printed, logged or put in an error. A
-remote run refuses to start without `--max-requests N` and stops at N requests (retries
-count). The backend sends only gold-set and control crops (`mark_licensed`): anything
-else is refused before a request is made (AGENTS.md INV-1). Each request has a timeout;
-throttling and server errors are retried at most MAX_RETRIES times with backoff, other
-errors not at all; redirects are never followed.
+Hosted models are called with the standard library only, one crop per request, as a PNG
+built in memory: through the Bedrock Converse API (`BedrockClassifier`) or DeepInfra's
+OpenAI-compatible chat completions API (`DeepInfraClassifier`, the PNG as a base64 data
+URL). A Bedrock bearer token is read from AWS_BEARER_TOKEN_BEDROCK when it is set and never
+printed, logged or put in an error; when it is not set, a bake-off sends no Authorization
+header and relies on the credential the environment adds. DeepInfra requests never carry
+an Authorization header of their own: the environment adds it. A remote run refuses to
+start without `--max-requests N` and stops at N requests (retries count). The backends
+send only gold-set and control crops (`mark_licensed`): anything else is refused before a
+request is made (AGENTS.md INV-1). Each request has a timeout; throttling and server
+errors are retried at most MAX_RETRIES times with backoff, other errors not at all;
+redirects are never followed.
 
 The judge (`Judge`) sees what a reviewer sees: the crop that the spot-check tool renders,
 enlarged with its box and number drawn on it. It is asked PROMPT, a fixed question, and
@@ -276,11 +283,17 @@ NO_CHOSEN_MODEL = "no judge model is chosen: no candidate passes the quality bar
 
 @dataclass(frozen=True, slots=True)
 class HostedCandidate:
-    """One vision model served by Amazon Bedrock, called with the Converse API. The model
-    ID, the regions and the terms are from the model's page in the Bedrock documentation
-    (`card`); the prices, in US dollars per million tokens on demand (Standard tier) in
-    `region`, from the Amazon Bedrock pricing page. A model ID that starts with eu. or us.
-    is a cross-region inference profile: Bedrock serves it within that geography."""
+    """One vision model served by a hosted provider.
+
+    Amazon Bedrock (HOSTED) is called with the Converse API. The model ID, the regions and
+    the terms are from the model's page in the Bedrock documentation (`card`); the prices,
+    in US dollars per million tokens on demand (Standard tier) in `region`, from the Amazon
+    Bedrock pricing page. A model ID that starts with eu. or us. is a cross-region
+    inference profile: Bedrock serves it within that geography.
+
+    DeepInfra (DEEPINFRA) is called with its OpenAI-compatible chat completions API. The
+    model ID, the prices (standard tier) and the licence are from the model's DeepInfra
+    page (`card`) and its entry in DeepInfra's model list."""
 
     name: str
     family: str
@@ -288,9 +301,10 @@ class HostedCandidate:
     region: str
     input_usd_per_mtok: float
     output_usd_per_mtok: float
-    licence: str  # of the weights, or the terms under which Bedrock serves the model
+    licence: str  # of the weights, or the terms under which the provider serves the model
     card: str
     backup: bool = False  # run only when no other hosted candidate passes
+    reasoning_off: bool = False  # DeepInfra: ask for no reasoning (reasoning_effort none)
 
 
 _BEDROCK_DOCS = "https://docs.aws.amazon.com/bedrock/latest/userguide/"
@@ -350,6 +364,83 @@ HOSTED: dict[str, HostedCandidate] = {
         ),
     )
 }
+
+
+_DEEPINFRA_PAGE = "https://deepinfra.com/"
+DEEPINFRA_REGION = "deepinfra"  # DeepInfra does not let a caller choose a region
+# Prices from DeepInfra's model list on 2026-09-26 (cents per token, times 10^4).
+DEEPINFRA: dict[str, HostedCandidate] = {
+    c.name: c
+    for c in (
+        HostedCandidate(
+            name="di-qwen3-vl-235b",
+            family="Qwen3-VL",
+            model_id="Qwen/Qwen3-VL-235B-A22B-Instruct",  # FP8
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.20,
+            output_usd_per_mtok=0.88,
+            licence="Apache-2.0",
+            card=_DEEPINFRA_PAGE + "Qwen/Qwen3-VL-235B-A22B-Instruct",
+        ),
+        HostedCandidate(
+            name="di-qwen3.5-397b",
+            family="Qwen3.5",
+            model_id="Qwen/Qwen3.5-397B-A17B",  # FP8; reasons unless told not to
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.45,
+            output_usd_per_mtok=3.00,
+            licence="Apache-2.0",
+            card=_DEEPINFRA_PAGE + "Qwen/Qwen3.5-397B-A17B",
+            reasoning_off=True,
+        ),
+        HostedCandidate(
+            name="di-llama4-maverick",
+            family="Meta Llama 4",
+            model_id="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",  # retires 2026-10-01
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.20,
+            output_usd_per_mtok=0.80,
+            licence="Llama 4 Community License",
+            card=_DEEPINFRA_PAGE + "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+        ),
+        HostedCandidate(
+            name="di-kimi-k2.6",
+            family="Moonshot Kimi",
+            model_id="moonshotai/Kimi-K2.6",  # FP4; reasons unless told not to
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.75,
+            output_usd_per_mtok=3.50,
+            licence="Modified MIT License",
+            card=_DEEPINFRA_PAGE + "moonshotai/Kimi-K2.6",
+            reasoning_off=True,
+        ),
+        HostedCandidate(
+            name="di-glm-4.6v",
+            family="Z.ai GLM-V",
+            model_id="zai-org/GLM-4.6V",  # listed as deprecated, still served
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.30,
+            output_usd_per_mtok=0.90,
+            licence="MIT",
+            card=_DEEPINFRA_PAGE + "zai-org/GLM-4.6V",
+        ),
+        HostedCandidate(
+            name="di-gemma-4-31b",
+            family="Google Gemma 4",
+            model_id="google/gemma-4-31B-it",  # FP8
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=0.13,
+            output_usd_per_mtok=0.38,
+            licence="Apache-2.0",
+            card=_DEEPINFRA_PAGE + "google/gemma-4-31B-it",
+        ),
+    )
+}
+
+
+def priced(name: str) -> HostedCandidate | None:
+    """The hosted candidate called `name`, of any provider, or None for a local one."""
+    return HOSTED.get(name) or DEEPINFRA.get(name)
 
 
 def cost_usd(candidate: HostedCandidate, input_tokens: int, output_tokens: int) -> float:
@@ -635,7 +726,7 @@ def is_licensed(image: object) -> bool:
     return entry is not None and entry[0]() is image and entry[1] == _pixel_digest(image)
 
 
-# The hosted backend (Amazon Bedrock) ------------------------------------------------------
+# The hosted backends (Amazon Bedrock, DeepInfra) ------------------------------------------
 
 TOKEN_ENV = "AWS_BEARER_TOKEN_BEDROCK"  # noqa: S105  (the variable name, not a token)
 REQUEST_TIMEOUT = 60.0  # seconds, for each connection, read and write
@@ -646,8 +737,12 @@ PNG_SUFFIX = ".png"  # the format each crop is sent in, encoded in memory
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_ERROR_CHARS = 200
 FILTERED_STOPS = frozenset({"content_filtered", "guardrail_intervened"})
+DEEPINFRA_ORIGIN = "https://api.deepinfra.com"
+DEEPINFRA_PATH = "/v1/openai/chat/completions"
+DEEPINFRA_FILTERED = frozenset({"content_filter"})
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})  # a local fake server (tests)
 _MODEL_ID = re.compile(r"[A-Za-z0-9][\w.:-]{0,127}")
+_DEEPINFRA_MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]{0,63}/[A-Za-z0-9][\w.-]{0,127}")
 _TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
 
 
@@ -681,29 +776,36 @@ class RequestBudget:
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect: it would carry the token to another address."""
+    """Never follow a redirect: it would carry a credential to another address."""
 
     def redirect_request(self, *args: Any, **kwargs: Any) -> None:
         return None
 
 
-def _endpoint(base: str, model_id: str) -> tuple[str, bool]:
-    """The Converse URL for `model_id` at `base`, and whether `base` is on this machine."""
+def _origin(base: str, provider: str) -> tuple[str, bool]:
+    """`base` checked to be a bare https origin (or http on this machine), and whether it
+    is on this machine."""
     parts = urllib.parse.urlsplit(base)
     local = parts.hostname in LOOPBACK
     if parts.scheme != "https" and not (parts.scheme == "http" and local):
-        raise JudgeError("the Bedrock endpoint must be an https URL")
+        raise JudgeError(f"the {provider} endpoint must be an https URL")
     if parts.path.strip("/") or parts.query or parts.fragment or parts.username:
-        raise JudgeError("the Bedrock endpoint must be a bare origin")
+        raise JudgeError(f"the {provider} endpoint must be a bare origin")
+    return f"{parts.scheme}://{parts.netloc}", local
+
+
+def _endpoint(base: str, model_id: str) -> tuple[str, bool]:
+    """The Converse URL for `model_id` at `base`, and whether `base` is on this machine."""
+    origin, local = _origin(base, "Bedrock")
     if not _MODEL_ID.fullmatch(model_id):
         raise JudgeError("malformed model ID")
-    return f"{parts.scheme}://{parts.netloc}/model/{model_id}/converse", local
+    return f"{origin}/model/{model_id}/converse", local
 
 
-def _read_capped(response: Any) -> bytes:
+def _read_capped(response: Any, provider: str = "Bedrock") -> bytes:
     body = response.read(MAX_RESPONSE_BYTES + 1)
     if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BYTES:
-        raise JudgeError(f"Bedrock sent a reply larger than {MAX_RESPONSE_BYTES} bytes")
+        raise JudgeError(f"{provider} sent a reply larger than {MAX_RESPONSE_BYTES} bytes")
     return body
 
 
@@ -711,16 +813,16 @@ def _reject_constant(name: str) -> object:
     raise ValueError(f"{name} is not a number")
 
 
-def _load_json(raw: bytes) -> object:
+def _load_json(raw: bytes, provider: str = "Bedrock") -> object:
     try:
         return json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
     except (ValueError, TypeError, UnicodeDecodeError, RecursionError, OverflowError) as exc:
-        raise JudgeError(f"Bedrock sent a malformed reply ({type(exc).__name__})") from None
+        raise JudgeError(f"{provider} sent a malformed reply ({type(exc).__name__})") from None
 
 
-def _dict(value: object, what: str) -> dict[str, object]:
+def _dict(value: object, what: str, provider: str = "Bedrock") -> dict[str, object]:
     if not isinstance(value, dict):
-        raise JudgeError(f"Bedrock sent a malformed reply ({what} is not an object)")
+        raise JudgeError(f"{provider} sent a malformed reply ({what} is not an object)")
     return value
 
 
@@ -728,20 +830,33 @@ def _count(value: object) -> int | None:
     return value if type(value) is int and 0 <= value <= 10**9 else None
 
 
-class BedrockClassifier:
-    """A hosted candidate answering PROMPT about gold-set and control crops, one crop per
-    Converse request, at temperature 0. `endpoint` replaces the Bedrock origin of the
-    candidate's region (tests: a fake server on the loopback interface); `sleep` waits
+def _png_base64(pixels: Image) -> str:
+    ok, encoded = cv2.imencode(PNG_SUFFIX, pixels)  # in memory
+    if not ok:
+        raise JudgeError("cannot encode the crop")
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+class _HostedClassifier:
+    """What every hosted backend shares: one crop per request, only marked gold-set and
+    control crops, a shared request budget, a timeout on every request, at most
+    MAX_RETRIES retries on throttling and server errors, no redirects, capped replies
+    parsed as hostile input, and errors that never carry a credential. `endpoint` replaces
+    the provider's origin (tests: a fake server on the loopback interface); `sleep` waits
     between retries."""
+
+    provider = "hosted"
 
     def __init__(
         self,
         candidate: HostedCandidate,
         *,
         budget: RequestBudget,
-        endpoint: str | None = None,
-        timeout: float = REQUEST_TIMEOUT,
-        sleep: Callable[[float], None] = time.sleep,
+        url: str,
+        local: bool,
+        token: str | None,
+        timeout: float,
+        sleep: Callable[[float], None],
     ) -> None:
         if not 0 < timeout <= 600:
             raise ValueError("timeout must be from 0 to 600 seconds")
@@ -750,14 +865,9 @@ class BedrockClassifier:
         self._budget = budget
         self._timeout = timeout
         self._sleep = sleep
-        base = endpoint or f"https://bedrock-runtime.{candidate.region}.amazonaws.com"
-        self._url, local = _endpoint(base, candidate.model_id)
-        token = os.environ.get(TOKEN_ENV, "")
-        if not token:
-            raise JudgeError(f"{TOKEN_ENV} is not set")
-        if not _TOKEN.fullmatch(token):
-            raise JudgeError(f"{TOKEN_ENV} is not a well-formed token")
-        self._token: str | None = token
+        self._url = url
+        self._token = token  # sent as a bearer token when not None
+        self._closed = False
         # The system's proxy settings apply, except to a server on this machine.
         proxies = urllib.request.ProxyHandler({} if local else None)
         self._opener = urllib.request.build_opener(
@@ -769,96 +879,88 @@ class BedrockClassifier:
     def classify(self, image: Image) -> Answer:
         """The model's answer about the box drawn in `image`, a marked gold-set or control
         crop (HxWx3 uint8, BGR)."""
-        if self._token is None:
+        if self._closed:
             raise JudgeError("the judge is closed")
         pixels = validate_image(image)
         if not is_licensed(pixels):
             raise JudgeError("refusing an image that is not a gold-set or control crop")
-        return self._answer(self._converse(self._body(pixels)))
+        return self._answer(self._call(self._body(pixels)))
 
     def close(self) -> None:
+        self._closed = True
         self._token = None
 
-    @staticmethod
-    def _body(pixels: Image) -> bytes:
-        ok, encoded = cv2.imencode(PNG_SUFFIX, pixels)  # in memory
-        if not ok:
-            raise JudgeError("cannot encode the crop")
-        image = base64.b64encode(encoded.tobytes()).decode("ascii")
-        request = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"image": {"format": "png", "source": {"bytes": image}}},
-                        {"text": PROMPT},
-                    ],
-                }
-            ],
-            "inferenceConfig": {"maxTokens": REMOTE_MAX_TOKENS, "temperature": 0},
-        }
-        return json.dumps(request).encode()
+    def _body(self, pixels: Image) -> bytes:
+        raise NotImplementedError
 
-    def _converse(self, body: bytes) -> bytes:
+    def _answer(self, raw: bytes) -> Answer:
+        raise NotImplementedError
+
+    def _error_kind(self, exc: urllib.error.HTTPError, raw: bytes) -> str:
+        return ""
+
+    def _retryable(self, status: int, kind: str) -> bool:
+        return status == 429 or status >= 500
+
+    def _call(self, body: bytes) -> bytes:
         for attempt in range(MAX_RETRIES + 1):
             status, raw, kind = self._send(body)
             if 200 <= status < 300:
                 return raw
-            retry = status == 429 or status >= 500 or kind == "ThrottlingException"
-            if not retry or attempt == MAX_RETRIES:
+            if not self._retryable(status, kind) or attempt == MAX_RETRIES:
                 raise JudgeError(self._describe(status, kind, raw))
             self._sleep(BACKOFF_SECONDS * 2**attempt)
         raise AssertionError("unreachable")
 
     def _send(self, body: bytes) -> tuple[int, bytes, str]:
-        """One request: the HTTP status, the body and the AWS error type."""
-        if self._token is None:
+        """One request: the HTTP status, the body and the provider's error type."""
+        if self._closed:
             raise JudgeError("the judge is closed")
         self._budget.take()
         self.usage.requests += 1
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._token is not None:
+            headers["Authorization"] = f"Bearer {self._token}"
         request = urllib.request.Request(  # noqa: S310  (the scheme is checked above)
-            self._url,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            self._url, data=body, method="POST", headers=headers
         )
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                return response.status, _read_capped(response), ""
+                return response.status, _read_capped(response, self.provider), ""
         except urllib.error.HTTPError as exc:
-            kind = (exc.headers.get("x-amzn-ErrorType") or "") if exc.headers else ""
             try:
-                raw = _read_capped(exc)
+                raw = _read_capped(exc, self.provider)
             except (JudgeError, OSError, http.client.HTTPException):
                 raw = b""
             finally:
                 exc.close()
-            return exc.code, raw, re.sub(r"[^A-Za-z]", "", kind.split(":", 1)[0])[:64]
+            return exc.code, raw, self._error_kind(exc, raw)
         except TimeoutError:
             raise JudgeError(f"the request timed out after {self._timeout:g} s") from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise JudgeError(f"the request timed out after {self._timeout:g} s") from None
-            raise JudgeError(f"cannot reach Bedrock ({type(exc.reason).__name__})") from None
+            raise JudgeError(
+                f"cannot reach {self.provider} ({type(exc.reason).__name__})"
+            ) from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             raise JudgeError(f"the request failed ({type(exc).__name__})") from None
 
+    def _message(self, data: object) -> str:
+        """The error message in a provider's error body, or ''."""
+        if isinstance(data, dict):
+            found = data.get("message") or data.get("Message")
+            return found if isinstance(found, str) else ""
+        return ""
+
     def _describe(self, status: int, kind: str, raw: bytes) -> str:
-        """An error for a failed request, with the service's message, never the token."""
-        message = ""
+        """An error for a failed request, with the service's message, never a credential."""
         try:
-            data = json.loads(raw.decode("utf-8"))
-            if isinstance(data, dict):
-                found = data.get("message") or data.get("Message")
-                message = found if isinstance(found, str) else ""
+            message = self._message(json.loads(raw.decode("utf-8")))
         except (ValueError, TypeError, UnicodeDecodeError, RecursionError, OverflowError):
             message = ""
         message = self._redact(message)
-        text = f"Bedrock answered HTTP {status}" + (f" {kind}" if kind else "")
+        text = f"{self.provider} answered HTTP {status}" + (f" {kind}" if kind else "")
         return text + (f": {message}" if message else "")
 
     def _redact(self, text: str) -> str:
@@ -873,22 +975,83 @@ class BedrockClassifier:
                     text = text.replace(word, "[redacted]")
         return text[:MAX_ERROR_CHARS]
 
+    def _add_usage(self, input_tokens: int | None, output_tokens: int | None) -> None:
+        if input_tokens is None or output_tokens is None:
+            self.usage.missing += 1
+        else:
+            self.usage.input_tokens += input_tokens
+            self.usage.output_tokens += output_tokens
+
+
+class BedrockClassifier(_HostedClassifier):
+    """A Bedrock candidate answering PROMPT, one crop per Converse request, at temperature
+    0. The bearer token comes from AWS_BEARER_TOKEN_BEDROCK. When `injected_credential` is
+    True and that variable is not set, no Authorization header is sent: the environment
+    adds one to requests for the Bedrock host (the session's network proxy)."""
+
+    provider = "Bedrock"
+
+    def __init__(
+        self,
+        candidate: HostedCandidate,
+        *,
+        budget: RequestBudget,
+        endpoint: str | None = None,
+        timeout: float = REQUEST_TIMEOUT,
+        sleep: Callable[[float], None] = time.sleep,
+        injected_credential: bool = False,
+    ) -> None:
+        base = endpoint or f"https://bedrock-runtime.{candidate.region}.amazonaws.com"
+        url, local = _endpoint(base, candidate.model_id)
+        token: str | None = os.environ.get(TOKEN_ENV, "")
+        if not token:
+            if not injected_credential:
+                raise JudgeError(f"{TOKEN_ENV} is not set")
+            token = None
+        elif not _TOKEN.fullmatch(token):
+            raise JudgeError(f"{TOKEN_ENV} is not a well-formed token")
+        super().__init__(
+            candidate,
+            budget=budget,
+            url=url,
+            local=local,
+            token=token,
+            timeout=timeout,
+            sleep=sleep,
+        )
+
+    def _body(self, pixels: Image) -> bytes:
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"image": {"format": "png", "source": {"bytes": _png_base64(pixels)}}},
+                        {"text": PROMPT},
+                    ],
+                }
+            ],
+            "inferenceConfig": {"maxTokens": REMOTE_MAX_TOKENS, "temperature": 0},
+        }
+        return json.dumps(request).encode()
+
+    def _error_kind(self, exc: urllib.error.HTTPError, raw: bytes) -> str:
+        kind = (exc.headers.get("x-amzn-ErrorType") or "") if exc.headers else ""
+        return re.sub(r"[^A-Za-z]", "", kind.split(":", 1)[0])[:64]
+
+    def _retryable(self, status: int, kind: str) -> bool:
+        return status == 429 or status >= 500 or kind == "ThrottlingException"
+
     def _answer(self, raw: bytes) -> Answer:
         data = _dict(_load_json(raw), "the reply")
         stop = data.get("stopReason")
         if not isinstance(stop, str):
             raise JudgeError("Bedrock sent a malformed reply (no stop reason)")
         usage = data.get("usage")
-        tokens = (
-            (_count(usage.get("inputTokens")), _count(usage.get("outputTokens")))
-            if isinstance(usage, dict)
-            else (None, None)
-        )
-        if tokens[0] is None or tokens[1] is None:
-            self.usage.missing += 1
+        if isinstance(usage, dict):
+            self._add_usage(_count(usage.get("inputTokens")), _count(usage.get("outputTokens")))
         else:
-            self.usage.input_tokens += tokens[0]
-            self.usage.output_tokens += tokens[1]
+            self._add_usage(None, None)
         if stop in FILTERED_STOPS:
             return "unsure"
         message = _dict(_dict(data.get("output"), "output").get("message"), "the message")
@@ -901,6 +1064,93 @@ class BedrockClassifier:
             if isinstance(block, dict) and isinstance(block.get("text"), str)
         ]
         return parse_answer("".join(texts))
+
+
+class DeepInfraClassifier(_HostedClassifier):
+    """A DeepInfra candidate answering PROMPT, one crop per chat completions request (the
+    OpenAI-compatible API), at temperature 0, the crop as a base64 PNG data URL built in
+    memory. It sends no Authorization header of its own: the environment adds one to
+    requests for api.deepinfra.com (the session's network proxy), so no key is read,
+    held or sent by this code."""
+
+    provider = "DeepInfra"
+
+    def __init__(
+        self,
+        candidate: HostedCandidate,
+        *,
+        budget: RequestBudget,
+        endpoint: str | None = None,
+        timeout: float = REQUEST_TIMEOUT,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        origin, local = _origin(endpoint or DEEPINFRA_ORIGIN, self.provider)
+        if not _DEEPINFRA_MODEL_ID.fullmatch(candidate.model_id):
+            raise JudgeError("malformed model ID")
+        super().__init__(
+            candidate,
+            budget=budget,
+            url=origin + DEEPINFRA_PATH,
+            local=local,
+            token=None,
+            timeout=timeout,
+            sleep=sleep,
+        )
+
+    def _body(self, pixels: Image) -> bytes:
+        image = "data:image/png;base64," + _png_base64(pixels)
+        request: dict[str, object] = {
+            "model": self.candidate.model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image}},
+                        {"type": "text", "text": PROMPT},
+                    ],
+                }
+            ],
+            "max_tokens": REMOTE_MAX_TOKENS,
+            "temperature": 0,
+            "stream": False,
+        }
+        if self.candidate.reasoning_off:
+            request["reasoning_effort"] = "none"
+        return json.dumps(request).encode()
+
+    def _message(self, data: object) -> str:
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                return super()._message(error)
+            for key in ("detail", "error", "message"):
+                if isinstance(data.get(key), str):
+                    return str(data[key])
+        return ""
+
+    def _answer(self, raw: bytes) -> Answer:
+        p = self.provider
+        data = _dict(_load_json(raw, p), "the reply", p)
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            self._add_usage(
+                _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
+            )
+        else:
+            self._add_usage(None, None)
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise JudgeError(f"{p} sent a malformed reply (no choices)")
+        choice = _dict(choices[0], "a choice", p)
+        if choice.get("finish_reason") in DEEPINFRA_FILTERED:
+            return "unsure"
+        message = _dict(choice.get("message"), "the message", p)
+        content = message.get("content")
+        if content is None:
+            return "unsure"  # nothing said (a refusal, or reasoning that ran out of tokens)
+        if not isinstance(content, str):
+            raise JudgeError(f"{p} sent a malformed reply (the content is not text)")
+        return parse_answer(content)
 
 
 # Scores -----------------------------------------------------------------------------------
@@ -1118,8 +1368,8 @@ def _by_height(run: Run) -> list[str]:
 
 
 def _title(name: str) -> str:
-    if name in HOSTED:
-        h = HOSTED[name]
+    h = priced(name)
+    if h is not None:
         return f"{h.name} ({h.family}, {h.model_id}, {h.region}, {h.licence})"
     c = CANDIDATES[name]
     return f"{c.name} ({c.family}, {c.params_b:g}B parameters, {c.licence})"
@@ -1127,17 +1377,18 @@ def _title(name: str) -> str:
 
 def _cost_per_crop(run: Run) -> float:
     """Measured cost per crop answered, in dollars; inf when it cannot be measured."""
-    if run.name not in HOSTED or run.usage is None or run.usage.missing or not run.answers:
+    h = priced(run.name)
+    if h is None or run.usage is None or run.usage.missing or not run.answers:
         return math.inf
     usage = run.usage
-    return cost_usd(HOSTED[run.name], usage.input_tokens, usage.output_tokens) / len(run.answers)
+    return cost_usd(h, usage.input_tokens, usage.output_tokens) / len(run.answers)
 
 
 def _usage(run: Run) -> list[str]:
     """A hosted model's region, requests, tokens and measured cost."""
-    if run.name not in HOSTED or run.usage is None:
+    h, u = priced(run.name), run.usage
+    if h is None or u is None:
         return []
-    h, u = HOSTED[run.name], run.usage
     cost = cost_usd(h, u.input_tokens, u.output_tokens)
     per_crop = cost / len(run.answers) if run.answers else math.nan
     per_bar = "n/a" if math.isnan(per_crop) else f"${BAR_CROPS * per_crop:.4f}"
@@ -1182,7 +1433,7 @@ def bakeoff(
             continue
         scores = score(run.answers)
         extra = ""
-        if run.name not in HOSTED:
+        if priced(run.name) is None:
             extra = f", load {run.load_seconds:.1f} s, peak RAM {run.peak_rss_mib / 1024:.2f} GiB"
         for line in report(title, scores, run.seconds, extra) + _usage(run) + _by_height(run):
             emit(line)
@@ -1210,17 +1461,17 @@ def bakeoff(
     metered = [r.usage for r in runs if r.usage is not None]
     if metered:
         total = sum(
-            cost_usd(HOSTED[r.name], r.usage.input_tokens, r.usage.output_tokens)
+            cost_usd(h, r.usage.input_tokens, r.usage.output_tokens)
             for r in runs
-            if r.usage is not None and r.name in HOSTED
+            if r.usage is not None and (h := priced(r.name)) is not None
         )
         emit(
             f"requests made {sum(u.requests for u in metered)}, "
             f"input tokens {sum(u.input_tokens for u in metered)}, "
             f"output tokens {sum(u.output_tokens for u in metered)}, cost ${total:.4f}"
         )
-    hosted = [r for r in passing if r.name in HOSTED]
-    local = [r for r in passing if r.name not in HOSTED]
+    hosted = [r for r in passing if priced(r.name) is not None]
+    local = [r for r in passing if priced(r.name) is None]
     if not decide:
         emit("a screen or a limited run: no pass decision (run --subset all without --limit)")
     elif not passing:
@@ -1266,6 +1517,42 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _names(requested: str | None, registry: dict[str, Any], default: list[str]) -> list[str]:
+    """The candidate names asked for, `chosen` resolved; raises ValueError with the message
+    to print when a name is refused."""
+    names = default if requested is None else [n.strip() for n in requested.split(",")]
+    names = [n for n in names if n]
+    if "chosen" in names and CHOSEN is None:
+        raise ValueError(NO_CHOSEN_MODEL)
+    names = [CHOSEN if n == "chosen" and CHOSEN is not None else n for n in names]
+    unknown = [n for n in names if n not in registry]
+    if unknown or not names:
+        raise ValueError(f"unknown candidate {unknown[0] if unknown else ''!r}")
+    return names
+
+
+def _remote(
+    args: argparse.Namespace,
+    names: Sequence[str],
+    open_classifier: Callable[[str, RequestBudget], Classifier],
+    crops: Crops | None,
+) -> int:
+    """A bake-off of hosted models: refused without --max-requests, which then bounds the
+    whole run."""
+    if args.max_requests is None or args.max_requests < 1:
+        print("judge: a remote run needs --max-requests N (N >= 1)", file=sys.stderr)
+        return 2
+    budget = RequestBudget(args.max_requests)
+    source = crops or _gold_crops(args.subset, args.limit)
+    decide = crops is not None or (args.subset == "all" and args.limit is None)
+
+    def run_one(name: str) -> Run:
+        return evaluate(name, lambda: open_classifier(name, budget), source)
+
+    bakeoff(names, run_one, lambda line: print(line, flush=True), decide=decide)
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -1281,17 +1568,11 @@ def main(
         return 2
     remote = args.backend == "bedrock"
     registry: dict[str, Candidate] | dict[str, HostedCandidate] = HOSTED if remote else CANDIDATES
-    if args.models is None:
-        names = [n for n, c in HOSTED.items() if not c.backup] if remote else list(CANDIDATES)
-    else:
-        names = [n.strip() for n in args.models.split(",") if n.strip()]
-    if "chosen" in names and CHOSEN is None:
-        print(f"judge: {NO_CHOSEN_MODEL}", file=sys.stderr)
-        return 2
-    names = [CHOSEN if n == "chosen" and CHOSEN is not None else n for n in names]
-    unknown = [n for n in names if n not in registry]
-    if unknown or not names:
-        print(f"judge: unknown candidate {unknown[0] if unknown else ''!r}", file=sys.stderr)
+    default = [n for n, c in HOSTED.items() if not c.backup] if remote else list(CANDIDATES)
+    try:
+        names = _names(args.models, registry, default)
+    except ValueError as exc:
+        print(f"judge: {exc}", file=sys.stderr)
         return 2
     if args.limit is not None and args.limit < 1:
         print("judge: --limit must be at least 1", file=sys.stderr)
@@ -1300,21 +1581,15 @@ def main(
 
     run_one: Callable[[str], Run]
     if remote:
-        if args.max_requests is None or args.max_requests < 1:
-            print("judge: a remote run needs --max-requests N (N >= 1)", file=sys.stderr)
-            return 2
-        if not os.environ.get(TOKEN_ENV):
-            print(f"judge: {TOKEN_ENV} is not set", file=sys.stderr)
-            return 2
-        budget = RequestBudget(args.max_requests)
-        remote_source = crops or _gold_crops(args.subset, args.limit)
-
-        def run_one(name: str) -> Run:
-            return evaluate(
-                name,
-                lambda: BedrockClassifier(HOSTED[name], budget=budget, endpoint=endpoint),
-                remote_source,
-            )
+        # Without AWS_BEARER_TOKEN_BEDROCK, the environment's injected credential is used.
+        return _remote(
+            args,
+            names,
+            lambda name, budget: BedrockClassifier(
+                HOSTED[name], budget=budget, endpoint=endpoint, injected_credential=True
+            ),
+            crops,
+        )
     elif open_judge is not None or crops is not None:
         opener = open_judge or (lambda c: Judge(c, threads=args.threads))
         source = crops or _gold_crops(args.subset, args.limit)
@@ -1330,6 +1605,60 @@ def main(
 
     bakeoff(names, run_one, lambda line: print(line, flush=True), decide=decide)
     return 0
+
+
+def build_deepinfra_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="python -m wearreport.tools.judge_deepinfra",
+        description="The judge bake-off on vision models hosted by DeepInfra (DEEPINFRA). "
+        "It sends gold-set crops only, needs --max-requests, and prints requests, tokens "
+        "and the measured cost. No key is read: the environment adds the credential.",
+    )
+    ap.add_argument("--bakeoff", action="store_true", help="run the candidates on the gold set")
+    ap.add_argument(
+        "--models",
+        default=None,
+        help="comma-separated names (default: every DeepInfra candidate but the backups); "
+        "chosen = CHOSEN (refused: none is chosen)",
+    )
+    ap.add_argument("--subset", choices=("all", "screen"), default="all")
+    ap.add_argument("--limit", type=int, default=None, help="first N crops only")
+    ap.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="required: stop after N requests in all (retries count)",
+    )
+    return ap
+
+
+def deepinfra_main(
+    argv: Sequence[str] | None = None,
+    *,
+    crops: Crops | None = None,
+    endpoint: str | None = None,
+) -> int:
+    """Run the bake-off on DEEPINFRA. `crops` replaces the gold set and `endpoint` the
+    DeepInfra origin (tests)."""
+    args = build_deepinfra_parser().parse_args(argv)
+    if not args.bakeoff:
+        build_deepinfra_parser().print_help()
+        return 2
+    default = [n for n, c in DEEPINFRA.items() if not c.backup]
+    try:
+        names = _names(args.models, DEEPINFRA, default)
+    except ValueError as exc:
+        print(f"judge: {exc}", file=sys.stderr)
+        return 2
+    if args.limit is not None and args.limit < 1:
+        print("judge: --limit must be at least 1", file=sys.stderr)
+        return 2
+    return _remote(
+        args,
+        names,
+        lambda name, budget: DeepInfraClassifier(DEEPINFRA[name], budget=budget, endpoint=endpoint),
+        crops,
+    )
 
 
 if __name__ == "__main__":

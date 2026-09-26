@@ -370,14 +370,6 @@ def test_a_screen_decides_nothing(capsys: pytest.CaptureFixture[str]) -> None:
     assert "no pass decision" in out and "passes:" not in out
 
 
-def test_main_refuses_a_remote_run_without_the_token(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
-    code = judge.main(["--bakeoff", "--backend", "bedrock", "--max-requests", "5"], crops=_crops)
-    assert code == 2 and judge.TOKEN_ENV in capsys.readouterr().err
-
-
 def test_local_names_are_unknown_to_the_remote_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(judge.TOKEN_ENV, "t" * 40)
     argv = ["--bakeoff", "--backend", "bedrock", "--max-requests", "5", "--models", PROBE]
