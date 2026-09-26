@@ -37,6 +37,7 @@ class Reply:
     status: int = 200
     body: bytes = b""
     delay: float = 0.0
+    drip: float = 0.0  # seconds between the body's bytes, sent one at a time
     headers: dict[str, str] = field(default_factory=dict)
 
 
@@ -95,7 +96,12 @@ class FakeServer:
                         self.send_header(key, value)
                     self.send_header("Content-Length", str(len(reply.body)))
                     self.end_headers()
-                    self.wfile.write(reply.body)
+                    if not reply.drip:
+                        self.wfile.write(reply.body)
+                    for i in range(len(reply.body) if reply.drip else 0):
+                        self.wfile.write(reply.body[i : i + 1])
+                        self.wfile.flush()
+                        time.sleep(reply.drip)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -271,6 +277,27 @@ def test_deepinfra_every_request_has_a_timeout(server: Any) -> None:
     with pytest.raises(judge.JudgeError, match=r"(?i)time"):
         clf.classify(crop())
     assert len(fake.requests) == 1  # a timeout is not retried
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_deepinfra_a_slowly_sent_reply_ends_at_the_request_deadline(
+    server: Any, status: int
+) -> None:
+    # Each byte comes well within the timeout, but the whole reply would take minutes.
+    fake = server(Reply(status=status, body=chat().body, drip=0.2))
+    clf = deepinfra(fake, timeout=1.0)
+    start = time.monotonic()
+    with pytest.raises(judge.JudgeError, match="timed out after 1 s"):
+        clf.classify(crop())
+    assert time.monotonic() - start < 1.8
+    assert len(fake.requests) == 1  # a timeout is not retried
+
+
+def test_deepinfra_a_reply_larger_than_one_chunk_is_read_whole(server: Any) -> None:
+    body = json.loads(chat("person").body)
+    body["padding"] = "x" * (3 * judge.READ_CHUNK_BYTES)
+    fake = server(Reply(body=json.dumps(body).encode()))
+    assert deepinfra(fake).classify(crop()) == "person"
 
 
 def test_deepinfra_redirects_are_not_followed(server: Any) -> None:

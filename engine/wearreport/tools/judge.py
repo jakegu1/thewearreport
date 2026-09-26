@@ -92,6 +92,7 @@ import math  # noqa: E402
 import multiprocessing  # noqa: E402
 import re  # noqa: E402
 import resource  # noqa: E402
+import socket  # noqa: E402
 import ssl  # noqa: E402
 import time  # noqa: E402
 import urllib.error  # noqa: E402
@@ -741,12 +742,13 @@ def is_licensed(image: object) -> bool:
 # The hosted backends (Amazon Bedrock, DeepInfra) ------------------------------------------
 
 TOKEN_ENV = "AWS_BEARER_TOKEN_BEDROCK"  # noqa: S105  (the variable name, not a token)
-REQUEST_TIMEOUT = 60.0  # seconds, for each connection, read and write
+REQUEST_TIMEOUT = 60.0  # seconds, for each request in all (each retry has its own)
 MAX_RETRIES = 3  # after the first attempt, on throttling and server errors only
 BACKOFF_SECONDS = 2.0  # doubled after each retry
 REMOTE_MAX_TOKENS = 10
 PNG_SUFFIX = ".png"  # the format each crop is sent in, encoded in memory
 MAX_RESPONSE_BYTES = 1 << 20
+READ_CHUNK_BYTES = 1 << 16
 MAX_ERROR_CHARS = 200
 FILTERED_STOPS = frozenset({"content_filtered", "guardrail_intervened"})
 DEEPINFRA_ORIGIN = "https://api.deepinfra.com"
@@ -814,11 +816,41 @@ def _endpoint(base: str, model_id: str) -> tuple[str, bool]:
     return f"{origin}/model/{model_id}/converse", local
 
 
-def _read_capped(response: Any, provider: str = "Bedrock") -> bytes:
-    body = response.read(MAX_RESPONSE_BYTES + 1)
-    if not isinstance(body, bytes) or len(body) > MAX_RESPONSE_BYTES:
-        raise JudgeError(f"{provider} sent a reply larger than {MAX_RESPONSE_BYTES} bytes")
-    return body
+class _DeadlinePassed(JudgeError):
+    """A request ran past its deadline while its reply was being read."""
+
+
+def _set_read_timeout(response: Any, seconds: float) -> None:
+    """Make the next socket read under `response` wait at most `seconds`, so that no single
+    read outlasts the request's deadline. Does nothing if the socket cannot be found."""
+    layer = response
+    for _ in range(4):  # HTTPError -> HTTPResponse -> BufferedReader -> SocketIO
+        sock = getattr(layer, "_sock", None)
+        if isinstance(sock, socket.socket):
+            sock.settimeout(seconds)
+            return
+        layer = getattr(layer, "raw", None) or getattr(layer, "fp", None)
+
+
+def _read_capped(response: Any, provider: str, deadline: float) -> bytes:
+    """The reply body, read in chunks: at most MAX_RESPONSE_BYTES, and all of it before
+    `deadline` (time.monotonic()), so a server that sends slowly cannot hold a request."""
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DeadlinePassed(f"{provider} took too long to send its reply")
+        _set_read_timeout(response, remaining)
+        chunk = response.read1(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
+        if not isinstance(chunk, bytes):
+            raise JudgeError(f"{provider} sent a malformed reply")
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_RESPONSE_BYTES:
+            raise JudgeError(f"{provider} sent a reply larger than {MAX_RESPONSE_BYTES} bytes")
 
 
 def _reject_constant(name: str) -> object:
@@ -936,22 +968,26 @@ class _HostedClassifier:
         request = urllib.request.Request(  # noqa: S310  (the scheme is checked above)
             self._url, data=body, method="POST", headers=headers
         )
+        timed_out = f"the request timed out after {self._timeout:g} s"
+        deadline = time.monotonic() + self._timeout  # for the whole request
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                return response.status, _read_capped(response, self.provider), ""
+                return response.status, _read_capped(response, self.provider, deadline), ""
         except urllib.error.HTTPError as exc:
             try:
-                raw = _read_capped(exc, self.provider)
-            except (JudgeError, OSError, http.client.HTTPException):
+                raw = _read_capped(exc, self.provider, deadline)
+            except (JudgeError, OSError, http.client.HTTPException, ValueError):
                 raw = b""
             finally:
                 exc.close()
+            if time.monotonic() >= deadline:
+                raise JudgeError(timed_out) from None
             return exc.code, raw, self._error_kind(exc, raw)
-        except TimeoutError:
-            raise JudgeError(f"the request timed out after {self._timeout:g} s") from None
+        except (TimeoutError, _DeadlinePassed):
+            raise JudgeError(timed_out) from None
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
-                raise JudgeError(f"the request timed out after {self._timeout:g} s") from None
+                raise JudgeError(timed_out) from None
             raise JudgeError(
                 f"cannot reach {self.provider} ({type(exc.reason).__name__})"
             ) from None
