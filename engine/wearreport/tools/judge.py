@@ -275,7 +275,8 @@ CANDIDATES: dict[str, Candidate] = {
 }
 # No model is chosen: no candidate and no two-model agreement passes the quality bar (T-029
 # bake-off: the best, qwen3.5-4b, reaches 76.2% accuracy on confident answers against the
-# 95% bar). Until one does, nothing names a judge: `--models chosen` is refused and
+# 95% bar; T-033 screen of the DEEPINFRA models: the best, di-qwen3-vl-235b, reaches 85.7%
+# with 23% unsure). Until one does, nothing names a judge: `--models chosen` is refused and
 # scripts/fetch_judge_model.sh without --model or --all exits non-zero.
 CHOSEN: str | None = None
 NO_CHOSEN_MODEL = "no judge model is chosen: no candidate passes the quality bar"
@@ -412,6 +413,17 @@ DEEPINFRA: dict[str, HostedCandidate] = {
             output_usd_per_mtok=3.50,
             licence="Modified MIT License",
             card=_DEEPINFRA_PAGE + "moonshotai/Kimi-K2.6",
+            reasoning_off=True,
+        ),
+        HostedCandidate(
+            name="di-kimi-k3",
+            family="Moonshot Kimi",
+            model_id="moonshotai/Kimi-K3",  # reasons in its reply unless told not to
+            region=DEEPINFRA_REGION,
+            input_usd_per_mtok=2.85,
+            output_usd_per_mtok=14.25,
+            licence="Kimi K3 License (MIT-style; a separate agreement for large model services)",
+            card=_DEEPINFRA_PAGE + "moonshotai/Kimi-K3",
             reasoning_off=True,
         ),
         HostedCandidate(
