@@ -766,7 +766,9 @@ _TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
 # With no token known, any long run of key-like characters in an error is redacted: it may
 # be an echoed key. Service error names (CamelCase words ending in Exception or Error, such
 # as UnrecognizedClientException) are kept: they are not keys, and they explain the error.
-_KEY_LIKE = re.compile(r"[A-Za-z0-9_-]{20,}")
+# Base64 and JWT characters (+ / = .) do not split a run; a run does not end in a period,
+# so the full stop after a word stays.
+_KEY_LIKE = re.compile(r"[A-Za-z0-9_+/=.-]{19,}[A-Za-z0-9_+/=-]")
 _ERROR_NAME = re.compile(r"(?:[A-Z][a-z]+){1,8}(?:Exception|Error)")
 
 

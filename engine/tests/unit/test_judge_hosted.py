@@ -805,3 +805,40 @@ def test_a_bedrock_run_without_the_variable_relies_on_the_injected_credential(
     for request in fake.requests:
         assert "authorization" not in {k.lower() for k in request["headers"]}
     assert "requests 2, input tokens 240, output tokens 4" in capsys.readouterr().out
+
+
+def _fragments(key: str, text: str, size: int = 8) -> list[str]:
+    """The runs of `size` characters of `key` that appear in `text`."""
+    return [key[i : i + size] for i in range(len(key) - size + 1) if key[i : i + size] in text]
+
+
+def test_deepinfra_the_aws_example_secret_is_redacted_whole(server: Any) -> None:
+    secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # noqa: S105  (AWS docs example)
+    fake = server(error(422, f"bad secret {secret}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert "bad secret [redacted]." in str(caught.value)
+    assert _fragments(secret, str(caught.value), 4) == []
+
+
+def test_deepinfra_a_base64_bedrock_key_leaves_no_fragment(server: Any) -> None:
+    raw = bytes(range(7, 250, 3)) + b"\xfb\xff"  # includes + and /, and ends in =
+    key = "ABSK" + base64.b64encode(raw).decode()
+    assert "+" in key and "/" in key and key.endswith("=")
+    fake = server(error(422, f"key {key} is invalid"))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    exc = caught.value
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert _fragments(key, shown) == []
+    assert "key [redacted] is invalid" in str(exc)
+
+
+@pytest.mark.parametrize(
+    "name", ["UnrecognizedClientException", "ValidationException", "AccessDeniedException"]
+)
+def test_deepinfra_aws_error_names_stay_readable(server: Any, name: str) -> None:
+    fake = server(error(422, f"failed: {name}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert f"failed: {name}." in str(caught.value)
