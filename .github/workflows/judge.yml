@@ -4,6 +4,9 @@ name: judge
 # weights and the gold set's licensed source photos (both SHA-256 pinned), runs the tests
 # that need them, and times the chosen model on the whole gold set. Manual only; it uses
 # no secrets and writes nothing back. See engine/wearreport/tools/judge.py.
+#
+# No model is chosen (no candidate passes the quality bar), so this workflow fails closed:
+# the fetch step exits non-zero and nothing runs.
 
 on:
   workflow_dispatch:

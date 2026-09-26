@@ -79,9 +79,9 @@ def test_every_candidate_has_its_own_files_and_a_template() -> None:
         assert all(re.fullmatch(r"[\w.-]+\.gguf", n) for n in (c.model_file, c.mmproj_file))
 
 
-def test_fetch_script_pins_every_candidate_and_names_the_chosen_one() -> None:
+def test_fetch_script_pins_every_candidate_and_names_no_chosen_one() -> None:
     script = FETCH_JUDGE.read_text()
-    assert f'CHOSEN="{judge.CHOSEN}"' in script
+    assert judge.CHOSEN is None and 'CHOSEN=""' in script
     for c in judge.CANDIDATES.values():
         for value in (c.repo, c.revision, c.model_file, c.model_sha256, c.mmproj_file):
             assert value in script, (c.name, value)
@@ -213,22 +213,29 @@ def test_main_refuses_bad_arguments(argv: list[str]) -> None:
     assert judge.main(argv, open_judge=lambda c: _Fake([]), crops=_crops) == 2
 
 
-def test_chosen_is_an_alias_on_the_command_line(capsys: pytest.CaptureFixture[str]) -> None:
-    judge.main(
-        ["--bakeoff", "--models", "chosen"],
-        open_judge=lambda c: _Fake(["person", "person", "in_vehicle", "not_person"]),
-        crops=_crops,
-    )
-    out = capsys.readouterr().out
-    assert f"== {judge.CHOSEN} (" in out and out.count("== ") == 1
+def test_the_chosen_alias_is_refused_while_no_model_is_chosen(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    opened: list[judge.Candidate] = []
+
+    def open_judge(c: judge.Candidate) -> _Fake:
+        opened.append(c)
+        return _Fake(["person", "person", "in_vehicle", "not_person"])
+
+    code = judge.main(["--bakeoff", "--models", "chosen"], open_judge=open_judge, crops=_crops)
+    captured = capsys.readouterr()
+    assert code == 2 and opened == [] and captured.out == ""
+    assert judge.NO_CHOSEN_MODEL in captured.err
 
 
-# With the chosen model's weights -----------------------------------------------------------
+# With a candidate's weights (the smallest Qwen3.5) ----------------------------------------
+
+PROBE = "qwen3.5-2b"
 
 
 @pytest.fixture(scope="module")
-def chosen() -> Iterator[judge.Judge]:
-    c = judge.CANDIDATES[judge.CHOSEN]
+def probe() -> Iterator[judge.Judge]:
+    c = judge.CANDIDATES[PROBE]
     if not all((judge.MODEL_DIR / n).is_file() for n in (c.model_file, c.mmproj_file)):
         if os.environ.get("WEARREPORT_REQUIRE_JUDGE"):
             pytest.fail("the judge weights are missing and WEARREPORT_REQUIRE_JUDGE is set")
@@ -240,16 +247,16 @@ def chosen() -> Iterator[judge.Judge]:
         jd.close()
 
 
-def test_replies_are_deterministic(chosen: judge.Judge) -> None:
+def test_replies_are_deterministic(probe: judge.Judge) -> None:
     rng = np.random.default_rng(5)
     image: npt.NDArray[np.uint8] = rng.integers(0, 256, (200, 100, 3), dtype=np.uint8)
-    first = chosen.reply(image)
-    assert chosen.reply(image) == first
+    first = probe.reply(image)
+    assert probe.reply(image) == first
     assert len(first) <= 200
 
 
 def test_a_closed_judge_refuses_to_answer() -> None:
-    c = judge.CANDIDATES[judge.CHOSEN]
+    c = judge.CANDIDATES[PROBE]
     if not all((judge.MODEL_DIR / n).is_file() for n in (c.model_file, c.mmproj_file)):
         pytest.skip("the judge weights are missing")
     jd = judge.Judge(c)

@@ -1,10 +1,13 @@
 #!/usr/bin/env sh
 # Download the spot-check judge's weights (GGUF, from Hugging Face) and verify each file
-# against a pinned SHA-256. By default the chosen model, qwen3.5-4b (Apache-2.0); with --all,
-# every bake-off candidate; with --model NAME, one of them. The pins are the ones in
-# engine/wearreport/tools/judge.py (CANDIDATES), and each URL names a pinned commit.
+# against a pinned SHA-256: with --all, every bake-off candidate; with --model NAME, one of
+# them. The pins are the ones in engine/wearreport/tools/judge.py (CANDIDATES), and each URL
+# names a pinned commit.
 #
-# Usage: sh scripts/fetch_judge_model.sh [--all | --model NAME] [--dest DIR]
+# No judge model is chosen: no candidate passes the quality bar (T-029 bake-off). Without
+# --all or --model the script therefore downloads nothing and exits non-zero.
+#
+# Usage: sh scripts/fetch_judge_model.sh (--all | --model NAME) [--dest DIR]
 #        (DIR defaults to .models/judge/)
 #
 # Fails closed: a file is moved into DIR only after its checksum matches; a file already
@@ -13,7 +16,7 @@
 # leaves no unverified file behind. Sends no credentials, and runs no Hugging Face client.
 set -eu
 
-CHOSEN="qwen3.5-4b"
+CHOSEN=""
 CANDIDATES="qwen3.5-2b qwen3.5-4b qwen3-vl-2b internvl3.5-2b smolvlm2-2.2b"
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${ROOT}/.models/judge"
@@ -27,10 +30,16 @@ while [ $# -gt 0 ]; do
       if [ "$1" = "--model" ]; then MODELS="$2"; else DEST="$2"; fi
       shift
       ;;
-    *) echo "usage: fetch_judge_model.sh [--all | --model NAME] [--dest DIR]" >&2; exit 2 ;;
+    *) echo "usage: fetch_judge_model.sh (--all | --model NAME) [--dest DIR]" >&2; exit 2 ;;
   esac
   shift
 done
+
+if [ -z "${MODELS}" ]; then
+  echo "fetch_judge_model: no judge model is chosen (no candidate passes the quality bar);" \
+    "nothing downloaded. Use --model NAME or --all to fetch bake-off candidates." >&2
+  exit 1
+fi
 
 PART=""
 trap '[ -z "${PART}" ] || rm -f "${PART}"' EXIT

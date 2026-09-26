@@ -1,5 +1,5 @@
 """The spot-check judge: an open-weights vision-language model, run locally on the CPU,
-that tells whether a detection crop shows a person, and the bake-off that chose it.
+that tells whether a detection crop shows a person, and the bake-off that chooses it.
 
   python -m wearreport.tools.judge --bakeoff [--models A,B] [--subset all|screen]
       [--limit N] [--threads 4]
@@ -27,10 +27,11 @@ are set before the runtime is imported, all the same, and the import is refused 
 runtime was loaded without them. llama.cpp's own environment switches (GGML_*, LLAMA_*,
 MTMD_*: debug dumps, a backend library path) are removed before it loads.
 
-The weights come from `scripts/fetch_judge_model.sh` (the chosen model; `--all` for every
-candidate). A model is opened only if both of its files match their pinned SHA-256: each
-file is opened once, hashed through that descriptor, and loaded through the same
-descriptor (/proc/self/fd/N), so it cannot be swapped between the check and the load.
+No model is chosen (CHOSEN is None): none passes the quality bar. The weights of the
+bake-off candidates come from `scripts/fetch_judge_model.sh --all` (or `--model NAME`).
+A model is opened only if both of its files match their pinned SHA-256: each file is
+opened once, hashed through that descriptor, and loaded through the same descriptor
+(/proc/self/fd/N), so it cannot be swapped between the check and the load.
 """
 
 from __future__ import annotations
@@ -241,10 +242,12 @@ CANDIDATES: dict[str, Candidate] = {
         ),
     )
 }
-# The most accurate candidate on the gold set. It does NOT pass the quality bar, and no
-# candidate or two-model agreement does (T-029 bake-off: 76.2% accuracy on confident
-# answers against the 95% bar), so it must not be used to publish precision yet.
-CHOSEN = "qwen3.5-4b"
+# No model is chosen: no candidate and no two-model agreement passes the quality bar (T-029
+# bake-off: the best, qwen3.5-4b, reaches 76.2% accuracy on confident answers against the
+# 95% bar). Until one does, nothing names a judge: `--models chosen` is refused and
+# scripts/fetch_judge_model.sh without --model or --all exits non-zero.
+CHOSEN: str | None = None
+NO_CHOSEN_MODEL = "no judge model is chosen: no candidate passes the quality bar"
 
 
 def download_url(candidate: Candidate, name: str) -> str:
@@ -731,7 +734,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--bakeoff", action="store_true", help="run the candidates on the gold set")
     ap.add_argument(
-        "--models", default=",".join(CANDIDATES), help="comma-separated names; chosen = CHOSEN"
+        "--models",
+        default=",".join(CANDIDATES),
+        help="comma-separated names; chosen = CHOSEN (refused: none is chosen)",
     )
     ap.add_argument("--subset", choices=("all", "screen"), default="all")
     ap.add_argument("--limit", type=int, default=None, help="first N crops only")
@@ -752,7 +757,10 @@ def main(
         build_parser().print_help()
         return 2
     names = [n.strip() for n in args.models.split(",") if n.strip()]
-    names = [CHOSEN if n == "chosen" else n for n in names]
+    if "chosen" in names and CHOSEN is None:
+        print(f"judge: {NO_CHOSEN_MODEL}", file=sys.stderr)
+        return 2
+    names = [CHOSEN if n == "chosen" and CHOSEN is not None else n for n in names]
     unknown = [n for n in names if n not in CANDIDATES]
     if unknown or not names:
         print(f"judge: unknown candidate {unknown[0] if unknown else ''!r}", file=sys.stderr)
