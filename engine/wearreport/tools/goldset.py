@@ -183,8 +183,12 @@ def _object(value: object, where: str) -> dict[str, object]:
 
 def _https(obj: dict[str, object], key: str, where: str) -> str:
     value = _str(obj, key, where)
-    if not value.startswith("https://") or any(c.isspace() for c in value):
-        raise GoldsetError(f"{where}: {key} must be an https URL")
+    if (
+        not value.startswith("https://")
+        or not value.isprintable()
+        or any(c.isspace() for c in value)
+    ):
+        raise GoldsetError(f"{where}: {key} must be an https URL without control characters")
     return value
 
 

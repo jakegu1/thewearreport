@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -233,14 +234,20 @@ def test_the_chosen_alias_is_refused_while_no_model_is_chosen(
 PROBE = "qwen3.5-2b"
 
 
-@pytest.fixture(scope="module")
-def probe() -> Iterator[judge.Judge]:
+def _require_weights() -> judge.Candidate:
+    """The probe candidate; its tests fail without the weights if WEARREPORT_REQUIRE_JUDGE
+    is set, and skip otherwise."""
     c = judge.CANDIDATES[PROBE]
     if not all((judge.MODEL_DIR / n).is_file() for n in (c.model_file, c.mmproj_file)):
         if os.environ.get("WEARREPORT_REQUIRE_JUDGE"):
             pytest.fail("the judge weights are missing and WEARREPORT_REQUIRE_JUDGE is set")
         pytest.skip("the judge weights are missing")
-    jd = judge.Judge(c)
+    return c
+
+
+@pytest.fixture(scope="module")
+def probe() -> Iterator[judge.Judge]:
+    jd = judge.Judge(_require_weights())
     try:
         yield jd
     finally:
@@ -256,11 +263,135 @@ def test_replies_are_deterministic(probe: judge.Judge) -> None:
 
 
 def test_a_closed_judge_refuses_to_answer() -> None:
-    c = judge.CANDIDATES[PROBE]
-    if not all((judge.MODEL_DIR / n).is_file() for n in (c.model_file, c.mmproj_file)):
-        pytest.skip("the judge weights are missing")
-    jd = judge.Judge(c)
+    # Like the probe fixture: fails without the weights when WEARREPORT_REQUIRE_JUDGE is set.
+    jd = judge.Judge(_require_weights())
     jd.close()
     jd.close()  # twice is fine
     with pytest.raises(judge.JudgeError):
         jd.classify(np.zeros((50, 30, 3), np.uint8))
+
+
+# The hosted backend (no network: the acceptance tests use a local fake server) ------------
+
+
+def test_the_request_budget_stops_at_its_limit() -> None:
+    budget = judge.RequestBudget(2)
+    budget.take()
+    budget.take()
+    with pytest.raises(judge.RequestLimitReached):
+        budget.take()
+    assert budget.used == 2
+    with pytest.raises(ValueError):
+        judge.RequestBudget(0)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://bedrock.example.org",  # plain http, not on this machine
+        "https://bedrock.example.org/other",
+        "https://user@bedrock.example.org",
+        "https://bedrock.example.org?x=1",
+        "ftp://127.0.0.1",
+    ],
+)
+def test_the_endpoint_must_be_an_https_origin(
+    endpoint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, "t" * 40)
+    candidate = next(iter(judge.HOSTED.values()))
+    with pytest.raises(judge.JudgeError):
+        judge.BedrockClassifier(candidate, budget=judge.RequestBudget(1), endpoint=endpoint)
+
+
+@pytest.mark.parametrize("token", ["with space", "line\nbreak", "é" * 20])
+def test_a_malformed_token_is_refused_without_being_echoed(
+    token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, token)
+    candidate = next(iter(judge.HOSTED.values()))
+    with pytest.raises(judge.JudgeError) as caught:
+        judge.BedrockClassifier(candidate, budget=judge.RequestBudget(1))
+    assert token not in str(caught.value)
+
+
+def test_the_default_endpoint_is_the_candidates_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, "t" * 40)
+    for c in judge.HOSTED.values():
+        clf = judge.BedrockClassifier(c, budget=judge.RequestBudget(1))
+        assert clf._url == (
+            f"https://bedrock-runtime.{c.region}.amazonaws.com/model/{c.model_id}/converse"
+        )
+
+
+def test_a_marked_crop_whose_pixels_change_is_no_longer_licensed() -> None:
+    marked = judge.mark_licensed(np.full((40, 20, 3), 7, np.uint8))
+    assert judge.is_licensed(marked)
+    assert not judge.is_licensed(marked.copy())
+    assert not judge.is_licensed(marked[:, :10])
+    marked.flags.writeable = True
+    marked[0, 0, 0] = 8
+    assert not judge.is_licensed(marked)
+    assert not judge.is_licensed("an image")
+
+
+def test_partial_tokens_in_an_error_message_are_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "abcdefghijklmnopqrstuvwxyz0123456789"  # noqa: S105  (made up)
+    monkeypatch.setenv(judge.TOKEN_ENV, token)
+    clf = judge.BedrockClassifier(next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(1))
+    raw = ('{"message": "bad key ' + token[5:30] + " or " + token + '\\u0007"}').encode()
+    text = clf._describe(403, "AccessDeniedException", raw)
+    assert token[5:30] not in text and token not in text and "\x07" not in text
+    assert text.startswith("Bedrock answered HTTP 403 AccessDeniedException: bad key")
+
+
+def test_a_closed_bedrock_classifier_refuses_to_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, "t" * 40)
+    clf = judge.BedrockClassifier(next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(1))
+    clf.close()
+    with pytest.raises(judge.JudgeError):
+        clf.classify(judge.mark_licensed(np.zeros((40, 20, 3), np.uint8)))
+
+
+def test_every_hosted_candidate_has_its_own_model_and_backups_are_not_run_by_default() -> None:
+    ids = [c.model_id for c in judge.HOSTED.values()]
+    assert len(ids) == len(set(ids))
+    assert any(c.backup for c in judge.HOSTED.values())
+    assert not set(judge.HOSTED) & set(judge.CANDIDATES)
+
+
+def test_a_screen_decides_nothing(capsys: pytest.CaptureFixture[str]) -> None:
+    run = judge.Run(next(iter(judge.HOSTED)))
+    answers: list[tuple[Any, Any]] = [("person", "person")] * 6
+    run.answers = answers + [("not_person", "not_person")] * 4
+    run.held_out = [True] * 10
+    judge.bakeoff([run.name], lambda name: run, print, decide=False)
+    out = capsys.readouterr().out
+    assert "no pass decision" in out and "passes:" not in out
+
+
+def test_main_refuses_a_remote_run_without_the_token(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
+    code = judge.main(["--bakeoff", "--backend", "bedrock", "--max-requests", "5"], crops=_crops)
+    assert code == 2 and judge.TOKEN_ENV in capsys.readouterr().err
+
+
+def test_local_names_are_unknown_to_the_remote_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, "t" * 40)
+    argv = ["--bakeoff", "--backend", "bedrock", "--max-requests", "5", "--models", PROBE]
+    assert judge.main(argv, crops=_crops) == 2
+
+
+def test_fetch_judge_model_with_a_blank_model_fails(tmp_path: Path) -> None:
+    sh = shutil.which("sh")
+    assert sh is not None
+    proc = subprocess.run(
+        [sh, str(FETCH_JUDGE), "--model", " ", "--dest", str(tmp_path / "d")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode != 0 and "no model named" in proc.stderr

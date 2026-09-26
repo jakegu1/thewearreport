@@ -80,7 +80,9 @@ fetch() { # fetch REPO REVISION NAME SHA256
   echo "fetch_judge_model: installed ${name} to ${DEST}"
 }
 
+count=0
 for model in ${MODELS}; do
+  count=$((count + 1))
   case "${model}" in
   qwen3.5-2b) set -- \
     "bartowski/Qwen_Qwen3.5-2B-GGUF" "7d26695454df6de5fbcce2e58681e62dae06ce43" \
@@ -107,3 +109,8 @@ for model in ${MODELS}; do
   fetch "$1" "$2" "$3" "$4"
   fetch "$1" "$2" "$5" "$6"
 done
+
+if [ "${count}" -eq 0 ]; then
+  echo "fetch_judge_model: no model named; nothing downloaded" >&2
+  exit 1
+fi

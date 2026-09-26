@@ -76,6 +76,25 @@ Copy it to `.env` (never committed) and fill in the values you need.
 | Public guard | `make public-guard` | no private material in the repository (INV-9) |
 | Schema validation | `make schemas` | `data/schema/` is valid JSON Schema and samples validate |
 
+## Judge bake-off
+
+The spot-check judge is chosen by a bake-off on a licensed gold set
+(`engine/wearreport/tools/judge.py`, `engine/wearreport/tools/goldset.py`). No judge is
+chosen yet: no candidate has passed the quality bar.
+
+```bash
+sh scripts/fetch_goldset.sh                      # the gold set's licensed source photos
+sh scripts/fetch_judge_model.sh --all            # local candidates' weights (GGUF)
+uv run python -m wearreport.tools.judge --bakeoff --subset screen   # local models
+AWS_BEARER_TOKEN_BEDROCK=... uv run python -m wearreport.tools.judge --bakeoff \
+  --backend bedrock --max-requests 1200          # models hosted by Amazon Bedrock
+```
+
+A model passes only if the whole gold set and the held-out items (those outside the
+100-crop screening subset) both pass the bar. A Bedrock run needs `--max-requests`, sends
+gold-set crops only and prints requests, tokens and the measured cost. It is never part
+of `make check` or CI.
+
 ## License
 
 Code: [Apache-2.0](./LICENSE). Data: see [DATA-LICENSE.md](./DATA-LICENSE.md).
