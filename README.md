@@ -100,6 +100,21 @@ of `make check` or CI. A Bedrock run without `AWS_BEARER_TOKEN_BEDROCK` sends no
 that the environment adds to requests for the provider's host (for example an
 authenticating proxy). No DeepInfra key is read by this code.
 
+A diagnostic experiment asks whether more context around the box, or a larger render,
+helps a hosted judge. It renders the gold set with each crop variant (`m0.5`, today's crop;
+`m1.0` and `m2.0`, a wider margin; `m1.0-r480`, a larger enlargement), with the degradation
+unchanged, and reports each variant and model against `m0.5`. It chooses no model.
+
+```bash
+uv run python -m wearreport.tools.judge_context --variants m0.5,m1.0,m2.0,m1.0-r480 \
+  --models di-qwen3-vl-235b,di-gemma-4-31b --max-requests 800   # screen subset
+```
+
+With `--subset all`, the held-out items are split by source photo: no held-out item shares
+a photo with a screening item. On the screen, no variant brought either model within
+5 points of the 95% bar with 15% or fewer unsure (T-035). The best result was
+`di-gemma-4-31b` with `m2.0`, at 84.2% with 5% unsure.
+
 ## Operations
 
 [`.github/workflows/sweep.yml`](./.github/workflows/sweep.yml) runs one sweep every 20
