@@ -1,6 +1,6 @@
 name: ci
 
-# Lint, types, tests, licences, privacy guard, schemas and secret scan.
+# Lint, types, tests, licences, privacy guard, schemas, workflow lint and secret scan.
 # Mirrors `make check` (the public guard runs in public-guard.yml). See AGENTS.md.
 
 on:
@@ -22,6 +22,8 @@ jobs:
     env:
       # Model-dependent tests fail, instead of skipping, when the model is missing.
       WEARREPORT_REQUIRE_MODEL: "1"
+      # The workflow lint test fails, instead of skipping, when actionlint is missing.
+      WEARREPORT_REQUIRE_ACTIONLINT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,6 +36,10 @@ jobs:
         run: uv sync --locked
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: sh scripts/fetch_model.sh --with-m
+      - name: Install actionlint (SHA-256 verified)
+        run: sh scripts/install_actionlint.sh
+      - name: actionlint (every workflow)
+        run: .tools/bin/actionlint -shellcheck= -pyflakes=
       - name: ruff check
         run: uv run --locked ruff check engine scripts
       - name: ruff format --check

@@ -61,7 +61,6 @@ jobs:
       stage: ${{ steps.result.outputs.stage }}
       consecutive_failures: ${{ steps.record.outputs.consecutive_failures }}
     env:
-      DATA_DIR: ${{ runner.temp }}/data
       DATA_REMOTE: https://github.com/${{ github.repository }}.git
     steps:
       - name: Forced failure (manual alert test; nothing is published)
@@ -70,6 +69,9 @@ jobs:
         run: |
           echo "force_fail is set: failing before the sweep starts" >&2
           exit 1
+      # The runner context is not available in job-level env, so DATA_DIR is set here.
+      - name: Set DATA_DIR
+        run: echo "DATA_DIR=${RUNNER_TEMP}/data" >> "${GITHUB_ENV}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

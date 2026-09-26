@@ -55,15 +55,15 @@ tools/       Repository checks (public guard)
 Requires Linux x86_64 (CI runs `ubuntu-24.04`), `make`, `curl` and `git`.
 
 ```bash
-make setup   # installs uv 0.12.18 if missing, Python 3.12, dependencies and gitleaks
-make check   # everything CI runs: lint, format, types, tests, licences, privacy, secrets, public guard
+make setup   # installs uv 0.12.18 if missing, Python 3.12, dependencies, gitleaks and actionlint
+make check   # everything CI runs: lint, format, types, tests, licences, privacy, secrets, workflow lint, public guard
 make test    # tests only
 make help    # list all targets
 ```
 
 `make setup` installs the pinned uv release into `~/.local/bin` when it is not already
-on `PATH`, and gitleaks into `.tools/bin/`. Both downloads are verified against pinned
-SHA-256 checksums.
+on `PATH`, and gitleaks and actionlint (both MIT, development tools only) into
+`.tools/bin/`. Every download is verified against a pinned SHA-256 checksum.
 
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
