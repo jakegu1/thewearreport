@@ -1,0 +1,48 @@
+{
+  "date": "2026-09-28",
+  "reviewer": "Jake",
+  "mode": "crops",
+  "frames_reviewed": 35,
+  "boxes_shown": 191,
+  "boxes_not_person": 34,
+  "boxes_in_vehicle": 0,
+  "persons_missed": null,
+  "precision_person": 0.822,
+  "precision_pedestrian": 0.822,
+  "recall_estimate": null,
+  "detector": {
+    "model": "yolox_m",
+    "sha256": "21ff6cfdeb53b013bac2249599e55f00bff3cfdfdab37ed7a4620818c1d15b3f",
+    "conf": 0.35
+  },
+  "judge": {
+    "model": "di-qwen3-vl-235b",
+    "provider": "DeepInfra",
+    "status": "complete",
+    "requests": 191,
+    "input_tokens": 32467,
+    "output_tokens": 456,
+    "cost_usd": 0.00689468,
+    "confusion": {
+      "person": {
+        "person": 102,
+        "in_vehicle": 0,
+        "not_person": 0,
+        "unsure": 55
+      },
+      "in_vehicle": {
+        "person": 0,
+        "in_vehicle": 0,
+        "not_person": 0,
+        "unsure": 0
+      },
+      "not_person": {
+        "person": 15,
+        "in_vehicle": 0,
+        "not_person": 0,
+        "unsure": 19
+      }
+    },
+    "judge_precision": 1.0
+  }
+}
