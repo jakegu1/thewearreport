@@ -355,7 +355,7 @@ def test_ac2_unsure_left_out_of_the_statistics_and_counted_in_the_box_file(
 ) -> None:
     out = tmp_path / "out"
     reviewer = Labeller({1: "unsure", 2: "not_person", 3: "in_vehicle"})
-    args = ["--n", "1", "--min-persons", "1", "--view", "files"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "files", "--record-boxes"]
     assert _run(args, out, pipeline=_pipeline([4]), reviewer=reviewer) == 0
     stats = _json(out / f"{DAY.isoformat()}.json")
     assert set(stats) == OLD_FIELDS
@@ -462,7 +462,7 @@ def test_ac2_the_judge_gets_only_the_crops_not_marked_unsure(
 def test_ac3_the_box_file_has_exactly_its_fields(env: Path, tmp_path: Path) -> None:
     out = tmp_path / "out"
     reviewer = Labeller({2: "not_person"})
-    args = ["--n", "2", "--min-persons", "1", "--view", "files"]
+    args = ["--n", "2", "--min-persons", "1", "--view", "files", "--record-boxes"]
     assert _run(args, out, pipeline=_pipeline([4, 2]), reviewer=reviewer) == 0
     stats = _json(out / f"{DAY.isoformat()}.json")
     record = _json(out / "boxes" / f"{DAY.isoformat()}.json")
@@ -501,7 +501,7 @@ def test_ac3_started_at_is_taken_when_the_sweep_begins(env: Path, tmp_path: Path
         return next(times)
 
     pipeline = spotcheck.Pipeline(frames=frames, detector=Stub([2]), info=INFO)
-    args = ["--n", "1", "--min-persons", "1", "--view", "files"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "files", "--record-boxes"]
     assert _run(args, tmp_path / "out", pipeline=pipeline, reviewer=Labeller(), clock=clock) == 0
     assert calls[:2] == ["clock", "sweep"]
     record = _json(tmp_path / "out" / "boxes" / f"{DAY.isoformat()}.json")
@@ -514,7 +514,7 @@ def test_ac3_nothing_else_is_written(env: Path, tmp_path: Path) -> None:
     watched = [work, home, env]
     tempfile.gettempdir()  # tempfile's own writability probe, before the snapshot
     before = _files(watched)
-    args = ["--n", "2", "--min-persons", "1", "--view", "files"]
+    args = ["--n", "2", "--min-persons", "1", "--view", "files", "--record-boxes"]
     assert _run(args, work / "stats", pipeline=_pipeline([3, 4]), reviewer=Labeller()) == 0
     after = _files(watched)
     name = f"{DAY.isoformat()}.json"
@@ -533,7 +533,7 @@ def test_ac3_no_overwrite(env: Path, tmp_path: Path) -> None:
     (out / "boxes").mkdir(parents=True)
     name = f"{DAY.isoformat()}.json"
     (out / "boxes" / name).write_text("kept", encoding="utf-8")
-    args = ["--n", "1", "--min-persons", "1", "--view", "files"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "files", "--record-boxes"]
     assert _run(args, out, pipeline=_pipeline([2]), reviewer=Labeller()) == 0
     assert (out / "boxes" / name).read_text(encoding="utf-8") == "kept"
     second = f"{DAY.isoformat()}-2.json"
@@ -543,6 +543,20 @@ def test_ac3_no_overwrite(env: Path, tmp_path: Path) -> None:
     assert _run(args, out, pipeline=_pipeline([2]), reviewer=Labeller()) == 0
     third = f"{DAY.isoformat()}-3.json"
     assert (out / third).is_file() and (out / "boxes" / third).is_file()
+
+
+def test_ac3_without_record_boxes_no_box_file_or_directory(env: Path, tmp_path: Path) -> None:
+    work, home = Path.cwd(), Path(os.environ["HOME"])
+    watched = [work, home, env]
+    tempfile.gettempdir()  # tempfile's own writability probe, before the snapshot
+    before = _files(watched)
+    reviewer = Labeller({1: "unsure", 2: "not_person"})
+    args = ["--n", "2", "--min-persons", "1", "--view", "files"]
+    assert _run(args, work / "stats", pipeline=_pipeline([3, 4]), reviewer=reviewer) == 0
+    after = _files(watched)
+    assert sorted(set(after) - set(before)) == [work / "stats" / f"{DAY.isoformat()}.json"]
+    assert not os.path.lexists(work / "stats" / "boxes")
+    assert set(_json(work / "stats" / f"{DAY.isoformat()}.json")) == OLD_FIELDS
 
 
 def test_ac3_privacy_guard_still_passes() -> None:
