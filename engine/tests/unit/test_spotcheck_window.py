@@ -9,13 +9,16 @@ the tool onto those paths.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import gc
 import io
 import os
 import signal
 import sys
 import tempfile
 import time
+import weakref
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -204,6 +207,30 @@ def test_window_accepts_keypad_enter_and_capitals_and_ignores_keys_after_the_las
     }
 
 
+@pytest.mark.parametrize("last", ["<Return>", "<KeyPress-q>"])
+def test_window_leaves_no_tk_object_for_another_thread_to_free(last: str) -> None:
+    """Tcl aborts the process when one of its objects is freed in a thread other than
+    the one that made it; the garbage collector can run in any thread. So nothing of the
+    window may outlive the review in a reference cycle."""
+    _need_window()
+    roots: list[weakref.ref[Any]] = []
+    send = _send("<Return>", last)
+
+    def drive(root: Any) -> None:
+        roots.append(weakref.ref(root))
+        send(root)
+
+    gc.disable()  # only the review's own clean-up may free it
+    try:
+        with contextlib.suppress(spotcheck.ReviewAborted):
+            spotcheck.WindowReviewer(driver=drive).judge(
+                _crops([1, 2]), "crops", time.monotonic() + WAIT_S
+            )
+        assert roots and roots[0]() is None
+    finally:
+        gc.enable()
+
+
 def test_window_with_nothing_to_review_opens_nothing() -> None:
     reviewer = spotcheck.WindowReviewer(driver=lambda root: pytest.fail("no window"))
     assert reviewer.judge([], "crops", time.monotonic() + WAIT_S) == {}
@@ -351,19 +378,31 @@ def test_windows_pipe_polling(monkeypatch: pytest.MonkeyPatch) -> None:
     _check_reader()
 
 
+def test_the_windows_lock_file_lies_next_to_the_directory_outside_the_prefix(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / (spotcheck.TEMP_PREFIX + "abc123")
+    lock = spotcheck.lock_file(directory)
+    assert lock == tmp_path / f".{spotcheck.TEMP_PREFIX}abc123.lock"
+    assert not lock.is_relative_to(directory)
+    assert not lock.name.startswith(spotcheck.TEMP_PREFIX)  # never taken for a directory
+
+
 # Windows only -------------------------------------------------------------------------
 
 
 @windows_only
-def test_windows_lock_file_excludes_a_second_lock_and_is_deleted_with_the_directory(
+def test_windows_lock_file_lies_outside_excludes_a_second_lock_and_is_deleted(
     env: Path,
 ) -> None:
     directory = spotcheck.ReviewDirectory()
     path = directory.create()
-    assert (path / spotcheck.LOCK_FILE).is_file()
+    lock = spotcheck.lock_file(path)
+    assert lock.parent == path.parent and lock.is_file()
+    assert list(path.iterdir()) == []  # nothing held open inside the directory
     assert spotcheck._lock(path) is None
     assert directory.remove()
-    assert not path.exists()
+    assert not path.exists() and not lock.exists()
 
 
 @windows_only

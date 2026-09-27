@@ -727,7 +727,7 @@ def test_encoding_failure_while_writing_leaves_nothing(
     monkeypatch.setattr(spotcheck.ReviewDirectory, "write_image", write_image)
     with pytest.raises(RuntimeError, match="encoder broke"):
         _run(
-            ["--n", "1", "--min-persons", "1"],
+            ["--n", "1", "--min-persons", "1", "--view", "files"],
             tmp_path / "o",
             pipeline=_pipeline([3]),
             reviewer=Scripted(),
@@ -750,7 +750,7 @@ def test_filesystem_errors_are_reported_without_a_traceback(
         monkeypatch.setattr(tempfile, "mkdtemp", full)
     else:
         monkeypatch.setattr(spotcheck.ReviewDirectory, step, full)
-    args = ["--n", "1", "--min-persons", "1"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "files"]
     assert _run(args, tmp_path / "out", pipeline=_pipeline([2]), reviewer=Scripted()) == 1
     assert "cannot write the review directory: No space left" in capsys.readouterr().err
     assert _leftovers(env) == []
@@ -771,7 +771,9 @@ def test_write_image_refuses_names_outside_the_directory(env: Path) -> None:
             directory.write_image(item)  # O_EXCL: never overwrites, never follows a link
         assert directory.path is not None
         mode = os.stat(directory.path / item.file).st_mode & 0o777
-        assert mode == 0o600
+        # Windows keeps no Unix mode bits (it reports 0o666 for a writable file); there,
+        # access is restricted by the owner-only ACL mkdtemp gives the directory.
+        assert mode == (0o666 if sys.platform == "win32" else 0o600)
     finally:
         assert directory.remove()
     assert _leftovers(env) == []
@@ -847,10 +849,44 @@ def _json_reviewer(path: Path) -> tuple[spotcheck.JsonFileReviewer, io.StringIO]
     return spotcheck.JsonFileReviewer(path, out), out
 
 
+def _named_pipe(request: pytest.FixtureRequest) -> Path:
+    """A Windows named pipe, the counterpart of a FIFO, with enough instances for every
+    poll to find one free (each stat connects to one)."""
+    if sys.platform != "win32":
+        raise AssertionError("Windows only")
+    import _winapi
+
+    name = rf"\\.\pipe\wearreport-test-{os.getpid()}-{time.monotonic_ns()}"
+    handles: list[int] = []
+
+    def close() -> None:
+        for handle in handles:
+            _winapi.CloseHandle(handle)
+
+    request.addfinalizer(close)
+    for _ in range(32):
+        handle = _winapi.CreateNamedPipe(
+            name,
+            _winapi.PIPE_ACCESS_INBOUND,
+            0,
+            _winapi.PIPE_UNLIMITED_INSTANCES,
+            0,
+            0,
+            0,
+            _winapi.NULL,
+        )
+        handles.append(handle)
+    return Path(name)
+
+
 @pytest.mark.parametrize("kind", ["fifo", "directory", "device", "too_large"])
-def test_json_reviewer_rejects_paths_that_are_not_small_files(tmp_path: Path, kind: str) -> None:
+def test_json_reviewer_rejects_paths_that_are_not_small_files(
+    tmp_path: Path, kind: str, request: pytest.FixtureRequest
+) -> None:
     path = tmp_path / "judgements.json"
-    if kind == "fifo":
+    if kind == "fifo" and sys.platform == "win32":
+        path = _named_pipe(request)
+    elif kind == "fifo":
         os.mkfifo(path)
     elif kind == "directory":
         path.mkdir()
@@ -900,7 +936,12 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     locked = tmp / (spotcheck.TEMP_PREFIX + "locked")
     locked.mkdir()
     link = tmp / (spotcheck.TEMP_PREFIX + "link")
-    link.symlink_to(outside)
+    if sys.platform == "win32":  # a junction: Windows' link that needs no privilege
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(link))
+    else:
+        link.symlink_to(outside)
     plain = tmp / (spotcheck.TEMP_PREFIX + "file")
     plain.write_text("x", encoding="utf-8")
     other = tmp / "other-dir"
@@ -908,7 +949,12 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     old = now - 7200
     for p in (stale, locked, plain, other):
         os.utime(p, (old, old))
-    os.utime(link, (old, old), follow_symlinks=False)
+    if sys.platform == "win32":
+        # No os.utime(follow_symlinks=False) there; links are never old enough to matter,
+        # since the sweep skips every reparse point first.
+        assert link.is_junction()
+    else:
+        os.utime(link, (old, old), follow_symlinks=False)
     fd = spotcheck._lock(locked)
     assert fd is not None
     try:
@@ -916,7 +962,8 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     finally:
         os.close(fd)
     assert not stale.exists()
-    assert locked.is_dir() and link.is_symlink() and plain.is_file() and other.is_dir()
+    is_link = link.is_junction() if sys.platform == "win32" else link.is_symlink()
+    assert locked.is_dir() and is_link and plain.is_file() and other.is_dir()
     assert (outside / "keep").is_file()
     assert spotcheck.remove_stale(tmp, 3600, now) == 1  # unlocked now
     assert spotcheck.remove_stale(tmp_path / "missing", 1) == 0
@@ -1125,7 +1172,7 @@ def _finish(proc: subprocess.Popen[bytes]) -> tuple[int, str]:
 def test_child_exit_paths_leave_no_directory(
     tmp_path: Path, scenario: str, code: int, message: str
 ) -> None:
-    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1"])
+    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1", "--view", "files"])
     returncode, output = _finish(proc)
     assert returncode == code, output
     assert message in output
@@ -1207,7 +1254,7 @@ def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
 def test_child_signals_as_cleanup_starts_still_clean_up(
     tmp_path: Path, scenario: str, code: int
 ) -> None:
-    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1"])
+    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1", "--view", "files"])
     returncode, output = _finish(proc)
     assert returncode == code, output
     assert "Traceback" not in output
@@ -1294,6 +1341,9 @@ def test_second_instance_never_deletes_a_running_instances_directory(tmp_path: P
     assert _leftovers(tmp) == []
 
 
+OK_ARGS = ["--n", "1", "--min-persons", "1", "--view", "files"]
+
+
 def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
     proc, tmp = _spawn(tmp_path, "json", args)
@@ -1301,11 +1351,11 @@ def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     proc.kill()
     proc.communicate(timeout=WAIT_S)
     assert workdir.is_dir()  # SIGKILL cannot be handled
-    returncode, output = _finish(_spawn(tmp_path, "ok", ["--n", "1", "--min-persons", "1"])[0])
+    returncode, output = _finish(_spawn(tmp_path, "ok", OK_ARGS)[0])
     assert returncode == 0 and workdir.is_dir()  # younger than the timeout: kept
     old = time.time() - 7200
     os.utime(workdir, (old, old))
-    returncode, output = _finish(_spawn(tmp_path, "ok", ["--n", "1", "--min-persons", "1"])[0])
+    returncode, output = _finish(_spawn(tmp_path, "ok", OK_ARGS)[0])
     assert returncode == 0, output
     assert "Deleted 1 review directories" in output
     assert _leftovers(tmp) == []
@@ -1413,8 +1463,8 @@ def _confined_run(tmp_path: Path, scenario: str, mode: str) -> tuple[list[tuple[
     tmp.mkdir()
     environ = _child_env(tmp)
     environ["HOME"] = str(tmp_path / "home")
-    args = ["--n", "3", "--min-persons", "1", "--mode", mode, "--reviewer", "tester"]
-    args += ["--out-dir", "stats"]
+    args = ["--n", "3", "--min-persons", "1", "--mode", mode, "--view", "files"]
+    args += ["--reviewer", "tester", "--out-dir", "stats"]
     result = subprocess.run(
         [sys.executable, "-c", CONFINED, scenario, *args],
         cwd=work,

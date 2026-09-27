@@ -151,8 +151,8 @@ except the statistics file.
 **SIGKILL cannot be handled** (nor can a power cut, a process ended from Task Manager
 or `taskkill /f` on Windows, or a crash with SIGSEGV, SIGBUS or another fault signal):
 the directory then stays behind.
-While it runs, the tool holds a lock on its directory (on Windows, on a `.lock` file in
-it); at start it deletes every `wearreport-spotcheck-*` directory of the current user
+While it runs, the tool holds a lock on its directory (on Windows, on a lock file next to
+it, `.wearreport-spotcheck-*.lock`, deleted with the directory); at start it deletes every `wearreport-spotcheck-*` directory of the current user
 that is older than the timeout and not locked by a running instance. To clean up by
 hand: `rm -rf "${TMPDIR:-/tmp}"/wearreport-spotcheck-*`, or in PowerShell
 `Remove-Item -Recurse -Force "$env:TEMP\wearreport-spotcheck-*"`.

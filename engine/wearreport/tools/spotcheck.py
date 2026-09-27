@@ -27,8 +27,9 @@ with `tempfile.mkdtemp(prefix=TEMP_PREFIX)` (mode 0700) and always deletes:
   being created or deleted: a signal that arrives then is held until that step is done.
   Only the first signal is raised; later ones are dropped, so they cannot interrupt the
   clean-up the first one started;
-- the directory holds a lock (flock; on Windows, msvcrt.locking on a `.lock` file in
-  it) while the tool runs. At start the tool deletes every `wearreport-spotcheck-*`
+- the directory holds a lock (flock; on Windows, msvcrt.locking on a lock file next to
+  it, `.wearreport-spotcheck-*.lock`, so that no open file is ever inside the directory)
+  while the tool runs. At start the tool deletes every `wearreport-spotcheck-*`
   directory of the current user in the temporary directory that is older than the
   timeout and not locked, which is what SIGKILL (which cannot be handled), a killed
   process on Windows or a power cut leaves behind. A running instance's directory stays
@@ -62,6 +63,7 @@ import base64
 import contextlib
 import dataclasses
 import datetime
+import gc
 import json
 import math
 import os
@@ -167,7 +169,9 @@ HANDLED_SIGNALS = _terminating_signals()
 # The review alarm: SIGALRM where the platform has it. Windows has none; a timer thread
 # raises SIGINT instead, and the guard tells it from Ctrl-C by a flag.
 ALARM_SIGNALS: tuple[int, ...] = (signal.SIGALRM,) if hasattr(signal, "SIGALRM") else ()
-LOCK_FILE = ".lock"  # Windows only: the file whose first byte holds the directory's lock
+# Windows only: the file whose first byte holds a review directory's lock. It lies next to
+# the directory, never inside it: an open file there could not be read or deleted.
+LOCK_SUFFIX = ".lock"
 # Extra flags for the files the tool creates, where the platform has them. O_BINARY
 # matters on Windows, where a descriptor is otherwise opened in text mode.
 CREATE_FLAGS = 0
@@ -594,16 +598,22 @@ def _is_link_like(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
 
 
+def lock_file(path: str | Path) -> Path:
+    """The Windows lock file of the review directory `path`: `.<name>.lock` next to it.
+    The leading dot keeps it out of `wearreport-spotcheck-*`."""
+    path = Path(path)
+    return path.parent / f".{path.name}{LOCK_SUFFIX}"
+
+
 def _lock_windows(path: str | Path) -> int | None:
-    """Windows cannot open or flock a directory: lock the first byte of a `.lock` file in
-    it with msvcrt.locking instead. The lock goes when the descriptor is closed or the
-    process ends, however it ends. An open file cannot be deleted on Windows, so close the
-    descriptor before deleting the directory."""
+    """Windows cannot open or flock a directory: lock the first byte of the directory's
+    lock file (`lock_file`) with msvcrt.locking instead. The lock goes when the descriptor
+    is closed or the process ends, however it ends."""
     try:
         st = os.lstat(path)
         if not stat.S_ISDIR(st.st_mode) or _is_link_like(st):
             return None
-        fd = os.open(Path(path) / LOCK_FILE, os.O_RDWR | os.O_CREAT | CREATE_FLAGS, 0o600)
+        fd = os.open(lock_file(path), os.O_RDWR | os.O_CREAT | CREATE_FLAGS, 0o600)
     except OSError:
         return None
     try:
@@ -673,8 +683,6 @@ class ReviewDirectory:
 
     def remove(self) -> bool:
         """Delete the directory; True if it is gone (or was never made). Never raises."""
-        if WINDOWS:
-            self._unlock()  # an open file cannot be deleted there
         gone = True
         if self.path is not None:
             gone = _rmtree(self.path)
@@ -692,6 +700,15 @@ class ReviewDirectory:
             with contextlib.suppress(OSError):
                 os.close(self._fd)
             self._fd = None
+            if WINDOWS and self.path is not None:
+                _remove_lock_file(self.path)
+
+
+def _remove_lock_file(path: Path) -> None:
+    """Delete the Windows lock file of the review directory `path`, if no process holds it
+    open (an open file cannot be deleted there). Never raises."""
+    with contextlib.suppress(OSError):
+        os.unlink(lock_file(path))
 
 
 def remove_stale(
@@ -712,7 +729,8 @@ def remove_stale(
         if not entry.name.startswith(TEMP_PREFIX):
             continue
         try:
-            st = entry.stat(follow_symlinks=False)
+            # Windows' DirEntry.stat() reports st_ino as 0: ask os.lstat there.
+            st = os.lstat(entry.path) if WINDOWS else entry.stat(follow_symlinks=False)
         except OSError:
             continue
         if not stat.S_ISDIR(st.st_mode) or not _owned(st):
@@ -743,17 +761,20 @@ def _owned(st: os.stat_result) -> bool:
 
 
 def _remove_stale_windows(path: Path, st: os.stat_result) -> int:
-    """1 if the unlocked directory `path`, still the one `st` describes, was deleted."""
+    """1 if the unlocked directory `path`, still the one `st` describes, was deleted. Its
+    lock file goes with it."""
     fd = _lock(path)
     if fd is None:
         return 0  # a running instance holds it
     try:
-        same = os.stat(path, follow_symlinks=False).st_ino == st.st_ino
+        same = os.lstat(path).st_ino == st.st_ino
+        removed = 1 if same and _rmtree(path) else 0
     except OSError:
-        same = False
+        removed = 0
     finally:
-        os.close(fd)  # an open file cannot be deleted
-    return 1 if same and _rmtree(path) else 0
+        os.close(fd)
+    _remove_lock_file(path)
+    return removed
 
 
 # Judgements ---------------------------------------------------------------------------
@@ -1189,12 +1210,19 @@ class WindowReviewer:
             return window.run(self.driver)
         finally:
             if window is not None:
-                window.photo = None  # delete the image now: Tk calls must stay in this thread
+                window.close()  # deletes the image now: Tk calls must stay in this thread
+            with contextlib.suppress(AttributeError):
+                del root.report_callback_exception  # the root's reference to the window
             with contextlib.suppress(tk.TclError):
                 # Cancel what is still scheduled, or Tcl runs it after the window is gone.
                 for pending in root.tk.splitlist(root.tk.call("after", "info")):
                     root.after_cancel(pending)
                 root.destroy()
+            # Tcl objects must be freed in this thread. Left in a reference cycle, they
+            # would be freed by whichever thread next runs the garbage collector (a fetch
+            # thread, say), and Tcl aborts the process when that is not this one.
+            del window, root
+            gc.collect()
 
 
 class _ReviewWindow:
@@ -1294,6 +1322,12 @@ class _ReviewWindow:
 
     def _callback_failed(self, kind: object, value: BaseException, tb: object) -> None:
         self._finish(value)
+
+    def close(self) -> None:
+        """Drop the image, and the outcome (whose traceback can lead back here), so that
+        no reference cycle keeps a Tcl object alive once the review is over."""
+        self.photo = None
+        self.outcome = None
 
 
 # Statistics ---------------------------------------------------------------------------

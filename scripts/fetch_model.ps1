@@ -9,7 +9,12 @@
 # so are the part files (DIR\.<name>.XXXXXX, six characters after the dot) that a killed
 # run can leave. Then each missing model is downloaded to a part file, which is moved
 # into place only after its checksum matches. On any failure the script exits 1 and
-# leaves no unverified file behind. Run one fetch per DIR at a time.
+# leaves no unverified file behind: every part file it made is deleted on every exit.
+# Run one fetch per DIR at a time.
+#
+# Works in Windows PowerShell 5.1 and PowerShell 7. The SHA-256 comes from .NET
+# (System.Security.Cryptography.SHA256), not Get-FileHash: Windows PowerShell started
+# from PowerShell 7 inherits its module path and then cannot load Get-FileHash.
 [CmdletBinding()]
 param(
     [string]$Dest = ''
@@ -29,10 +34,34 @@ if ($Dest -eq '') {
 }
 $Dest = [System.IO.Path]::GetFullPath($Dest)
 
+# The part files this run made and has not yet moved into place or deleted.
+$Parts = New-Object System.Collections.Generic.List[string]
+
+function Get-Sha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $bytes = $sha.ComputeHash($stream)
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+    return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
 function Test-Pinned([string]$Path, [string]$Sha256) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    return $actual -eq $Sha256
+    return (Get-Sha256 $Path) -eq $Sha256
+}
+
+function Remove-Parts {
+    foreach ($part in @($Parts)) {
+        if (Test-Path -LiteralPath $part) {
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path -LiteralPath $part)) { [void]$Parts.Remove($part) }
+    }
 }
 
 function Remove-Unverified([string]$Name, [string]$Sha256) {
@@ -61,6 +90,7 @@ function Get-Model([string]$Name, [string]$Sha256) {
     $letters = 'abcdefghijklmnopqrstuvwxyz0123456789'
     $suffix = -join (1..6 | ForEach-Object { $letters[(Get-Random -Maximum $letters.Length)] })
     $part = Join-Path $Dest ".$Name.$suffix"
+    $Parts.Add($part)
     try {
         & curl.exe --proto '=https' --tlsv1.2 --max-time 300 --retry 3 `
             --proto-redir '=https' -fsSL -o $part ($BaseUrl + $Name)
@@ -69,22 +99,24 @@ function Get-Model([string]$Name, [string]$Sha256) {
             throw "$Name failed SHA-256 verification; nothing installed"
         }
         Move-Item -LiteralPath $part -Destination $target -Force
-        $part = $null
+        [void]$Parts.Remove($part)
         Write-Output "fetch_model: installed $Name to $Dest"
     }
     finally {
-        if ($null -ne $part -and (Test-Path -LiteralPath $part)) {
-            Remove-Item -LiteralPath $part -Force
-        }
+        Remove-Parts
     }
 }
 
+$status = 1
 try {
     foreach ($name in $Models.Keys) { Remove-Unverified $name $Models[$name] }
     foreach ($name in $Models.Keys) { Get-Model $name $Models[$name] }
+    $status = 0
 }
 catch {
     [Console]::Error.WriteLine("fetch_model: $($_.Exception.Message)")
-    exit 1
 }
-exit 0
+finally {
+    Remove-Parts
+}
+exit $status
