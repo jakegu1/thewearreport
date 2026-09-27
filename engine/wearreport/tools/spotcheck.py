@@ -14,9 +14,16 @@ margin (`crops`, the default) or as whole frames with numbered boxes (`frames`).
 and the reviewer judges each one from the keyboard, or by writing a JSON file
 (`--judgements`) that the tool polls for. With `--view window` (crops only; the default on
 Windows) one tkinter window shows each crop straight from memory and takes one key per
-crop, and no image is written anywhere. The tool then writes one statistics file,
-`<out-dir>/YYYY-MM-DD.json` (then `-2`, `-3`...), and nothing else. The format is in
-`spotchecks/README.md`.
+crop, and no image is written anywhere. The reviewer can answer "cannot tell" (`u`) for a
+box; such a box is left out of the statistics. The tool then writes one statistics file,
+`<out-dir>/YYYY-MM-DD.json` (then `-2`, `-3`...), and next to it one per-box file with the
+same name, `<out-dir>/boxes/YYYY-MM-DD.json`: each box's height in source-frame pixels and
+its label, the light at the start of the sweep, and no image, position or camera id. It
+writes nothing else. The formats are in `spotchecks/README.md`.
+
+While it fetches and detects, the tool prints progress to stderr: the number of cameras
+listed, then every PROGRESS_EVERY frames fetched and run through the detector, and a line
+before the review opens. Only counts; never a camera id or image data.
 
 Privacy (AGENTS.md INV-1, exception (c)). This is the only engine module that writes
 images derived from camera frames, and it writes them only into a directory it creates
@@ -78,6 +85,7 @@ import contextlib
 import dataclasses
 import datetime
 import gc
+import itertools
 import json
 import math
 import os
@@ -92,7 +100,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, ModuleType
@@ -204,6 +212,7 @@ MAX_LINE_BYTES = 4096
 MAX_FILES_PER_DAY = 1000
 MAX_JUDGE_REQUESTS = 10_000
 JSON_POLL_S = 0.5
+PROGRESS_EVERY = 100  # frames between two progress lines, fetched or detected
 REVIEWER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}")
 
 CROP_MARGIN = 0.5  # of the box's width on each side, and of its height above and below
@@ -229,8 +238,16 @@ WINDOW_DEADLINE_GRACE_S = 5.0
 WINDOW_TITLE = "Spot-check"
 WINDOW_LEGEND = (
     "Enter or Space: pedestrian   n: not a person   v: person in a vehicle   "
-    "Backspace: back   q: stop"
+    "u: cannot tell   Backspace: back   q: stop"
 )
+
+BOXES_DIR = "boxes"  # the per-box files, in the statistics directory
+# The light at the start of the sweep, from the sun's elevation over central London:
+# "day" at LIGHT_DAY_DEG or above, "twilight" (civil) at LIGHT_TWILIGHT_DEG or above, else
+# "dark".
+LONDON = (51.5074, -0.1278)  # latitude and longitude, degrees (west negative)
+LIGHT_DAY_DEG = 0.0
+LIGHT_TWILIGHT_DEG = -6.0
 
 
 class SpotcheckError(RuntimeError):
@@ -293,21 +310,28 @@ def sample(
     n: int,
     min_persons: int,
     seed: int | None,
+    progress: Callable[[int], None] | None = None,
 ) -> list[Sample]:
     """Up to `n` frames with at least `min_persons` person detections, chosen uniformly at
     random (reservoir sampling, so at most `n` frames are held) and returned in the order
-    they came in.
+    they came in. `progress`, if given, is called with the number of frames run through
+    the detector so far, after each one.
 
     A frame on which the detector raises DetectorError is skipped, and the number skipped
     is printed to stderr: only the count, never a camera id or image data."""
     rng = random.Random(seed)  # noqa: S311  (sampling, not security)
     kept: list[tuple[int, Sample]] = []
-    seen = skipped = 0
+    seen = skipped = done = 0
     for frame in frames:
+        found: list[detect.Detection] | None = None
         try:
             found = detector.detect(frame)
         except detect.DetectorError:
             skipped += 1
+        done += 1
+        if progress is not None:
+            progress(done)
+        if found is None:
             continue
         persons = tuple(d for d in found if d.label == "person")
         if len(persons) < min_persons:
@@ -328,15 +352,46 @@ def sample(
     return [s for _, s in sorted(kept, key=lambda pair: pair[0])]
 
 
-def _sweep_frames(cameras: Sequence[registry.Camera]) -> Iterator[Frame]:
-    """Fetch one sweep in memory; yield its frames without their camera ids, and let go
-    of each frame once it has been handed on."""
-    results = fetch.fetch_sweep(cameras)
-    results.reverse()
-    while results:
-        frame = results.pop().frame
-        if frame is not None:
-            yield frame
+def _progress(text: str) -> None:
+    """One progress line on stderr. Callers pass counts only."""
+    print(f"spotcheck: {text}", file=sys.stderr, flush=True)
+
+
+def _due(done: int, total: int | None) -> bool:
+    return done % PROGRESS_EVERY == 0 or done == total
+
+
+class Frames:
+    """A sweep's frames, without their camera ids, in camera order. Iterating hands each
+    frame on once and lets go of it; the length is the number of frames fetched."""
+
+    def __init__(self, frames: list[Frame]) -> None:
+        self._total = len(frames)
+        self._frames = frames[::-1]
+
+    def __len__(self) -> int:
+        return self._total
+
+    def __iter__(self) -> Iterator[Frame]:
+        while self._frames:
+            yield self._frames.pop()
+
+
+def sweep_frames(cameras: Sequence[registry.Camera]) -> Frames:
+    """Fetch one sweep in memory with `fetch.fetch_sweep`, PROGRESS_EVERY cameras at a
+    time, printing the number of cameras, then a progress line after each batch. Camera
+    ids are dropped with each result."""
+    total = len(cameras)
+    _progress(f"{total} cameras listed")
+    frames: list[Frame] = []
+    for start in range(0, total, PROGRESS_EVERY):
+        batch = cameras[start : start + PROGRESS_EVERY]
+        frames += [r.frame for r in fetch.fetch_sweep(batch) if r.frame is not None]
+        _progress(f"fetched {start + len(batch)} of {total}")
+    return Frames(frames)
+
+
+_sweep_frames = sweep_frames  # the name child processes in earlier tests call
 
 
 def _detector_info(path: Path, conf: float) -> DetectorInfo:
@@ -362,12 +417,12 @@ def _open_detector(model: str) -> tuple[detect.Detector, DetectorInfo]:
 def live_pipeline(model: str) -> Pipeline:
     detector, info = _open_detector(model)
 
-    def frames() -> Iterator[Frame]:
+    def frames() -> Frames:
         try:
             cameras = registry.list_cameras(load_settings().tfl_app_key)
         except (registry.RegistryError, SettingsError) as exc:
             raise SpotcheckError(f"cannot list cameras: {exc}") from None
-        yield from _sweep_frames(cameras)
+        return sweep_frames(cameras)
 
     return Pipeline(frames=frames, detector=detector, info=info)
 
@@ -382,13 +437,13 @@ def dry_run_pipeline(model: str) -> Pipeline:
         raise SpotcheckError(f"cannot read the dry-run fixtures: {exc.strerror}") from None
     detector, info = _open_detector(model)
 
-    def frames() -> Iterator[Frame]:
+    def frames() -> Frames:
         with FakeCameraServer() as server:
             cameras = server.cameras(DRY_RUN_CAMERAS)
             for i, camera in enumerate(cameras):
                 if i % 3 != 2:  # every third camera serves noise
                     server.serve_body(camera.id, bodies[i % len(bodies)])
-            yield from _sweep_frames(cameras)
+            return sweep_frames(cameras)
 
     return Pipeline(frames=frames, detector=detector, info=info)
 
@@ -812,11 +867,13 @@ def _remove_stale_windows(path: Path, st: os.stat_result) -> int:
 @dataclass(frozen=True, slots=True)
 class Judgement:
     """For one image: the boxes that are not a person, the boxes that are a person inside
-    a vehicle, and (frames mode only) how many visible people have no box."""
+    a vehicle, (frames mode only) how many visible people have no box, and the boxes the
+    reviewer cannot tell. Every other box on the image is a pedestrian."""
 
     not_person: frozenset[int]
     in_vehicle: frozenset[int]
     missed: int | None
+    unsure: frozenset[int] = frozenset()
 
 
 @runtime_checkable
@@ -829,8 +886,17 @@ class Reviewer(Protocol):
     ) -> Mapping[int, Judgement]: ...
 
 
+# The answers a judgement gives per box, and how messages name them.
+BOX_ANSWERS = ("not_person", "in_vehicle", "unsure")
+BOX_ANSWER_WORDS = {
+    "not_person": "not a person",
+    "in_vehicle": "in a vehicle",
+    "unsure": "cannot tell",
+}
+
+
 def _template_entry(mode: Mode) -> dict[str, object]:
-    entry: dict[str, object] = {"not_person": [], "in_vehicle": []}
+    entry: dict[str, object] = {"not_person": [], "in_vehicle": [], "unsure": []}
     if mode == "frames":
         entry["missed"] = 0
     return entry
@@ -838,7 +904,7 @@ def _template_entry(mode: Mode) -> dict[str, object]:
 
 def validate(judgement: Judgement, item: ReviewItem, mode: Mode) -> Judgement:
     """Return `judgement` if it is valid for `item`, else raise JudgementError."""
-    for name in ("not_person", "in_vehicle"):
+    for name in BOX_ANSWERS:
         boxes = getattr(judgement, name)
         if not isinstance(boxes, frozenset) or not all(
             type(b) is int
@@ -851,11 +917,13 @@ def validate(judgement: Judgement, item: ReviewItem, mode: Mode) -> Judgement:
                 f"image {item.number}: box {unknown[0]} is not on this image "
                 f"(its boxes: {_numbers(item.boxes)})"
             )
-    both = sorted(judgement.not_person & judgement.in_vehicle)
-    if both:
-        raise JudgementError(
-            f"image {item.number}: box {both[0]} cannot be both not a person and in a vehicle"
-        )
+    for first, second in itertools.combinations(BOX_ANSWERS, 2):
+        both = sorted(getattr(judgement, first) & getattr(judgement, second))
+        if both:
+            raise JudgementError(
+                f"image {item.number}: box {both[0]} cannot be both "
+                f"{BOX_ANSWER_WORDS[first]} and {BOX_ANSWER_WORDS[second]}"
+            )
     missed = judgement.missed
     if mode == "crops":
         if missed is not None:
@@ -928,7 +996,7 @@ def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dic
             raise JudgementError(f"there is no image {key[:20]!r}")
         if not isinstance(entry, dict):
             raise JudgementError(f"image {key}: the judgement must be an object")
-        allowed = {"not_person", "in_vehicle"} | ({"missed"} if mode == "frames" else set())
+        allowed = set(BOX_ANSWERS) | ({"missed"} if mode == "frames" else set())
         unknown = sorted(set(entry) - allowed)
         if unknown:
             raise JudgementError(f"image {key}: unexpected field {unknown[0][:20]!r}")
@@ -941,27 +1009,30 @@ def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dic
             _box_list(entry.get("not_person", []), "not_person", key),
             _box_list(entry.get("in_vehicle", []), "in_vehicle", key),
             missed if mode == "frames" else None,
+            _box_list(entry.get("unsure", []), "unsure", key),
         )
     return validate_all(judgements, items, mode)
 
 
-LINE_TOKEN = re.compile(r"([nvm])(\d{1,6})?")
+LINE_TOKEN = re.compile(r"([nvum])(\d{1,6})?")
 
 
 def parse_line(line: str, item: ReviewItem, mode: Mode) -> Judgement:
     """Parse one keyboard answer for `item`; raise JudgementError.
 
     Tokens, separated by spaces or commas: `n<box>` not a person, `v<box>` a person inside
-    a vehicle, `m<count>` people missed (frames mode). In crops mode a bare `n` or `v`
-    means the crop's box. An empty line: every box is a pedestrian and nobody is missed.
+    a vehicle, `u<box>` cannot tell, `m<count>` people missed (frames mode). In crops mode
+    a bare `n`, `v` or `u` means the crop's box. An empty line: every box is a pedestrian
+    and nobody is missed.
     """
-    not_person: list[int] = []
-    in_vehicle: list[int] = []
+    lists: dict[str, list[int]] = {"n": [], "v": [], "u": []}
     missed: int | None = None
     for token in line.replace(",", " ").lower().split():
         match = LINE_TOKEN.fullmatch(token)
         if match is None:
-            raise JudgementError(f"cannot read {token[:20]!r}; use n<box>, v<box> or m<count>")
+            raise JudgementError(
+                f"cannot read {token[:20]!r}; use n<box>, v<box>, u<box> or m<count>"
+            )
         kind, digits = match.group(1), match.group(2)
         if kind == "m":
             if mode != "frames":
@@ -976,13 +1047,16 @@ def parse_line(line: str, item: ReviewItem, mode: Mode) -> Judgement:
             box = item.boxes[0]
         else:
             box = int(digits)
-        target = not_person if kind == "n" else in_vehicle
+        target = lists[kind]
         if box in target:
             raise JudgementError(f"box {box} is listed twice")
         target.append(box)
     if mode == "frames" and missed is None:
         missed = 0
-    return validate(Judgement(frozenset(not_person), frozenset(in_vehicle), missed), item, mode)
+    judgement = Judgement(
+        frozenset(lists["n"]), frozenset(lists["v"]), missed, frozenset(lists["u"])
+    )
+    return validate(judgement, item, mode)
 
 
 def _numbers(boxes: Sequence[int]) -> str:
@@ -1106,8 +1180,8 @@ class KeyboardReviewer:
     ) -> Mapping[int, Judgement]:
         out = self.out or sys.stdout
         reader = _LineReader(self.fd)
-        hint = "n<box> not a person, v<box> person in a vehicle"
-        hint += ", m<count> people missed" if mode == "frames" else " (bare n or v: this crop)"
+        hint = "n<box> not a person, v<box> person in a vehicle, u<box> cannot tell"
+        hint += ", m<count> people missed" if mode == "frames" else " (bare n, v or u: this crop)"
         print(f"One line per image: {hint}; empty line: all correct; q: stop.", file=out)
         judgements: dict[int, Judgement] = {}
         for item in items:
@@ -1212,7 +1286,8 @@ def _import_tkinter() -> ModuleType:
 class WindowReviewer:
     """Shows each crop in one tkinter window, straight from memory, and records one key
     per crop: Enter or Space a pedestrian, `n` not a person, `v` a person in a vehicle,
-    Backspace back one crop, `q` or closing the window stop. Crops mode only.
+    `u` cannot tell, Backspace back one crop, `q` or closing the window stop. Crops mode
+    only.
 
     Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
     as data. `driver`, if given, is called with the window once it shows the first crop
@@ -1286,7 +1361,7 @@ class _ReviewWindow:
         self.legend = tk.Label(root, text=WINDOW_LEGEND)
         self.legend.pack(padx=8, pady=(4, 8))
         answers = {"Return": "", "KP_Enter": "", "space": "", "n": "n", "N": "n"}
-        answers |= {"v": "v", "V": "v"}
+        answers |= {"v": "v", "V": "v", "u": "u", "U": "u"}
         for key, line in answers.items():
             root.bind(f"<KeyPress-{key}>", self._on_answer(line))
         root.bind("<KeyPress-BackSpace>", lambda _event: self._back())
@@ -1372,7 +1447,8 @@ class _ReviewWindow:
 
 # The paired judge ---------------------------------------------------------------------
 
-# The reviewer's label for a crop (the keyboard and the window have no unsure answer).
+# The reviewer's label for a crop sent to the judge. Crops the reviewer cannot tell
+# ("unsure") are not sent.
 REVIEWER_LABELS = ("person", "in_vehicle", "not_person")
 JUDGE_POSITIVE: tuple[judge_hosted.Answer, ...] = ("person", "in_vehicle")
 
@@ -1457,11 +1533,25 @@ def _judge_stopped(reason: str) -> None:
     )
 
 
-def _reviewer_label(item: ReviewItem, judgement: Judgement) -> str:
-    (box,) = item.boxes  # crops mode: one box per image
+def box_label(box: int, judgement: Judgement) -> str:
+    """The reviewer's label for `box`: person, in_vehicle, not_person or unsure."""
     if box in judgement.not_person:
         return "not_person"
-    return "in_vehicle" if box in judgement.in_vehicle else "person"
+    if box in judgement.in_vehicle:
+        return "in_vehicle"
+    return "unsure" if box in judgement.unsure else "person"
+
+
+def _reviewer_label(item: ReviewItem, judgement: Judgement) -> str:
+    (box,) = item.boxes  # crops mode: one box per image
+    return box_label(box, judgement)
+
+
+def judged_items(
+    items: Sequence[ReviewItem], judgements: Mapping[int, Judgement]
+) -> list[ReviewItem]:
+    """The crops the reviewer did not mark unsure: the only ones the judge is shown."""
+    return [item for item in items if not set(item.boxes) & judgements[item.number].unsure]
 
 
 def judge_stats(
@@ -1513,8 +1603,10 @@ def compute_stats(
     info: DetectorInfo,
     day: datetime.date,
 ) -> dict[str, object]:
-    """The statistics record: counts, and the ratios derived from them (None on 0/0)."""
-    shown = sum(len(item.boxes) for item in items)
+    """The statistics record: counts, and the ratios derived from them (None on 0/0).
+    Boxes the reviewer cannot tell are left out: they are not counted as shown."""
+    unsure = sum(len(judgements[item.number].unsure) for item in items)
+    shown = sum(len(item.boxes) for item in items) - unsure
     not_person = sum(len(judgements[item.number].not_person) for item in items)
     in_vehicle = sum(len(judgements[item.number].in_vehicle) for item in items)
     missed: int | None = None
@@ -1540,38 +1632,151 @@ def compute_stats(
     }
 
 
-def write_stats(stats: Mapping[str, object], out_dir: Path, day: datetime.date) -> Path:
-    """Write `stats` to a new `<day>.json` (or `<day>-2.json`, ...); never overwrite.
+def box_heights(samples: Sequence[Sample]) -> dict[int, int]:
+    """Each box's height in source-frame pixels, rounded, by box number (numbered as
+    `render` numbers them: 1, 2, ... across the whole check)."""
+    boxes = (person.box for s in samples for person in s.persons)
+    return {number: round(box[3] - box[1]) for number, box in enumerate(boxes, start=1)}
 
-    Raises SpotcheckError, with the statistics in the message so they are not lost, if
-    the file cannot be written.
+
+def box_record(
+    items: Sequence[ReviewItem],
+    judgements: Mapping[int, Judgement],
+    heights: Mapping[int, int],
+    *,
+    frames_reviewed: int,
+    info: DetectorInfo,
+    day: datetime.date,
+    started_at: datetime.datetime,
+) -> dict[str, object]:
+    """The per-box record: each box's height and label, sorted so that the order says
+    nothing about frames, and no position, width, camera id, frame index or image."""
+    minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
+    boxes = sorted(
+        (heights[box], box_label(box, judgements[item.number]))
+        for item in items
+        for box in item.boxes
+    )
+    return {
+        "date": day.isoformat(),
+        "started_at": minute.strftime("%Y-%m-%dT%H:%MZ"),
+        "light": light_at(minute),
+        "frames": frames_reviewed,
+        "detector": dataclasses.asdict(info),
+        "boxes": [[height, label] for height, label in boxes],
+    }
+
+
+# The light ----------------------------------------------------------------------------
+
+Light = Literal["day", "twilight", "dark"]
+
+
+def solar_elevation(
+    moment: datetime.datetime, latitude: float = LONDON[0], longitude: float = LONDON[1]
+) -> float:
+    """The sun's elevation above the horizon, in degrees, at `moment` (an aware datetime)
+    seen from `latitude`, `longitude`: the geometric position of its centre, without
+    refraction. NOAA's general solar position formulae (after Meeus, "Astronomical
+    Algorithms"), good to a minute of time or so at this latitude."""
+    moment = moment.astimezone(datetime.UTC)
+    j2000 = datetime.datetime(2000, 1, 1, 12, tzinfo=datetime.UTC)
+    t = (moment - j2000).total_seconds() / 86400 / 36525  # Julian centuries from J2000.0
+    mean_long = math.radians((280.46646 + t * (36000.76983 + t * 0.0003032)) % 360)
+    mean_anomaly = math.radians(357.52911 + t * (35999.05029 - 0.0001537 * t))
+    eccentricity = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
+    centre = (
+        math.sin(mean_anomaly) * (1.914602 - t * (0.004817 + 0.000014 * t))
+        + math.sin(2 * mean_anomaly) * (0.019993 - 0.000101 * t)
+        + math.sin(3 * mean_anomaly) * 0.000289
+    )
+    omega = math.radians(125.04 - 1934.136 * t)
+    apparent_long = math.radians(
+        math.degrees(mean_long) + centre - 0.00569 - 0.00478 * math.sin(omega)
+    )
+    seconds = 21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))
+    obliquity = math.radians(23 + (26 + seconds / 60) / 60 + 0.00256 * math.cos(omega))
+    declination = math.asin(math.sin(obliquity) * math.sin(apparent_long))
+    y = math.tan(obliquity / 2) ** 2
+    equation_of_time = 4 * math.degrees(  # minutes
+        y * math.sin(2 * mean_long)
+        - 2 * eccentricity * math.sin(mean_anomaly)
+        + 4 * eccentricity * y * math.sin(mean_anomaly) * math.cos(2 * mean_long)
+        - 0.5 * y * y * math.sin(4 * mean_long)
+        - 1.25 * eccentricity * eccentricity * math.sin(2 * mean_anomaly)
+    )
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes = (moment - midnight).total_seconds() / 60
+    hour_angle = math.radians((minutes + equation_of_time + 4 * longitude) / 4 - 180)
+    lat = math.radians(latitude)
+    cos_zenith = math.sin(lat) * math.sin(declination) + math.cos(lat) * math.cos(
+        declination
+    ) * math.cos(hour_angle)
+    return 90 - math.degrees(math.acos(max(-1.0, min(1.0, cos_zenith))))
+
+
+def light_category(elevation: float) -> Light:
+    if elevation >= LIGHT_DAY_DEG:
+        return "day"
+    return "twilight" if elevation >= LIGHT_TWILIGHT_DEG else "dark"
+
+
+def light_at(moment: datetime.datetime) -> Light:
+    """The light over central London at `moment`: day, (civil) twilight or dark."""
+    return light_category(solar_elevation(moment))
+
+
+def write_stats(
+    stats: Mapping[str, object],
+    out_dir: Path,
+    day: datetime.date,
+    boxes: Mapping[str, object] | None = None,
+) -> Path:
+    """Write `stats` to a new `<day>.json` (or `<day>-2.json`, ...), and `boxes`, if
+    given, to a new file of the same name in `<out-dir>/boxes/`; never overwrite. The
+    name is the first one free in both places.
+
+    Raises SpotcheckError, with the records in the message so they are not lost, if the
+    files cannot be written; then neither is left behind.
     """
-    text = json.dumps(stats, indent=2, ensure_ascii=True) + "\n"
+    texts = [json.dumps(stats, indent=2, ensure_ascii=True) + "\n"]
+    if boxes is not None:
+        texts.append(json.dumps(boxes, ensure_ascii=True) + "\n")
     try:
-        return _write_new(text, out_dir, day)
+        return _write_new(texts, out_dir, day)
     except OSError as exc:
+        lost = f"they were: {json.dumps(stats, ensure_ascii=True)}"
+        if boxes is not None:
+            lost += f" and {json.dumps(boxes, ensure_ascii=True)}"
         raise SpotcheckError(
-            f"cannot write statistics into {out_dir} ({exc.strerror}); "
-            f"they were: {json.dumps(stats, ensure_ascii=True)}"
+            f"cannot write statistics into {out_dir} ({exc.strerror}); {lost}"
         ) from None
 
 
-def _write_new(text: str, out_dir: Path, day: datetime.date) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _write_new(texts: Sequence[str], out_dir: Path, day: datetime.date) -> Path:
+    """texts[0] into `out_dir`, texts[1] (if any) into `out_dir/boxes`, under one name."""
+    directories = [out_dir, out_dir / BOXES_DIR][: len(texts)]
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
     for k in range(1, MAX_FILES_PER_DAY + 1):
         name = f"{day.isoformat()}.json" if k == 1 else f"{day.isoformat()}-{k}.json"
-        path = out_dir / name
+        created: list[Path] = []
         try:
-            fh = open(path, "x", encoding="utf-8")  # noqa: SIM115  (closed below)
+            for directory, text in zip(directories, texts, strict=True):
+                path = directory / name
+                fh = open(path, "x", encoding="utf-8")  # noqa: SIM115  (closed below)
+                created.append(path)
+                with fh:
+                    fh.write(text)
         except FileExistsError:
+            for path in created:
+                path.unlink(missing_ok=True)
             continue
-        try:
-            with fh:
-                fh.write(text)
         except BaseException:
-            path.unlink(missing_ok=True)
+            for path in created:
+                path.unlink(missing_ok=True)
             raise
-        return path
+        return out_dir / name
     raise SpotcheckError(f"{out_dir} already holds {MAX_FILES_PER_DAY} files for {day}")
 
 
@@ -1803,12 +2008,13 @@ def _run(
     day: datetime.date,
     guard: _SignalGuard,
     setup: JudgeSetup | None = None,
+    clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
     mode: Mode = args.mode
     view = resolve_view(args.view, mode, args.judgements)
     judge = open_judge(args, mode, setup or JudgeSetup())
     try:
-        return _check(args, pipeline, reviewer, day, guard, mode, view, judge)
+        return _check(args, pipeline, reviewer, day, guard, mode, view, judge, clock or _utcnow)
     finally:
         if judge is not None:
             judge.close()
@@ -1823,6 +2029,7 @@ def _check(
     mode: Mode,
     view: View,
     judge: judge_hosted.LiveCropJudge | None,
+    clock: Callable[[], datetime.datetime],
 ) -> int:
     _check_temp_dir(Path(tempfile.gettempdir()))
     out_dir = Path(args.out_dir)
@@ -1845,14 +2052,30 @@ def _check(
     if pipeline is None:
         pipeline = dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
 
+    started_at = clock()
+    frames = pipeline.frames()
+    total = len(frames) if isinstance(frames, Sized) else None
+
+    def detected(done: int) -> None:
+        if _due(done, total):
+            _progress(f"detected {done} of {total}" if total is not None else f"detected {done}")
+
     samples = sample(
-        pipeline.frames(), pipeline.detector, n=args.n, min_persons=args.min_persons, seed=args.seed
+        frames,
+        pipeline.detector,
+        n=args.n,
+        min_persons=args.min_persons,
+        seed=args.seed,
+        progress=detected,
     )
+    del frames
     if not samples:
         raise SpotcheckError(f"no frame had at least {args.min_persons} person detections")
     frames_reviewed = len(samples)
+    heights = box_heights(samples)
     items = render(samples, mode)
     del samples  # the frames are not needed any more
+    _progress(f"opening the review: {len(items)} image(s)")
     judgements = _review(items, mode, reviewer, args.timeout, guard, view) if items else {}
     stats = compute_stats(
         items,
@@ -1863,20 +2086,36 @@ def _check(
         info=pipeline.info,
         day=day,
     )
+    boxes = box_record(
+        items,
+        judgements,
+        heights,
+        frames_reviewed=frames_reviewed,
+        info=pipeline.info,
+        day=day,
+        started_at=started_at,
+    )
     if judge is not None:
-        # Only now, with the review over and its judgements valid: the crops in memory.
-        answers = ask_judge([item.image for item in items], judge)
-        block = judge_stats(items, judgements, answers, judge, args.judge)
+        # Only now, with the review over and its judgements valid: the crops in memory,
+        # except those the reviewer could not tell.
+        judged = judged_items(items, judgements)
+        answers = ask_judge([item.image for item in judged], judge)
+        block = judge_stats(judged, judgements, answers, judge, args.judge)
         stats["judge"] = block
         print(
-            f"Judge {args.judge}: {len(answers)} of {len(items)} crop(s) answered "
+            f"Judge {args.judge}: {len(answers)} of {len(judged)} crop(s) answered "
             f"({block['status']}), {block['requests']} request(s), ${block['cost_usd']:.6f}",
             flush=True,
         )
+        del judged
     del items
-    path = write_stats(stats, out_dir, day)
-    print(f"Statistics written to {path}")
+    path = write_stats(stats, out_dir, day, boxes)
+    print(f"Statistics written to {path}, box heights to {path.parent / BOXES_DIR / path.name}")
     return 0
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
 
 
 def main(
@@ -1888,10 +2127,12 @@ def main(
     judge_endpoint: str | None = None,
     judge_timeout: float = judge_hosted.REQUEST_TIMEOUT,
     judge_sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
-    """Run one spot-check. `pipeline` and `reviewer` replace the live ones, and
+    """Run one spot-check. `pipeline` and `reviewer` replace the live ones,
     `judge_endpoint`, `judge_timeout` and `judge_sleep` the judge's origin, request timeout
-    and wait between retries (tests: a fake judge on this machine)."""
+    and wait between retries (tests: a fake judge on this machine), and `clock` the UTC
+    clock that dates the start of the sweep."""
     ci = _ci_variables()
     if ci:
         print(
@@ -1906,7 +2147,8 @@ def main(
         try:
             guard.install()
             setup = JudgeSetup(judge_endpoint, judge_timeout, judge_sleep)
-            return _run(args, pipeline, reviewer, today or datetime.date.today(), guard, setup)
+            day = today or datetime.date.today()
+            return _run(args, pipeline, reviewer, day, guard, setup, clock)
         finally:
             # Nothing may interrupt the handlers below. A signal that lands before
             # stop() is raised here, is the last one raised, and is caught below.

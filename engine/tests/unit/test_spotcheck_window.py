@@ -13,6 +13,7 @@ import contextlib
 import datetime
 import gc
 import io
+import json
 import os
 import signal
 import sys
@@ -225,6 +226,39 @@ def test_window_accepts_keypad_enter_and_capitals_and_ignores_keys_after_the_las
         2: spotcheck.Judgement(frozenset({2}), frozenset(), None),
         3: spotcheck.Judgement(frozenset(), frozenset({3}), None),
     }
+
+
+def test_window_u_means_cannot_tell_and_backspace_undoes_it() -> None:
+    _need_window()
+    keys = ["<KeyPress-u>", "<KeyPress-U>", "<BackSpace>", "<Return>", "<KeyPress-n>"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    judgements = reviewer.judge(_crops([1, 2, 3]), "crops", time.monotonic() + WAIT_S)
+    assert dict(judgements) == {
+        1: spotcheck.Judgement(frozenset(), frozenset(), None, frozenset({1})),
+        2: PEDESTRIAN,
+        3: spotcheck.Judgement(frozenset({3}), frozenset(), None),
+    }
+    assert "u: cannot tell" in spotcheck.WINDOW_LEGEND
+
+
+def test_window_unsure_is_left_out_of_the_statistics_and_kept_in_the_box_file(
+    env: Path, tmp_path: Path
+) -> None:
+    _need_window()
+    out = tmp_path / "out"
+    keys = ["<KeyPress-u>", "<KeyPress-n>", "<Return>"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "window"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    assert _run(args, out, pipeline=_pipeline([3]), reviewer=reviewer) == 0
+    name = f"{DAY.isoformat()}.json"
+    stats = json.loads((out / name).read_text(encoding="utf-8"))
+    assert stats["boxes_shown"] == 2 and stats["boxes_not_person"] == 1
+    boxes = json.loads((out / spotcheck.BOXES_DIR / name).read_text(encoding="utf-8"))
+    assert sorted(boxes["boxes"]) == [[60, "not_person"], [60, "person"], [60, "unsure"]]
+    assert sorted(p.relative_to(out).as_posix() for p in out.rglob("*.json")) == [
+        name,
+        f"{spotcheck.BOXES_DIR}/{name}",
+    ]
 
 
 @pytest.mark.parametrize("last", ["<Return>", "<KeyPress-q>"])

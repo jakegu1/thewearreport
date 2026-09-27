@@ -154,3 +154,90 @@ def test_a_perfect_judge_needs_no_correction() -> None:
     earlier = _table(90, 0, 10)
     current = _table(40, 0, 10)
     assert summary.corrected_estimate(current, earlier) == pytest.approx(0.8)
+
+
+# The height summary (T-041) -------------------------------------------------------------
+
+UTC = datetime.UTC
+
+
+def _box_file(directory: Path, name: str, started_at: str, boxes: list[list[Any]]) -> None:
+    record = {
+        "date": started_at[:10],
+        "started_at": started_at,
+        "light": "day",
+        "frames": 1,
+        "detector": {"model": "stub"},
+        "boxes": boxes,
+    }
+    (directory / "boxes").mkdir(parents=True, exist_ok=True)
+    (directory / "boxes" / name).write_text(json.dumps(record), encoding="utf-8")
+
+
+def _record(data: Path, name: str, started_at: str, precip: float) -> None:
+    folder = data / "sweeps" / started_at[:4] / started_at[5:7] / started_at[8:10]
+    folder.mkdir(parents=True, exist_ok=True)
+    record = {"started_at": started_at, "weather": {"precip_mm": precip}}
+    (folder / name).write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_wilson_stays_within_zero_and_one() -> None:
+    assert summary.wilson(0, 5)[0] == 0.0 and 0 < summary.wilson(0, 5)[1] < 1
+    assert summary.wilson(5, 5)[1] == 1.0 and 0 < summary.wilson(5, 5)[0] < 1
+    lo, hi = summary.wilson(1, 2)
+    assert lo == pytest.approx(1 - hi)
+
+
+def test_the_rain_join_takes_the_earlier_record_on_a_tie(tmp_path: Path) -> None:
+    moment = datetime.datetime(2026, 9, 20, 10, 0, tzinfo=UTC)
+    _record(tmp_path, "20260920T0950Z.json", "2026-09-20T09:50:00Z", 0.0)
+    _record(tmp_path, "20260920T1010Z.json", "2026-09-20T10:10:00Z", 2.0)
+    assert summary.rain_condition(tmp_path, moment) == "dry"
+
+
+def test_the_rain_join_reads_only_records_near_the_session(tmp_path: Path) -> None:
+    moment = datetime.datetime(2026, 9, 20, 10, 0, tzinfo=UTC)
+    folder = tmp_path / "sweeps" / "2026" / "09" / "20"
+    folder.mkdir(parents=True)
+    (folder / "20260920T1200Z.json").write_bytes(b"not json")  # far off: never read
+    (folder / "20261320T1000Z.json").write_bytes(b"not json")  # not a sweep id
+    (folder / "notes.json").write_bytes(b"not json")
+    assert summary.rain_condition(tmp_path, moment) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "weather",
+    [{"precip_mm": True}, {"precip_mm": -0.1}, {"precip_mm": 1e999}, {}, [], "wet"],
+)
+def test_a_sweep_record_with_a_bad_precipitation_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], weather: Any
+) -> None:
+    d, data = tmp_path / "s", tmp_path / "data"
+    _box_file(d, "a.json", "2026-09-20T10:00Z", [[40, "person"]])
+    folder = data / "sweeps" / "2026" / "09" / "20"
+    folder.mkdir(parents=True)
+    record = {"started_at": "2026-09-20T10:05:00Z", "weather": weather}
+    (folder / "20260920T1005Z.json").write_text(json.dumps(record), encoding="utf-8")
+    assert summary.main(["--heights", "--dir", str(d), "--data-dir", str(data)]) == 1
+    assert "20260920T1005Z.json" in capsys.readouterr().err
+
+
+def test_heights_with_a_missing_directory_or_data_dir_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert summary.main(["--heights", "--dir", str(tmp_path / "none")]) == 1
+    assert "boxes" in capsys.readouterr().err
+    _box_file(tmp_path, "a.json", "2026-09-20T10:00Z", [[40, "person"]])
+    args = ["--heights", "--dir", str(tmp_path), "--data-dir", str(tmp_path / "missing")]
+    assert summary.main(args) == 1
+    assert "missing" in capsys.readouterr().err
+
+
+def test_a_height_with_only_unsure_boxes_is_a_candidate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _box_file(tmp_path, "a.json", "2026-09-20T10:00Z", [[40, "person"], [90, "unsure"]])
+    assert summary.main(["--heights", "--dir", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert ">= 90 px: n=0 precision n/a wilson n/a kept 0.0000" in lines
+    assert "coverage: 1 session, 1 date, 1 judged boxes" in lines[-1]

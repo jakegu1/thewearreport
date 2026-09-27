@@ -1106,7 +1106,7 @@ elif scenario == "signal_in_handler":
         def __init__(self, real):
             self.real, self.sent = real, False
         def write(self, text):
-            if not self.sent:
+            if not self.sent and "No space left" in text:  # the error, not a progress line
                 self.sent = True
                 kill_self(signal.SIGTERM)
             return self.real.write(text)
@@ -1449,15 +1449,21 @@ def _windows_lock(review: Path) -> list[Path]:
     return [spotcheck.lock_file(review)] if sys.platform == "win32" else []
 
 
+def _box_file(stats_file: Path) -> Path:
+    """The per-box file written next to `stats_file`."""
+    return stats_file.parent / spotcheck.BOXES_DIR / stats_file.name
+
+
 def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path) -> None:
-    """Every write is inside the one review directory, or is the statistics file (or the
-    directory made for it); and the images were written there."""
+    """Every write is inside the one review directory, or is the statistics file or its
+    per-box file (or a directory made for them); and the images were written there."""
     made = [Path(path) for kind, path in events if kind == "mkdtemp"]
     assert len(made) == 1, made
     review = made[0]
     assert review.name.startswith(spotcheck.TEMP_PREFIX)
     written = [Path(path) for kind, path in events if kind == "write"]
-    allowed = [stats_file, stats_file.parent, *_windows_lock(review)]
+    box_file = _box_file(stats_file)
+    allowed = [stats_file, stats_file.parent, box_file, box_file.parent, *_windows_lock(review)]
     stray = [p for p in written if p not in allowed]
     stray = [p for p in stray if not p.is_relative_to(review)]
     assert stray == [], stray
@@ -1627,7 +1633,8 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
     events = MARKER.findall(stderr)
     assert [text for kind, text in events if kind == "escape"] == []
     written = {work / text for kind, text in events if kind == "write"}  # cwd-relative
-    allowed = {stats_file, work / "stats", *_windows_lock(workdir)}
+    box_file = _box_file(stats_file)
+    allowed = {stats_file, work / "stats", box_file, box_file.parent, *_windows_lock(workdir)}
     for path in written - allowed:
         assert path.is_relative_to(tmp), path
         top = path.relative_to(tmp).parts[0]
@@ -1640,7 +1647,8 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
     }
 
     files = _all_files([work, home, tmp])
-    assert list(files) == [stats_file]
+    assert sorted(files) == sorted([stats_file, box_file])
+    assert "Fake_" not in box_file.read_text(encoding="utf-8")
     for data in files.values():
         assert not any(sig in data for sig in SIGNATURES)
     assert not any(sig.decode("latin-1") in output for sig in SIGNATURES)
