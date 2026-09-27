@@ -42,12 +42,6 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
-      - name: "TEMPORARY: repeat with --capture=sys (T-037 diagnosis)"
-        continue-on-error: true
-        run: |
-          foreach ($i in 1..3) {
-            uv run --no-sync pytest -q --capture=sys engine/tests/unit/test_spotcheck.py engine/tests/unit/test_spotcheck_window.py engine/tests/acceptance/test_t_037.py 2>&1 | Select-String -Pattern "passed|failed|FAILED"
-          }
       - name: Spot-check unit and acceptance tests
         # --capture=sys: pytest's default capture swaps the process's standard handles
         # for every test and closes them after it. Tcl keeps the standard channels it
