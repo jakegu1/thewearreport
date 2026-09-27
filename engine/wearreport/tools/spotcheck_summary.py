@@ -1,6 +1,10 @@
-"""Summarise the spot-check statistics files per ISO week, reviewer against hosted judge.
+"""Summarise the spot-check statistics files, reviewer against hosted judge, per ISO week
+(the default) or per session (`--by-session`).
 
   python -m wearreport.tools.spotcheck_summary [--dir spotchecks]
+  python -m wearreport.tools.spotcheck_summary --by-session [--dir spotchecks] [--model NAME]
+
+Per ISO week
 
 Reads every `*.json` statistics file in the directory (counts only: no image, no network)
 and prints, for each ISO week and each judge model found in a `judge` block:
@@ -21,12 +25,28 @@ and prints, for each ISO week and each judge model found in a `judge` block:
 
 Last, whether the condition holds: the two latest weeks with a corrected estimate are both
 within WITHIN_POINTS of the reviewer. A file without a `judge` block counts for the
-reviewer only. A malformed file is an error that names it.
+reviewer only.
+
+Per session (--by-session)
+
+A session is one statistics file. For one judge model (`--model`, or the only model found
+in qualifying sessions; several without `--model` is an error, exit 2), a session
+qualifies when its `judge` block has that model, `status` `complete` and at least
+MIN_SESSION_BOXES boxes shown. The others are listed as skipped, with the reason, and
+enter no calibration. Each qualifying session gets one row: the same figures as a week,
+except that its corrected estimate inverts the confusion pooled over every *other*
+qualifying session (leave one session out). The last line is `ready: yes` when there are
+at least MIN_SESSIONS qualifying sessions on at least MIN_DAYS distinct dates, every one
+has a corrected estimate within WITHIN_POINTS, and they pool at least MIN_POOLED_BOXES
+boxes shown; otherwise `ready: no (<the first condition not met>)`.
+
+In both modes a malformed file is an error that names it (exit 1).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import json
 import re
@@ -44,6 +64,11 @@ JUDGE_ANSWERS = ("person", "in_vehicle", "not_person", "unsure")
 POSITIVE = ("person", "in_vehicle")
 WITHIN_POINTS = 3.0
 WEEKS_NEEDED = 2
+MIN_SESSION_BOXES = 100
+MIN_SESSIONS = 3
+MIN_DAYS = 2
+MIN_POOLED_BOXES = 300
+COMPLETE = "complete"
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _MODEL = re.compile(r"[A-Za-z0-9][\w.-]{0,63}")
 
@@ -63,6 +88,8 @@ class Record:
     not_person: int
     model: str | None
     confusion: Confusion | None
+    status: str | None = None  # the judge block's status, when it is a string
+    name: str = ""  # the file name
 
 
 def _count(value: object, what: str) -> int:
@@ -109,7 +136,13 @@ def parse_record(raw: bytes) -> Record:
         if not isinstance(name, str) or not _MODEL.fullmatch(name):
             raise ValueError("judge.model is not a model name")
         model, confusion = name, _confusion(block.get("confusion"))
-    return Record(datetime.date.fromisoformat(day), shown, not_person, model, confusion)
+        status = block.get("status")
+        judge_status = status if isinstance(status, str) else None
+    else:
+        judge_status = None
+    return Record(
+        datetime.date.fromisoformat(day), shown, not_person, model, confusion, judge_status
+    )
 
 
 def load(directory: Path) -> list[Record]:
@@ -123,7 +156,7 @@ def load(directory: Path) -> list[Record]:
         try:
             with open(path, "rb") as fh:
                 raw = fh.read(MAX_FILE_BYTES + 1)
-            records.append(parse_record(raw))
+            records.append(dataclasses.replace(parse_record(raw), name=path.name))
         except OSError as exc:
             raise SummaryError(f"cannot read {path.name}: {exc.strerror}") from None
         except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
@@ -194,14 +227,21 @@ class Week:
 
     @property
     def diff_points(self) -> float | None:
-        if self.corrected is None or self.reviewer is None:
-            return None
-        return 100 * (self.corrected - self.reviewer)
+        return _points(self.corrected, self.reviewer)
 
     @property
     def within(self) -> bool | None:
-        diff = self.diff_points
-        return None if diff is None else abs(diff) <= WITHIN_POINTS + 1e-9
+        return _within(self.diff_points)
+
+
+def _points(corrected: float | None, reviewer: float | None) -> float | None:
+    if corrected is None or reviewer is None:
+        return None
+    return 100 * (corrected - reviewer)
+
+
+def _within(diff: float | None) -> bool | None:
+    return None if diff is None else abs(diff) <= WITHIN_POINTS + 1e-9
 
 
 def _iso_week(day: datetime.date) -> tuple[int, int]:
@@ -249,6 +289,96 @@ def condition_holds(rows: Sequence[Week]) -> bool:
     return len(judged) >= WEEKS_NEEDED and all(row.within for row in judged[-WEEKS_NEEDED:])
 
 
+# Per session ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    name: str
+    day: datetime.date
+    reviewer: float | None
+    shown: int
+    judge: float | None
+    confident: int
+    corrected: float | None
+
+    @property
+    def diff_points(self) -> float | None:
+        return _points(self.corrected, self.reviewer)
+
+    @property
+    def within(self) -> bool | None:
+        return _within(self.diff_points)
+
+
+def skip_reason(record: Record, model: str | None) -> str | None:
+    """Why `record` is not a qualifying session for `model` (None: any model), or None."""
+    if record.model is None or record.confusion is None:
+        return "no judge block"
+    if model is not None and record.model != model:
+        return f"judge model {record.model}, not {model}"
+    if record.status != COMPLETE:
+        return (
+            "judge status incomplete"
+            if record.status == "incomplete"
+            else "judge status not complete"
+        )
+    if record.shown < MIN_SESSION_BOXES:
+        return f"{record.shown} boxes shown, fewer than {MIN_SESSION_BOXES}"
+    return None
+
+
+def qualifying_models(records: Sequence[Record]) -> list[str]:
+    """The judge models of the sessions that would qualify for their own model."""
+    return sorted(
+        {r.model for r in records if r.model is not None and skip_reason(r, None) is None}
+    )
+
+
+def sessions(records: Sequence[Record], model: str) -> list[Session]:
+    """One row per qualifying session, each corrected with every other one's confusion."""
+    chosen = [
+        (r, r.confusion)
+        for r in records
+        if r.confusion is not None and skip_reason(r, model) is None
+    ]
+    rows: list[Session] = []
+    for i, (record, table) in enumerate(chosen):
+        others = [other for j, (_, other) in enumerate(chosen) if j != i]
+        says_person, says_not = _answers(table, REVIEWER_LABELS)
+        shown = record.shown
+        rows.append(
+            Session(
+                name=record.name,
+                day=record.day,
+                reviewer=(shown - record.not_person) / shown if shown else None,
+                shown=shown,
+                judge=judge_precision(table),
+                confident=says_person + says_not,
+                corrected=corrected_estimate(table, pooled(others)) if others else None,
+            )
+        )
+    return rows
+
+
+def readiness(rows: Sequence[Session]) -> str | None:
+    """The first readiness condition `rows` do not meet, or None when they meet them all."""
+    if len(rows) < MIN_SESSIONS:
+        return f"{len(rows)} qualifying session(s), fewer than {MIN_SESSIONS}"
+    days = len({row.day for row in rows})
+    if days < MIN_DAYS:
+        return f"{days} distinct date(s), fewer than {MIN_DAYS}"
+    for row in rows:
+        if row.corrected is None:
+            return f"{row.name} has no corrected estimate"
+        if not row.within:
+            return f"{row.name} is not within {WITHIN_POINTS:g} points"
+    total = sum(row.shown for row in rows)
+    if total < MIN_POOLED_BOXES:
+        return f"{total} boxes shown pooled, fewer than {MIN_POOLED_BOXES}"
+    return None
+
+
 def _fmt(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.4f}"
 
@@ -264,6 +394,24 @@ def format_week(row: Week) -> str:
     )
 
 
+def format_session(row: Session) -> str:
+    diff = row.diff_points
+    within = row.within
+    return (
+        f"{row.name}  {row.day.isoformat()}  reviewer {_fmt(row.reviewer)} (n={row.shown})  "
+        f"judge {_fmt(row.judge)} (n={row.confident})  corrected {_fmt(row.corrected)}  "
+        # round(...) + 0.0 turns a rounding residue's -0.00 into +0.00
+        f"diff {'n/a' if diff is None else f'{round(diff, 2) + 0.0:+.2f} pts'}  "
+        f"within {WITHIN_POINTS:g} pts: {'n/a' if within is None else 'yes' if within else 'no'}"
+    )
+
+
+def _model_name(value: str) -> str:
+    if not _MODEL.fullmatch(value):
+        raise argparse.ArgumentTypeError("not a model name")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m wearreport.tools.spotcheck_summary",
@@ -271,11 +419,53 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--dir", default=DEFAULT_DIR, help="where the statistics files are")
+    ap.add_argument(
+        "--by-session",
+        action="store_true",
+        help="one row per session, each calibrated on all the other sessions",
+    )
+    ap.add_argument(
+        "--model",
+        type=_model_name,
+        help="the judge model (with --by-session; default: the only one found)",
+    )
     return ap
 
 
+def by_session(records: Sequence[Record], model: str | None) -> int:
+    """Print the per-session summary; 2 when the model is ambiguous, else 0."""
+    if model is None:
+        found = qualifying_models(records)
+        if len(found) > 1:
+            print(
+                f"summary: several judge models in qualifying sessions: {', '.join(found)};"
+                " choose one with --model",
+                file=sys.stderr,
+            )
+            return 2
+        model = found[0] if found else None
+    if model is None:
+        print("No qualifying session with a judge model.")
+        rows: list[Session] = []
+    else:
+        print(f"Judge {model}, each session corrected with the confusion of all other sessions:")
+        rows = sessions(records, model)
+    for row in rows:
+        print(format_session(row))
+    for record in records:
+        reason = skip_reason(record, model)
+        if reason is not None:
+            print(f"skipped {record.name}: {reason}")
+    unmet = readiness(rows)
+    print("ready: yes" if unmet is None else f"ready: no ({unmet})")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.model is not None and not args.by_session:
+        ap.error("--model needs --by-session")
     directory = Path(args.dir)
     try:
         records = load(directory)
@@ -283,6 +473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"summary: {exc}", file=sys.stderr)
         return 1
     print(f"{len(records)} statistics file(s) in {directory}")
+    if args.by_session:
+        return by_session(records, args.model)
     found = sorted({r.model for r in records if r.model is not None})
     models: list[str | None] = list(found) if found else [None]
     for model in models:

@@ -217,6 +217,42 @@ each judge model:
 The last line says whether the condition holds: the two latest weeks with a corrected
 estimate are both within 3 points of the reviewer's precision.
 
+## Summary per session
+
+```bash
+uv run python -m wearreport.tools.spotcheck_summary --by-session [--dir spotchecks] [--model NAME]
+```
+
+treats each statistics file as one session, for one judge model: `--model NAME`, or, when
+it is omitted, the only model found in qualifying sessions (with several, the tool names
+them and exits with status 2). Without `--by-session` the output is the weekly summary
+above, unchanged.
+
+A session qualifies when its `judge` block has that model, `status` `complete` and at
+least 100 boxes shown (`MIN_SESSION_BOXES`). Every other file is listed as
+`skipped <file>: <reason>` (no judge block, another model, an incomplete judge, too few
+boxes) and enters no calibration.
+
+Each qualifying session gets one row: file name, date, the reviewer's precision and n,
+the judge's precision and n, the corrected estimate, the difference in points and whether
+it is within 3 points (`WITHIN_POINTS`). The corrected estimate is the one of the weekly
+summary, with the calibration taken from every *other* qualifying session, pooled (leave
+one session out): a session's own reviewer answers never correct its own judge answers.
+It is `n/a` as in the weekly summary, for example when there is no other session.
+
+The last line is the verdict, `ready: yes` only when all of these hold:
+
+| Condition | Constant |
+|---|---|
+| at least 3 qualifying sessions | `MIN_SESSIONS` |
+| on at least 2 distinct dates | `MIN_DAYS` |
+| every qualifying session's corrected estimate defined and within 3 points | `WITHIN_POINTS` |
+| at least 300 boxes shown, pooled over the qualifying sessions | `MIN_POOLED_BOXES` |
+
+Otherwise it is `ready: no (<the first condition not met>)`. Both verdicts exit with
+status 0. A malformed file is an error that names it (status 1), as in the weekly
+summary.
+
 ## Privacy and cleanup
 
 With `--view window`, rendered images exist only in memory and in the window, and

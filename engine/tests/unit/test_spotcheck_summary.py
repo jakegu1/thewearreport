@@ -154,3 +154,84 @@ def test_a_perfect_judge_needs_no_correction() -> None:
     earlier = _table(90, 0, 10)
     current = _table(40, 0, 10)
     assert summary.corrected_estimate(current, earlier) == pytest.approx(0.8)
+
+
+# By session -----------------------------------------------------------------------------
+
+
+def _session(
+    directory: Path,
+    name: str,
+    day: str,
+    shown: int = 100,
+    status: object = "complete",
+    model: str = "di-qwen3-vl-235b",
+) -> None:
+    record: dict[str, Any] = {"date": day, "boxes_shown": shown, "boxes_not_person": 10}
+    record["judge"] = {"model": model, "status": status, "confusion": _table(90, 0, 10)}
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_model_without_by_session_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        summary.main(["--dir", str(tmp_path), "--model", "di-qwen3-vl-235b"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("name", ["", "-x", "a b", "x" * 65, "a/b"])
+def test_a_malformed_model_name_is_refused(tmp_path: Path, name: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        summary.main(["--by-session", "--dir", str(tmp_path), "--model", name])
+    assert exc.value.code == 2
+
+
+def test_an_empty_directory_is_not_ready(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert summary.main(["--by-session", "--dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "No qualifying session" in out
+    assert out.splitlines()[-1] == "ready: no (0 qualifying session(s), fewer than 3)"
+
+
+@pytest.mark.parametrize("status", [None, 3, "done", ["complete"]])
+def test_a_status_other_than_complete_is_skipped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], status: object
+) -> None:
+    _session(tmp_path, "a.json", "2026-09-15", status=status)
+    assert summary.main(["--by-session", "--dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "skipped a.json: judge status not complete" in out
+    # The weekly summary still reads the file as before.
+    assert summary.main(["--dir", str(tmp_path)]) == 0
+    assert "judge 0.9000 (n=100)" in capsys.readouterr().out
+
+
+def test_a_perfect_judge_is_ready_with_every_other_session_as_calibration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _session(tmp_path, "a.json", "2026-09-15")
+    _session(tmp_path, "b.json", "2026-09-16")
+    _session(tmp_path, "c.json", "2026-09-16")
+    _session(tmp_path, "d.json", "2026-09-16", status="incomplete")
+    assert summary.main(["--by-session", "--dir", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith("Judge di-qwen3-vl-235b")
+    assert lines[2:5] == [
+        f"{n}  {d}  reviewer 0.9000 (n=100)  judge 0.9000 (n=100)  corrected 0.9000"
+        "  diff +0.00 pts  within 3 pts: yes"
+        for n, d in (("a.json", "2026-09-15"), ("b.json", "2026-09-16"), ("c.json", "2026-09-16"))
+    ]
+    assert lines[5:] == ["skipped d.json: judge status incomplete", "ready: yes"]
+
+
+def test_readiness_reports_the_first_unmet_condition() -> None:
+    day = datetime.date(2026, 9, 15)
+    row = summary.Session("a.json", day, 0.9, 100, 0.9, 100, 0.9)
+    assert summary.readiness([row, row, row]) == "1 distinct date(s), fewer than 2"
+    other = summary.Session("b.json", day + datetime.timedelta(1), 0.9, 50, 0.9, 50, 0.95)
+    assert summary.readiness([row, row, other]) == "b.json is not within 3 points"
+    small = summary.Session("b.json", day + datetime.timedelta(1), 0.9, 50, 0.9, 50, 0.9)
+    assert summary.readiness([row, row, small]) == "250 boxes shown pooled, fewer than 300"
+    assert summary.readiness([row, small]) == "2 qualifying session(s), fewer than 3"
