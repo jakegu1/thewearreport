@@ -194,8 +194,9 @@ Scheduled and manual runs start from the default branch only.
   `sweep_id`, each JSON and at most 1 MiB. It checks out the `data` branch (creating it
   as an orphan if it does not exist), copies the files in (an existing record must be
   identical), stages only new records and `status.json`, checks the staged list, then
-  commits and pushes. A failed publish job can be re-run on its own while the artifact
-  lasts.
+  commits and pushes. It refuses a `status.json` older than the published one (an
+  earlier `last_sweep_at`), so re-running an old run's publish job after later runs have
+  published fails instead of rolling the status back.
 - **Alert.** A failed sweep is a sweep or publish job that fails (for example, the
   registry is unreachable, so no record is written) or a published record that is not a
   success (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert

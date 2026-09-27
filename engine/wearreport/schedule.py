@@ -130,6 +130,10 @@ RECORD_PATH = re.compile(
     rf"sweeps/([0-9]{{4}})/([0-9]{{2}})/([0-9]{{2}})/({SWEEP_ID.pattern})\.json"
 )
 STATUS_PATH: Final = "status.json"
+# The same time format as wearreport.aggregate.UTC_TIME (a test keeps them equal).
+UTC_TIME = re.compile(
+    r"[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z"
+)
 # wearreport.publish's success rule and record size cap (a test keeps them equal).
 SUCCESS_NUMERATOR, SUCCESS_DENOMINATOR = 9, 10
 MAX_RECORD_BYTES: Final = 1024 * 1024
@@ -560,8 +564,13 @@ def copy_artifact(artifact: Path, data_dir: Path) -> list[str]:
     branch checkout `data_dir`: a record is created, or left alone when the identical
     record is already there (a different one raises ScheduleError, as records are
     immutable); status.json is replaced. No existing directory on the way may be a
-    symlink or anything but a plain directory. Returns the paths copied."""
+    symlink or anything but a plain directory. Returns the paths copied.
+
+    An artifact status.json older than the checked-out one (an earlier `last_sweep_at`,
+    as when an old run's publish job is re-run after later runs published) raises
+    ScheduleError before anything is written: it would roll the published status back."""
     paths = check_artifact(artifact)
+    _refuse_a_status_rollback(artifact / STATUS_PATH, data_dir / STATUS_PATH)
     for relative in paths:
         data = _read_regular(artifact / relative, MAX_RECORD_BYTES)
         if data is None:
@@ -573,6 +582,48 @@ def copy_artifact(artifact: Path, data_dir: Path) -> list[str]:
         elif _read_regular(target, MAX_RECORD_BYTES) != data:
             _create_file(target, data)
     return paths
+
+
+def _refuse_a_status_rollback(new: Path, published: Path) -> None:
+    """Raise ScheduleError when the status.json at `new` has an earlier `last_sweep_at`
+    than the one at `published`. A missing or unusable published status (the first
+    publish) or one without a sweep yet allows any new status."""
+    data = _read_regular(published, MAX_STATUS_BYTES)
+    if data is None or len(data) > MAX_STATUS_BYTES:
+        return
+    try:
+        published_at = _last_sweep_at(data)
+    except ScheduleError:
+        return
+    if published_at is None:
+        return
+    data = _read_regular(new, MAX_STATUS_BYTES)
+    if data is None or len(data) > MAX_STATUS_BYTES:
+        raise ScheduleError("artifact: cannot read status.json")
+    new_at = _last_sweep_at(data)
+    if new_at is None or new_at < published_at:
+        raise ScheduleError(
+            "artifact: status.json is older than the published one (last_sweep_at): "
+            "refusing to roll it back"
+        )
+
+
+def _last_sweep_at(data: bytes) -> datetime | None:
+    """A status document's `last_sweep_at` (None when no sweep is published yet), in
+    wearreport.aggregate's YYYY-MM-DDTHH:MM:SSZ. Raises ScheduleError for anything else."""
+    try:
+        status = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):  # includes UnicodeDecodeError
+        raise ScheduleError("status.json is not JSON") from None
+    value = status.get("last_sweep_at") if isinstance(status, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, str) or not UTC_TIME.fullmatch(value):
+        raise ScheduleError("status.json has no valid last_sweep_at")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:  # e.g. 2026-02-30
+        raise ScheduleError("status.json has no valid last_sweep_at") from None
 
 
 def _plain_dirs(root: Path, directory: Path) -> None:

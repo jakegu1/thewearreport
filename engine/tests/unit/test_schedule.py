@@ -61,6 +61,7 @@ def _created(run_id: int) -> str:
 
 def test_sweep_id_and_daytime_match_the_engine() -> None:
     assert schedule.SWEEP_ID.pattern == aggregate.SWEEP_ID.pattern
+    assert schedule.UTC_TIME.pattern == aggregate.UTC_TIME.pattern
     assert (schedule.DAY_START, schedule.DAY_END) == (publish.DAY_START, publish.DAY_END)
     assert schedule.LONDON_TZ == publish.LONDON_TZ
 
@@ -1068,6 +1069,86 @@ def test_copy_artifact_refuses_a_symlink_in_the_data_checkout(tmp_path: Path) ->
     assert not (elsewhere / "x.json").exists()
 
 
+def _status_at(last_sweep_at: str | None, failures: int = 0) -> bytes:
+    return (
+        json.dumps({"consecutive_failures": failures, "last_sweep_at": last_sweep_at}).encode()
+        + b"\n"
+    )
+
+
+def test_copy_artifact_refuses_an_older_status_and_writes_nothing(tmp_path: Path) -> None:
+    # A re-run of an old run's publish job after later runs published: its status would
+    # roll the published one back (and read as a success, closing an open alert).
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at("2026-07-15T09:07:00Z"))
+    data = tmp_path / "data"
+    data.mkdir()
+    newer = _status_at("2026-07-15T10:07:00Z", failures=3)
+    (data / "status.json").write_bytes(newer)
+    argv = ["copy-artifact", "--artifact", str(artifact), "--data-dir", str(data)]
+    with pytest.raises(schedule.ScheduleError, match="older than the published"):
+        schedule.copy_artifact(artifact, data)
+    assert schedule.main(argv) == 1
+    assert (data / "status.json").read_bytes() == newer
+    assert sorted(p.name for p in data.iterdir()) == ["status.json"]  # no record either
+
+
+@pytest.mark.parametrize(
+    "artifact_status",
+    [
+        _status_at(None),  # no sweep in it
+        b'{"consecutive_failures": 0}\n',  # no last_sweep_at at all
+        _status_at("2026-07-15T10:07:00"),  # not the UTC format
+        _status_at("2026-02-30T10:07:00Z"),  # not a calendar date
+    ],
+)
+def test_copy_artifact_refuses_a_status_without_a_usable_time_over_a_published_one(
+    tmp_path: Path, artifact_status: bytes
+) -> None:
+    artifact = _artifact(tmp_path / "a", _sweep(NOON, 10), artifact_status)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "status.json").write_bytes(_status_at("2026-07-15T10:07:00Z"))
+    with pytest.raises(schedule.ScheduleError):
+        schedule.copy_artifact(artifact, data)
+    assert sorted(p.name for p in data.iterdir()) == ["status.json"]
+
+
+@pytest.mark.parametrize("new", ["2026-07-15T10:07:00Z", "2026-07-15T12:00:00Z"])
+def test_copy_artifact_copies_an_equal_or_newer_status_at(tmp_path: Path, new: str) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at(new))
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "status.json").write_bytes(_status_at("2026-07-15T10:07:00Z", failures=3))
+    assert schedule.copy_artifact(artifact, data) == sorted(["status.json", _relative(record)])
+    assert (data / "status.json").read_bytes() == _status_at(new)
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        None,  # the first publish: no status.json yet
+        _status_at(None),  # nothing published yet
+        b"not json",
+        b"[" * 100_000 + b"]" * 100_000,
+        _status_at("yesterday"),
+        b" " * (schedule.MAX_STATUS_BYTES + 1),
+    ],
+)
+def test_copy_artifact_allows_any_status_over_a_missing_or_unusable_one(
+    tmp_path: Path, published: bytes | None
+) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at("2026-07-15T09:07:00Z"))
+    data = tmp_path / "data"
+    data.mkdir()
+    if published is not None:
+        (data / "status.json").write_bytes(published)
+    schedule.copy_artifact(artifact, data)
+    assert (data / "status.json").read_bytes() == _status_at("2026-07-15T09:07:00Z")
+
+
 def test_copy_artifact_checks_before_copying(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path / "a", _sweep(NOON, 10))
     (artifact / "notes.txt").write_text("x")
@@ -1086,7 +1167,7 @@ def test_check_artifact_caps_the_number_of_files(tmp_path: Path) -> None:
         schedule.check_artifact(artifact)
 
 
-def test_check_artifact_rejects_a_bad_status(tmp_path: Path) -> None:
+def test_check_artifact_rejects_a_bad_status_at(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path / "a", _sweep(NOON, 10), status=b"[]")
     with pytest.raises(schedule.ScheduleError):
         schedule.check_artifact(artifact)
