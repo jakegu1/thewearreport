@@ -37,6 +37,8 @@ INFO = spotcheck.DetectorInfo(model="stub", sha256="0" * 64, conf=detect.DEFAULT
 IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8", b"BM", b"RIFF", b"II*\x00")
 SIGNATURES = (b"\xff\xd8\xff", b"\x89PNG", b"/9j/", b"iVBORw0KGgo")
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
+# Windows has no SIGHUP; the tests that send it are POSIX-only.
+SIGHUP = getattr(signal, "SIGHUP", signal.SIGTERM)
 
 
 def _box(k: int) -> tuple[float, float, float, float]:
@@ -1085,7 +1087,7 @@ def _finish(proc: subprocess.Popen[bytes]) -> tuple[int, str]:
     [
         ("while_writing_SIGTERM", 128 + signal.SIGTERM, "SIGTERM"),
         ("while_writing_SIGINT", 128 + signal.SIGINT, "SIGINT"),
-        ("while_writing_SIGHUP", 128 + signal.SIGHUP, "SIGHUP"),
+        ("while_writing_SIGHUP", 128 + SIGHUP, "SIGHUP"),
         ("in_mkdtemp", 128 + signal.SIGINT, "SIGINT"),
         ("in_rmtree", 128 + signal.SIGTERM, "SIGTERM"),
         ("stats_fail", 1, "No space left"),
@@ -1167,7 +1169,7 @@ def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
         ("at_cleanup:-:SIGTERM", 128 + signal.SIGTERM),
         # Ctrl-C, then more signals as clean-up starts: the first one decides the exit.
         ("at_cleanup:SIGINT:SIGTERM,SIGINT,SIGHUP", 128 + signal.SIGINT),
-        ("at_cleanup:-:SIGHUP,SIGTERM,SIGINT", 128 + signal.SIGHUP),
+        ("at_cleanup:-:SIGHUP,SIGTERM,SIGINT", 128 + SIGHUP),
     ],
 )
 def test_child_signals_as_cleanup_starts_still_clean_up(
@@ -1190,7 +1192,7 @@ def test_child_signal_while_reporting_an_error(tmp_path: Path) -> None:
 
 
 STRESS_RUNS = 20
-BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, SIGHUP)
 
 
 def test_child_repeated_signals_stress(tmp_path: Path) -> None:

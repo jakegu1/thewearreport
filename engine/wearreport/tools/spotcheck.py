@@ -89,7 +89,22 @@ from wearreport._cv import cv2
 from wearreport.settings import SettingsError, load_settings
 
 if sys.platform == "win32":
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+    _kernel32.GetFileType.restype = wintypes.DWORD
+    _kernel32.PeekNamedPipe.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    _kernel32.PeekNamedPipe.restype = wintypes.BOOL
 else:
     import fcntl
     import select
@@ -938,7 +953,8 @@ class _LineReader:
         self.buffer = b""
         self.eof = False
         self.too_long = False
-        self._chunks: queue.Queue[bytes] | None = None  # Windows: filled by a thread
+        self._kind: str | None = None  # Windows: "pipe", "file" or "console"
+        self._chunks: queue.Queue[bytes] | None = None  # Windows consoles: filled by a thread
 
     def readline(self, deadline: float) -> str:
         while b"\n" not in self.buffer:
@@ -970,8 +986,26 @@ class _LineReader:
         if not WINDOWS:
             ready, _, _ = select.select([self.fd], [], [], remaining)
             return os.read(self.fd, 4096) if ready else None
-        # Windows cannot select() on a pipe or a console: a thread reads, and the wait is
-        # cut into short slices so that signals are handled between them.
+        # Windows cannot select() on a pipe or a console. A pipe is polled for waiting
+        # bytes, so no read ever blocks (a blocked read would hold the descriptor, and a
+        # close of it would wait for that read). A console, which the tool never closes,
+        # is read by a thread. Waits are cut into short slices, so that signals are
+        # handled between them.
+        if self._kind is None:
+            self._kind = _input_kind(self.fd)
+        if self._kind == "file":
+            return os.read(self.fd, 4096)
+        if self._kind == "pipe":
+            end = time.monotonic() + min(remaining, 0.1)
+            while True:
+                waiting = _pipe_waiting(self.fd)
+                if waiting is None:
+                    return b""  # the writer closed it
+                if waiting:
+                    return os.read(self.fd, min(waiting, 4096))
+                if time.monotonic() >= end:
+                    return None
+                time.sleep(0.02)
         if self._chunks is None:
             self._chunks = queue.Queue()
             threading.Thread(target=self._pump, args=(self._chunks,), daemon=True).start()
@@ -989,6 +1023,25 @@ class _LineReader:
             chunks.put(chunk)
             if not chunk:
                 return
+
+
+def _input_kind(fd: int) -> str:
+    """Windows: what the descriptor reads from ("pipe", "file" or "console")."""
+    if sys.platform == "win32":
+        kind = _kernel32.GetFileType(msvcrt.get_osfhandle(fd))
+        return {1: "file", 3: "pipe"}.get(kind, "console")  # FILE_TYPE_DISK, FILE_TYPE_PIPE
+    return "file"
+
+
+def _pipe_waiting(fd: int) -> int | None:
+    """Windows: bytes waiting in the pipe, or None once the writer has closed it."""
+    if sys.platform == "win32":
+        waiting = wintypes.DWORD()
+        handle = msvcrt.get_osfhandle(fd)
+        if not _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(waiting), None):
+            return None  # ERROR_BROKEN_PIPE, or the pipe is unusable: its end either way
+        return int(waiting.value)
+    return None
 
 
 class KeyboardReviewer:
