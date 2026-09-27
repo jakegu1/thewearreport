@@ -37,6 +37,12 @@ INFO = spotcheck.DetectorInfo(model="stub", sha256="0" * 64, conf=detect.DEFAULT
 IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8", b"BM", b"RIFF", b"II*\x00")
 SIGNATURES = (b"\xff\xd8\xff", b"\x89PNG", b"/9j/", b"iVBORw0KGgo")
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
+# Windows has no SIGHUP; the tests that send it are POSIX-only.
+SIGHUP = getattr(signal, "SIGHUP", signal.SIGTERM)
+# Tests that send POSIX signals to a process: on Windows, os.kill() and send_signal() end it.
+POSIX_SIGNALS = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX signals; Windows ends the process"
+)
 
 
 def _box(k: int) -> tuple[float, float, float, float]:
@@ -121,6 +127,12 @@ def _items(mode: spotcheck.Mode) -> list[spotcheck.ReviewItem]:
 FRAMES_OK = {"1": {"missed": 0}, "2": {"missed": 0}, "3": {"missed": 0}}
 
 
+def _short_id(raw: bytes) -> str | None:
+    """A short test id for a large input. pytest puts the id in PYTEST_CURRENT_TEST, and
+    Windows refuses environment variables longer than 32767 characters."""
+    return f"{raw[:16]!r}...{len(raw)}-bytes" if len(raw) > 200 else None
+
+
 def _frames(**changes: Any) -> bytes:
     data: dict[str, Any] = {k: dict(v) for k, v in FRAMES_OK.items()}
     for key, value in changes.items():
@@ -161,6 +173,7 @@ def _frames(**changes: Any) -> bytes:
         b"\x00" * 64,
         b"\xff\xd8\xff\xe0",  # a JPEG header is not a judgements file
     ],
+    ids=_short_id,
 )
 def test_parse_judgements_rejects_hostile_input(raw: bytes) -> None:
     with pytest.raises(spotcheck.JudgementError):
@@ -626,14 +639,19 @@ def test_alarm_stops_a_reviewer_that_ignores_its_deadline(env: Path, tmp_path: P
     assert code == 3
     assert time.monotonic() - started < WAIT_S / 2
     assert _leftovers(env) == []
-    assert signal.getsignal(signal.SIGALRM) in (signal.SIG_DFL, signal.SIG_IGN, None) or callable(
-        signal.getsignal(signal.SIGALRM)
-    )
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    if hasattr(signal, "SIGALRM"):  # Windows has no SIGALRM: the alarm is a timer thread
+        assert signal.getsignal(signal.SIGALRM) in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+            None,
+        ) or callable(signal.getsignal(signal.SIGALRM))
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
 
 def test_signal_handlers_are_restored(env: Path, tmp_path: Path) -> None:
-    before = {s: signal.getsignal(s) for s in (*spotcheck.HANDLED_SIGNALS, signal.SIGALRM)}
+    before = {
+        s: signal.getsignal(s) for s in (*spotcheck.HANDLED_SIGNALS, *spotcheck.ALARM_SIGNALS)
+    }
     assert (
         _run(
             ["--n", "1", "--min-persons", "1"],
@@ -651,6 +669,7 @@ def _deliver(signum: int) -> None:
     time.sleep(0.05)  # the Python-level handler runs at the latest here
 
 
+@POSIX_SIGNALS
 def test_signal_guard_raises_only_the_first_signal() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -667,6 +686,7 @@ def test_signal_guard_raises_only_the_first_signal() -> None:
         guard.restore()
 
 
+@POSIX_SIGNALS
 def test_signal_guard_holds_a_signal_inside_critical_then_latches() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -680,6 +700,7 @@ def test_signal_guard_holds_a_signal_inside_critical_then_latches() -> None:
         guard.restore()
 
 
+@POSIX_SIGNALS
 def test_signal_guard_stop_drops_every_signal() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -706,7 +727,7 @@ def test_encoding_failure_while_writing_leaves_nothing(
     monkeypatch.setattr(spotcheck.ReviewDirectory, "write_image", write_image)
     with pytest.raises(RuntimeError, match="encoder broke"):
         _run(
-            ["--n", "1", "--min-persons", "1"],
+            ["--n", "1", "--min-persons", "1", "--view", "files"],
             tmp_path / "o",
             pipeline=_pipeline([3]),
             reviewer=Scripted(),
@@ -729,7 +750,7 @@ def test_filesystem_errors_are_reported_without_a_traceback(
         monkeypatch.setattr(tempfile, "mkdtemp", full)
     else:
         monkeypatch.setattr(spotcheck.ReviewDirectory, step, full)
-    args = ["--n", "1", "--min-persons", "1"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "files"]
     assert _run(args, tmp_path / "out", pipeline=_pipeline([2]), reviewer=Scripted()) == 1
     assert "cannot write the review directory: No space left" in capsys.readouterr().err
     assert _leftovers(env) == []
@@ -750,7 +771,9 @@ def test_write_image_refuses_names_outside_the_directory(env: Path) -> None:
             directory.write_image(item)  # O_EXCL: never overwrites, never follows a link
         assert directory.path is not None
         mode = os.stat(directory.path / item.file).st_mode & 0o777
-        assert mode == 0o600
+        # Windows keeps no Unix mode bits (it reports 0o666 for a writable file); there,
+        # access is restricted by the owner-only ACL mkdtemp gives the directory.
+        assert mode == (0o666 if sys.platform == "win32" else 0o600)
     finally:
         assert directory.remove()
     assert _leftovers(env) == []
@@ -766,14 +789,23 @@ def test_write_image_needs_a_directory() -> None:
 def test_keyboard_reviewer_over_a_pipe() -> None:
     read_fd, write_fd = os.pipe()
     out = io.StringIO()
+    data = b"x\nn9\n" + b"n" * (spotcheck.MAX_LINE_BYTES + 10) + b"\nn1 m2\nv4\n\n"
+
+    def write() -> None:  # from a thread: the input is larger than a Windows pipe buffer
+        try:
+            os.write(write_fd, data)
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write)
+    writer.start()
     try:
-        os.write(write_fd, b"x\nn9\n" + b"n" * (spotcheck.MAX_LINE_BYTES + 10) + b"\nn1 m2\nv4\n\n")
-        os.close(write_fd)
         got = spotcheck.KeyboardReviewer(read_fd, out).judge(
             _items("frames"), "frames", time.monotonic() + 10
         )
     finally:
-        os.close(read_fd)
+        os.close(read_fd)  # first: a writer still blocked on a full pipe then fails
+        writer.join()
     assert got == {
         1: spotcheck.Judgement(frozenset({1}), frozenset(), 2),
         2: spotcheck.Judgement(frozenset(), frozenset({4}), 0),
@@ -817,10 +849,44 @@ def _json_reviewer(path: Path) -> tuple[spotcheck.JsonFileReviewer, io.StringIO]
     return spotcheck.JsonFileReviewer(path, out), out
 
 
+def _named_pipe(request: pytest.FixtureRequest) -> Path:
+    """A Windows named pipe, the counterpart of a FIFO, with enough instances for every
+    poll to find one free (each stat connects to one)."""
+    if sys.platform != "win32":
+        raise AssertionError("Windows only")
+    import _winapi
+
+    name = rf"\\.\pipe\wearreport-test-{os.getpid()}-{time.monotonic_ns()}"
+    handles: list[int] = []
+
+    def close() -> None:
+        for handle in handles:
+            _winapi.CloseHandle(handle)
+
+    request.addfinalizer(close)
+    for _ in range(32):
+        handle = _winapi.CreateNamedPipe(
+            name,
+            _winapi.PIPE_ACCESS_INBOUND,
+            0,
+            _winapi.PIPE_UNLIMITED_INSTANCES,
+            0,
+            0,
+            0,
+            _winapi.NULL,
+        )
+        handles.append(handle)
+    return Path(name)
+
+
 @pytest.mark.parametrize("kind", ["fifo", "directory", "device", "too_large"])
-def test_json_reviewer_rejects_paths_that_are_not_small_files(tmp_path: Path, kind: str) -> None:
+def test_json_reviewer_rejects_paths_that_are_not_small_files(
+    tmp_path: Path, kind: str, request: pytest.FixtureRequest
+) -> None:
     path = tmp_path / "judgements.json"
-    if kind == "fifo":
+    if kind == "fifo" and sys.platform == "win32":
+        path = _named_pipe(request)
+    elif kind == "fifo":
         os.mkfifo(path)
     elif kind == "directory":
         path.mkdir()
@@ -870,7 +936,12 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     locked = tmp / (spotcheck.TEMP_PREFIX + "locked")
     locked.mkdir()
     link = tmp / (spotcheck.TEMP_PREFIX + "link")
-    link.symlink_to(outside)
+    if sys.platform == "win32":  # a junction: Windows' link that needs no privilege
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(link))
+    else:
+        link.symlink_to(outside)
     plain = tmp / (spotcheck.TEMP_PREFIX + "file")
     plain.write_text("x", encoding="utf-8")
     other = tmp / "other-dir"
@@ -878,7 +949,12 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     old = now - 7200
     for p in (stale, locked, plain, other):
         os.utime(p, (old, old))
-    os.utime(link, (old, old), follow_symlinks=False)
+    if sys.platform == "win32":
+        # No os.utime(follow_symlinks=False) there; links are never old enough to matter,
+        # since the sweep skips every reparse point first.
+        assert link.is_junction()
+    else:
+        os.utime(link, (old, old), follow_symlinks=False)
     fd = spotcheck._lock(locked)
     assert fd is not None
     try:
@@ -886,7 +962,8 @@ def test_remove_stale_is_narrow(tmp_path: Path) -> None:
     finally:
         os.close(fd)
     assert not stale.exists()
-    assert locked.is_dir() and link.is_symlink() and plain.is_file() and other.is_dir()
+    is_link = link.is_junction() if sys.platform == "win32" else link.is_symlink()
+    assert locked.is_dir() and is_link and plain.is_file() and other.is_dir()
     assert (outside / "keep").is_file()
     assert spotcheck.remove_stale(tmp, 3600, now) == 1  # unlocked now
     assert spotcheck.remove_stale(tmp_path / "missing", 1) == 0
@@ -905,6 +982,7 @@ def _stale_dirs(tmp: Path, names: Sequence[str]) -> list[Path]:
     return made
 
 
+@POSIX_SIGNALS
 def test_remove_stale_finishes_a_removal_that_a_signal_lands_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1083,18 +1161,18 @@ def _finish(proc: subprocess.Popen[bytes]) -> tuple[int, str]:
 @pytest.mark.parametrize(
     ("scenario", "code", "message"),
     [
-        ("while_writing_SIGTERM", 128 + signal.SIGTERM, "SIGTERM"),
-        ("while_writing_SIGINT", 128 + signal.SIGINT, "SIGINT"),
-        ("while_writing_SIGHUP", 128 + signal.SIGHUP, "SIGHUP"),
-        ("in_mkdtemp", 128 + signal.SIGINT, "SIGINT"),
-        ("in_rmtree", 128 + signal.SIGTERM, "SIGTERM"),
+        pytest.param("while_writing_SIGTERM", 128 + signal.SIGTERM, "SIGTERM", marks=POSIX_SIGNALS),
+        pytest.param("while_writing_SIGINT", 128 + signal.SIGINT, "SIGINT", marks=POSIX_SIGNALS),
+        pytest.param("while_writing_SIGHUP", 128 + SIGHUP, "SIGHUP", marks=POSIX_SIGNALS),
+        pytest.param("in_mkdtemp", 128 + signal.SIGINT, "SIGINT", marks=POSIX_SIGNALS),
+        pytest.param("in_rmtree", 128 + signal.SIGTERM, "SIGTERM", marks=POSIX_SIGNALS),
         ("stats_fail", 1, "No space left"),
     ],
 )
 def test_child_exit_paths_leave_no_directory(
     tmp_path: Path, scenario: str, code: int, message: str
 ) -> None:
-    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1"])
+    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1", "--view", "files"])
     returncode, output = _finish(proc)
     assert returncode == code, output
     assert message in output
@@ -1125,6 +1203,7 @@ def _terminating() -> set[int]:
     return {int(s) for s in signal.valid_signals() if _name(s) not in excluded}
 
 
+@POSIX_SIGNALS
 def test_every_catchable_terminating_signal_is_handled() -> None:
     expected = _terminating()
     assert set(spotcheck.HANDLED_SIGNALS) == expected
@@ -1143,6 +1222,7 @@ def _sent_while_waiting() -> list[int]:
     return [*chosen, signal.SIGALRM]
 
 
+@POSIX_SIGNALS
 def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
     runs = []
     for signum in _sent_while_waiting():
@@ -1160,6 +1240,7 @@ def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
         assert not workdir.exists() and _leftovers(tmp) == [], signum
 
 
+@POSIX_SIGNALS
 @pytest.mark.parametrize(
     ("scenario", "code"),
     [
@@ -1167,13 +1248,13 @@ def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
         ("at_cleanup:-:SIGTERM", 128 + signal.SIGTERM),
         # Ctrl-C, then more signals as clean-up starts: the first one decides the exit.
         ("at_cleanup:SIGINT:SIGTERM,SIGINT,SIGHUP", 128 + signal.SIGINT),
-        ("at_cleanup:-:SIGHUP,SIGTERM,SIGINT", 128 + signal.SIGHUP),
+        ("at_cleanup:-:SIGHUP,SIGTERM,SIGINT", 128 + SIGHUP),
     ],
 )
 def test_child_signals_as_cleanup_starts_still_clean_up(
     tmp_path: Path, scenario: str, code: int
 ) -> None:
-    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1"])
+    proc, tmp = _spawn(tmp_path, scenario, ["--n", "2", "--min-persons", "1", "--view", "files"])
     returncode, output = _finish(proc)
     assert returncode == code, output
     assert "Traceback" not in output
@@ -1181,6 +1262,7 @@ def test_child_signals_as_cleanup_starts_still_clean_up(
     assert not (tmp_path / "out").exists()
 
 
+@POSIX_SIGNALS
 def test_child_signal_while_reporting_an_error(tmp_path: Path) -> None:
     proc, tmp = _spawn(tmp_path, "signal_in_handler", ["--n", "2", "--min-persons", "1"])
     returncode, output = _finish(proc)
@@ -1190,9 +1272,10 @@ def test_child_signal_while_reporting_an_error(tmp_path: Path) -> None:
 
 
 STRESS_RUNS = 20
-BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, SIGHUP)
 
 
+@POSIX_SIGNALS
 def test_child_repeated_signals_stress(tmp_path: Path) -> None:
     """INT, TERM, INT, HUP back to back while the review is open, in many processes."""
     runs = []
@@ -1241,6 +1324,7 @@ def test_child_keyboard_timeout_and_end_of_input(tmp_path: Path) -> None:
     assert _leftovers(tmp) == []
 
 
+@POSIX_SIGNALS
 def test_second_instance_never_deletes_a_running_instances_directory(tmp_path: Path) -> None:
     args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
     first, tmp = _spawn(tmp_path, "json", args)
@@ -1257,6 +1341,9 @@ def test_second_instance_never_deletes_a_running_instances_directory(tmp_path: P
     assert _leftovers(tmp) == []
 
 
+OK_ARGS = ["--n", "1", "--min-persons", "1", "--view", "files"]
+
+
 def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
     proc, tmp = _spawn(tmp_path, "json", args)
@@ -1264,16 +1351,17 @@ def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     proc.kill()
     proc.communicate(timeout=WAIT_S)
     assert workdir.is_dir()  # SIGKILL cannot be handled
-    returncode, output = _finish(_spawn(tmp_path, "ok", ["--n", "1", "--min-persons", "1"])[0])
+    returncode, output = _finish(_spawn(tmp_path, "ok", OK_ARGS)[0])
     assert returncode == 0 and workdir.is_dir()  # younger than the timeout: kept
     old = time.time() - 7200
     os.utime(workdir, (old, old))
-    returncode, output = _finish(_spawn(tmp_path, "ok", ["--n", "1", "--min-persons", "1"])[0])
+    returncode, output = _finish(_spawn(tmp_path, "ok", OK_ARGS)[0])
     assert returncode == 0, output
     assert "Deleted 1 review directories" in output
     assert _leftovers(tmp) == []
 
 
+@POSIX_SIGNALS
 @pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"])
 def test_child_signal_during_the_stale_sweep_still_removes_the_directory(
     tmp_path: Path, signame: str
@@ -1355,6 +1443,12 @@ sys.exit(sc.main(sys.argv[2:], pipeline=pipeline, reviewer=Scripted()))
 """
 
 
+def _windows_lock(review: Path) -> list[Path]:
+    """The lock file next to the review directory: Windows only, and never an image (the
+    file scans show it is gone after the run)."""
+    return [spotcheck.lock_file(review)] if sys.platform == "win32" else []
+
+
 def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path) -> None:
     """Every write is inside the one review directory, or is the statistics file (or the
     directory made for it); and the images were written there."""
@@ -1363,7 +1457,8 @@ def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path)
     review = made[0]
     assert review.name.startswith(spotcheck.TEMP_PREFIX)
     written = [Path(path) for kind, path in events if kind == "write"]
-    stray = [p for p in written if p not in (stats_file, stats_file.parent)]
+    allowed = [stats_file, stats_file.parent, *_windows_lock(review)]
+    stray = [p for p in written if p not in allowed]
     stray = [p for p in stray if not p.is_relative_to(review)]
     assert stray == [], stray
     assert [p for p in written if p.suffix == spotcheck.IMAGE_SUFFIX], "no image write seen"
@@ -1375,8 +1470,8 @@ def _confined_run(tmp_path: Path, scenario: str, mode: str) -> tuple[list[tuple[
     tmp.mkdir()
     environ = _child_env(tmp)
     environ["HOME"] = str(tmp_path / "home")
-    args = ["--n", "3", "--min-persons", "1", "--mode", mode, "--reviewer", "tester"]
-    args += ["--out-dir", "stats"]
+    args = ["--n", "3", "--min-persons", "1", "--mode", mode, "--view", "files"]
+    args += ["--reviewer", "tester", "--out-dir", "stats"]
     result = subprocess.run(
         [sys.executable, "-c", CONFINED, scenario, *args],
         cwd=work,
@@ -1501,28 +1596,38 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
         mode,
     ]
     args += ["--judgements", str(judgements), "--reviewer", "tester", "--out-dir", "stats"]
-    proc = subprocess.Popen(
-        [sys.executable, "-c", AUDITED, *args],
-        cwd=work,
-        env=environ,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    workdir = _wait_for_review(tmp, proc)
+    # The output goes to files, outside every scanned directory: the audit writes a line
+    # per event, more than a Windows pipe holds before the child blocks on it.
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    with open(logs / "out", "wb") as out_fh, open(logs / "err", "wb") as err_fh:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", AUDITED, *args],
+            cwd=work,
+            env=environ,
+            stdout=out_fh,
+            stderr=err_fh,
+        )
+    try:
+        workdir = _wait_for_review(tmp, proc)
+    except AssertionError:
+        proc.kill()
+        proc.wait(timeout=WAIT_S)
+        raise AssertionError((logs / "err").read_bytes().decode(errors="replace")) from None
     images = [p for p in workdir.iterdir() if p.read_bytes().startswith(IMAGE_MAGIC)]
     assert images
     numbering = json.loads((workdir / spotcheck.NUMBERING_FILE).read_text(encoding="utf-8"))
     judgements.write_text(json.dumps(numbering["template"]), encoding="utf-8")
-    out, err = proc.communicate(timeout=WAIT_S)
-    stderr = err.decode(errors="replace")
+    proc.wait(timeout=WAIT_S)
+    stderr = (logs / "err").read_bytes().decode(errors="replace")
     assert proc.returncode == 0, stderr
-    output = out.decode(errors="replace") + MARKER.sub("", stderr)
+    output = (logs / "out").read_bytes().decode(errors="replace") + MARKER.sub("", stderr)
 
     stats_file = work / "stats" / f"{datetime.date.today().isoformat()}.json"
     events = MARKER.findall(stderr)
     assert [text for kind, text in events if kind == "escape"] == []
     written = {work / text for kind, text in events if kind == "write"}  # cwd-relative
-    allowed = {stats_file, work / "stats"}
+    allowed = {stats_file, work / "stats", *_windows_lock(workdir)}
     for path in written - allowed:
         assert path.is_relative_to(tmp), path
         top = path.relative_to(tmp).parts[0]

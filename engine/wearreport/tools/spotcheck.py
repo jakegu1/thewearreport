@@ -2,15 +2,18 @@
 
   python -m wearreport.tools.spotcheck --n 20 [--mode crops|frames] [--min-persons 3]
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
-      [--judgements PATH] [--timeout SECONDS] [--dry-run]
+      [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
 frames with at least `--min-persons` person detections, at random (seeded by `--seed`).
 The detections are rendered for a reviewer, either as one crop per detection with a 50%
-margin (`crops`, the default) or as whole frames with numbered boxes (`frames`). The
-reviewer judges each image from the keyboard, or by writing a JSON file (`--judgements`)
-that the tool polls for. The tool then writes one statistics file,
+margin (`crops`, the default) or as whole frames with numbered boxes (`frames`). With
+`--view files` (the default except on Windows) the images go into a temporary directory
+and the reviewer judges each one from the keyboard, or by writing a JSON file
+(`--judgements`) that the tool polls for. With `--view window` (crops only; the default on
+Windows) one tkinter window shows each crop straight from memory and takes one key per
+crop, and no image is written anywhere. The tool then writes one statistics file,
 `<out-dir>/YYYY-MM-DD.json` (then `-2`, `-3`...), and nothing else. The format is in
 `spotchecks/README.md`.
 
@@ -24,14 +27,23 @@ with `tempfile.mkdtemp(prefix=TEMP_PREFIX)` (mode 0700) and always deletes:
   being created or deleted: a signal that arrives then is held until that step is done.
   Only the first signal is raised; later ones are dropped, so they cannot interrupt the
   clean-up the first one started;
-- the directory holds a lock (flock) while the tool runs. At start the tool deletes
-  every `wearreport-spotcheck-*` directory of the current user in the temporary
-  directory that is older than the timeout and not locked, which is what SIGKILL (which
-  cannot be handled) or a power cut leaves behind. A running instance's directory stays
+- the directory holds a lock (flock; on Windows, msvcrt.locking on a lock file next to
+  it, `.wearreport-spotcheck-*.lock`, so that no open file is ever inside the directory)
+  while the tool runs. At start the tool deletes every `wearreport-spotcheck-*`
+  directory of the current user in the temporary directory that is older than the
+  timeout and not locked, which is what SIGKILL (which cannot be handled), a killed
+  process on Windows or a power cut leaves behind. A running instance's directory stays
   locked, so a second instance never deletes it;
-- image files are created with O_EXCL and O_NOFOLLOW, mode 0600, and named after their
-  number only (`crop-0001.png`, `frame-0001.png`), never after a camera. Camera ids are
-  dropped as soon as the sweep is fetched.
+- image files are created with O_EXCL and O_NOFOLLOW (where the platform has it), mode
+  0600, and named after their number only (`crop-0001.png`, `frame-0001.png`), never
+  after a camera. Camera ids are dropped as soon as the sweep is fetched.
+
+The window view (`--view window`) writes no image and creates no directory: each crop is
+encoded to PNG bytes in memory and handed to a tkinter PhotoImage as data.
+
+On Windows there is no SIGALRM: the review timeout is a timer thread that raises SIGINT
+in the process, which the handler turns into the timeout. Standard input is read by a
+thread instead of select(), and the handled signals are SIGINT, SIGTERM and SIGBREAK.
 
 The static privacy guard exempts exactly this file from its binary-open rules
 (`IMAGE_WRITE_EXEMPTION` in scripts/privacy_guard.py); every other rule still applies,
@@ -47,16 +59,17 @@ cameras, so it needs an `--out-dir` other than spotchecks/.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import dataclasses
 import datetime
-import fcntl
+import gc
 import json
 import math
 import os
+import queue
 import random
 import re
-import select
 import shutil
 import signal
 import stat
@@ -67,8 +80,8 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
-from typing import Literal, Protocol, TextIO, get_args, runtime_checkable
+from types import FrameType, ModuleType
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO, get_args, runtime_checkable
 
 import numpy as np
 import numpy.typing as npt
@@ -77,8 +90,36 @@ from wearreport import detect, fetch, registry
 from wearreport._cv import cv2
 from wearreport.settings import SettingsError, load_settings
 
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+    _kernel32.GetFileType.restype = wintypes.DWORD
+    _kernel32.PeekNamedPipe.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    _kernel32.PeekNamedPipe.restype = wintypes.BOOL
+else:
+    import fcntl
+    import select
+
+if TYPE_CHECKING:
+    import tkinter
+
+WINDOWS = sys.platform == "win32"
+
 Mode = Literal["crops", "frames"]
 MODES: tuple[Mode, ...] = get_args(Mode)
+View = Literal["files", "window"]
+VIEWS: tuple[View, ...] = get_args(View)
 Frame = npt.NDArray[np.uint8]
 
 TEMP_PREFIX = "wearreport-spotcheck-"
@@ -95,10 +136,12 @@ CI_VARIABLES = ("CI", "GITHUB_ACTIONS")
 # the review alarm and handled as a timeout; SIGPIPE and SIGXFSZ, which Python ignores;
 # and the fault signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP, SIGSYS, SIGABRT),
 # since a Python handler cannot run while C code faults and would turn a crash into a
-# hang. Like SIGKILL, what those leave behind is deleted by a later run.
+# hang. Like SIGKILL, what those leave behind is deleted by a later run. SIGBREAK is
+# Windows' Ctrl-Break.
 TERMINATING_SIGNAL_NAMES = (
     "SIGINT",
     "SIGTERM",
+    "SIGBREAK",
     "SIGHUP",
     "SIGQUIT",
     "SIGUSR1",
@@ -123,6 +166,18 @@ def _terminating_signals() -> tuple[int, ...]:
 
 
 HANDLED_SIGNALS = _terminating_signals()
+# The review alarm: SIGALRM where the platform has it. Windows has none; a timer thread
+# raises SIGINT instead, and the guard tells it from Ctrl-C by a flag.
+ALARM_SIGNALS: tuple[int, ...] = (signal.SIGALRM,) if hasattr(signal, "SIGALRM") else ()
+# Windows only: the file whose first byte holds a review directory's lock. It lies next to
+# the directory, never inside it: an open file there could not be read or deleted.
+LOCK_SUFFIX = ".lock"
+# Extra flags for the files the tool creates, where the platform has them. O_BINARY
+# matters on Windows, where a descriptor is otherwise opened in text mode.
+CREATE_FLAGS = 0
+for _flag in ("O_NOFOLLOW", "O_CLOEXEC", "O_BINARY", "O_NOINHERIT"):
+    CREATE_FLAGS |= getattr(os, _flag, 0)
+del _flag
 
 MAX_N = 500
 MAX_MIN_PERSONS = 100
@@ -146,6 +201,19 @@ DRY_RUN_CAMERAS = 12
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / "fixtures" / "detect"
 DRY_RUN_FIXTURES = ("people_street.jpg", "umbrella_rain.jpg")
+
+WINDOW_TARGET_HEIGHT = 480  # the window enlarges crops by a whole factor up to about this
+WINDOW_MAX_WIDTH = 1200
+MAX_WINDOW_SCALE = 4
+WINDOW_TICK_MS = 100  # Tk hands control back to Python this often, so signals are handled
+# A backstop: the tick ends a window review this long after its deadline, should the
+# review's own timeout callback not have ended it.
+WINDOW_DEADLINE_GRACE_S = 5.0
+WINDOW_TITLE = "Spot-check"
+WINDOW_LEGEND = (
+    "Enter or Space: pedestrian   n: not a person   v: person in a vehicle   "
+    "Backspace: back   q: stop"
+)
 
 
 class SpotcheckError(RuntimeError):
@@ -430,12 +498,14 @@ class _SignalGuard:
         self._pending: BaseException | None = None
         self._previous: dict[int, object] = {}
         self._installed = False
+        self._timer: threading.Timer | None = None  # the alarm, where there is no SIGALRM
+        self._alarm_due = False
 
     def install(self) -> None:
         if threading.current_thread() is not threading.main_thread():
             return  # signal handlers can only be set from the main thread
         self._installed = True
-        for signum in (*HANDLED_SIGNALS, signal.SIGALRM):
+        for signum in (*HANDLED_SIGNALS, *ALARM_SIGNALS):
             self._previous[signum] = signal.signal(signum, self._handle)
 
     def stop(self) -> None:
@@ -446,7 +516,9 @@ class _SignalGuard:
         if not self._installed:
             return
         self._stopping = True
-        signal.setitimer(signal.ITIMER_REAL, 0)
+        if ALARM_SIGNALS:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        self._cancel_timer()
         for signum, handler in self._previous.items():
             signal.signal(signum, handler)  # type: ignore[arg-type]
         self._installed = False
@@ -454,23 +526,49 @@ class _SignalGuard:
     def alarm(self, seconds: float) -> None:
         """Raise ReviewTimeout after `seconds` (0 cancels). A backstop: reviewers also
         watch their deadline."""
-        if self._installed:
+        if not self._installed:
+            return
+        if ALARM_SIGNALS:
             signal.setitimer(signal.ITIMER_REAL, seconds)
+            return
+        self._cancel_timer()
+        if seconds > 0:
+            self._timer = threading.Timer(seconds, self._ring)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _ring(self) -> None:
+        """The timer thread's alarm. raise() runs Python's C-level handler, which also
+        wakes a main thread that is sleeping or waiting (on Windows, only for SIGINT)."""
+        if self._stopping:
+            return
+        self._alarm_due = True
+        signal.raise_signal(signal.SIGINT)
+
+    def _cancel_timer(self) -> None:
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+            if timer is not threading.current_thread():
+                timer.join()
 
     def _handle(self, signum: int, frame: FrameType | None) -> None:
         if self._stopping:
             return
-        exc: BaseException = (
-            ReviewTimeout("the review timed out")
-            if signum == signal.SIGALRM
-            else Interrupted(signum)
-        )
+        alarm = signum in ALARM_SIGNALS or (signum == signal.SIGINT and self._alarm_due)
+        exc: BaseException = ReviewTimeout("the review timed out") if alarm else Interrupted(signum)
         if self._depth:
             if self._pending is None:
                 self._pending = exc
             return
         self._stopping = True  # before raising: no later signal may interrupt clean-up
-        raise exc
+        try:
+            raise exc
+        finally:
+            # A local holding the exception, whose traceback holds this frame, is a
+            # reference cycle: everything the traceback reaches (a Tk window, for one)
+            # would wait for the garbage collector, which may run in another thread.
+            del exc
 
     @contextlib.contextmanager
     def critical(self) -> Iterator[None]:
@@ -483,18 +581,56 @@ class _SignalGuard:
                 exc, self._pending = self._pending, None
                 if not self._stopping:
                     self._stopping = True
-                    raise exc
+                    try:
+                        raise exc
+                    finally:
+                        del exc  # no reference cycle through this frame (see _handle)
 
 
 def _lock(path: str | Path) -> int | None:
     """An open descriptor holding an exclusive lock on the directory, or None if another
     process holds it (or it cannot be opened as a directory)."""
+    if WINDOWS:
+        return _lock_windows(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _is_link_like(st: os.stat_result) -> bool:
+    """A symlink, or on Windows any reparse point (a junction, for one)."""
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & reparse)
+
+
+def lock_file(path: str | Path) -> Path:
+    """The Windows lock file of the review directory `path`: `.<name>.lock` next to it.
+    The leading dot keeps it out of `wearreport-spotcheck-*`."""
+    path = Path(path)
+    return path.parent / f".{path.name}{LOCK_SUFFIX}"
+
+
+def _lock_windows(path: str | Path) -> int | None:
+    """Windows cannot open or flock a directory: lock the first byte of the directory's
+    lock file (`lock_file`) with msvcrt.locking instead. The lock goes when the descriptor
+    is closed or the process ends, however it ends."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or _is_link_like(st):
+            return None
+        fd = os.open(lock_file(path), os.O_RDWR | os.O_CREAT | CREATE_FLAGS, 0o600)
+    except OSError:
+        return None
+    try:
+        if sys.platform == "win32":  # always, here; the test is for the type checker
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
     except OSError:
         os.close(fd)
         return None
@@ -533,7 +669,7 @@ class ReviewDirectory:
         ok, encoded = cv2.imencode(IMAGE_SUFFIX, item.image)
         if not ok:
             raise SpotcheckError("cannot encode a review image")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | CREATE_FLAGS
         fd = os.open(self.path / item.file, flags, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(encoded.tobytes())
@@ -568,11 +704,23 @@ class ReviewDirectory:
                     file=sys.stderr,
                     flush=True,
                 )
+        self._unlock()
+        return gone
+
+    def _unlock(self) -> None:
         if self._fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self._fd)
             self._fd = None
-        return gone
+            if WINDOWS and self.path is not None:
+                _remove_lock_file(self.path)
+
+
+def _remove_lock_file(path: Path) -> None:
+    """Delete the Windows lock file of the review directory `path`, if no process holds it
+    open (an open file cannot be deleted there). Never raises."""
+    with contextlib.suppress(OSError):
+        os.unlink(lock_file(path))
 
 
 def remove_stale(
@@ -593,14 +741,18 @@ def remove_stale(
         if not entry.name.startswith(TEMP_PREFIX):
             continue
         try:
-            st = entry.stat(follow_symlinks=False)
+            # Windows' DirEntry.stat() reports st_ino as 0: ask os.lstat there.
+            st = os.lstat(entry.path) if WINDOWS else entry.stat(follow_symlinks=False)
         except OSError:
             continue
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        if not stat.S_ISDIR(st.st_mode) or not _owned(st):
             continue
         if now - st.st_mtime <= max_age_s:
             continue
         with guard.critical() if guard is not None else contextlib.nullcontext():
+            if WINDOWS:
+                removed += _remove_stale_windows(Path(entry.path), st)
+                continue
             fd = _lock(entry.path)
             if fd is None:
                 continue  # a running instance holds it
@@ -609,6 +761,31 @@ def remove_stale(
                     removed += 1
             finally:
                 os.close(fd)
+    return removed
+
+
+def _owned(st: os.stat_result) -> bool:
+    """True for this user's entry. Windows reports no owner in st_uid, but its temporary
+    directory is per user; there, links and junctions are left alone instead."""
+    if WINDOWS:
+        return not _is_link_like(st)
+    return st.st_uid == os.getuid()
+
+
+def _remove_stale_windows(path: Path, st: os.stat_result) -> int:
+    """1 if the unlocked directory `path`, still the one `st` describes, was deleted. Its
+    lock file goes with it."""
+    fd = _lock(path)
+    if fd is None:
+        return 0  # a running instance holds it
+    try:
+        same = os.lstat(path).st_ino == st.st_ino
+        removed = 1 if same and _rmtree(path) else 0
+    except OSError:
+        removed = 0
+    finally:
+        os.close(fd)
+    _remove_lock_file(path)
     return removed
 
 
@@ -809,6 +986,8 @@ class _LineReader:
         self.buffer = b""
         self.eof = False
         self.too_long = False
+        self._kind: str | None = None  # Windows: "pipe", "file" or "console"
+        self._chunks: queue.Queue[bytes] | None = None  # Windows consoles: filled by a thread
 
     def readline(self, deadline: float) -> str:
         while b"\n" not in self.buffer:
@@ -820,10 +999,9 @@ class _LineReader:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ReviewTimeout("the review timed out")
-            ready, _, _ = select.select([self.fd], [], [], remaining)
-            if not ready:
+            chunk = self._read_chunk(remaining)
+            if chunk is None:
                 continue
-            chunk = os.read(self.fd, 4096)
             if not chunk:
                 self.eof = True
                 continue
@@ -835,6 +1013,68 @@ class _LineReader:
             self.too_long = False
             raise JudgementError(f"the line is longer than {MAX_LINE_BYTES} bytes")
         return line.decode("utf-8", errors="replace").strip()
+
+    def _read_chunk(self, remaining: float) -> bytes | None:
+        """Up to 4096 bytes (b"" at end of input), or None if none came in `remaining`."""
+        if not WINDOWS:
+            ready, _, _ = select.select([self.fd], [], [], remaining)
+            return os.read(self.fd, 4096) if ready else None
+        # Windows cannot select() on a pipe or a console. A pipe is polled for waiting
+        # bytes, so no read ever blocks (a blocked read would hold the descriptor, and a
+        # close of it would wait for that read). A console, which the tool never closes,
+        # is read by a thread. Waits are cut into short slices, so that signals are
+        # handled between them.
+        if self._kind is None:
+            self._kind = _input_kind(self.fd)
+        if self._kind == "file":
+            return os.read(self.fd, 4096)
+        if self._kind == "pipe":
+            end = time.monotonic() + min(remaining, 0.1)
+            while True:
+                waiting = _pipe_waiting(self.fd)
+                if waiting is None:
+                    return b""  # the writer closed it
+                if waiting:
+                    return os.read(self.fd, min(waiting, 4096))
+                if time.monotonic() >= end:
+                    return None
+                time.sleep(0.02)
+        if self._chunks is None:
+            self._chunks = queue.Queue()
+            threading.Thread(target=self._pump, args=(self._chunks,), daemon=True).start()
+        try:
+            return self._chunks.get(timeout=min(remaining, 0.1))
+        except queue.Empty:
+            return None
+
+    def _pump(self, chunks: queue.Queue[bytes]) -> None:
+        while True:
+            try:
+                chunk = os.read(self.fd, 4096)
+            except OSError:
+                chunk = b""
+            chunks.put(chunk)
+            if not chunk:
+                return
+
+
+def _input_kind(fd: int) -> str:
+    """Windows: what the descriptor reads from ("pipe", "file" or "console")."""
+    if sys.platform == "win32":
+        kind = _kernel32.GetFileType(msvcrt.get_osfhandle(fd))
+        return {1: "file", 3: "pipe"}.get(kind, "console")  # FILE_TYPE_DISK, FILE_TYPE_PIPE
+    return "file"
+
+
+def _pipe_waiting(fd: int) -> int | None:
+    """Windows: bytes waiting in the pipe, or None once the writer has closed it."""
+    if sys.platform == "win32":
+        waiting = wintypes.DWORD()
+        handle = msvcrt.get_osfhandle(fd)
+        if not _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(waiting), None):
+            return None  # ERROR_BROKEN_PIPE, or the pipe is unusable: its end either way
+        return int(waiting.value)
+    return None
 
 
 class KeyboardReviewer:
@@ -920,6 +1160,197 @@ class JsonFileReviewer:
             return None
         except OSError as exc:
             raise JudgementError(f"cannot read the file: {exc.strerror}") from None
+
+
+def window_scale(height: int, width: int) -> int:
+    """The whole factor the window enlarges a `height` x `width` crop by: up to about
+    WINDOW_TARGET_HEIGHT tall, at most WINDOW_MAX_WIDTH wide and MAX_WINDOW_SCALE times."""
+    by_height = WINDOW_TARGET_HEIGHT // max(1, height)
+    by_width = WINDOW_MAX_WIDTH // max(1, width)
+    return max(1, min(MAX_WINDOW_SCALE, by_height, by_width))
+
+
+def _png_data(image: Frame, scale: int) -> str:
+    """`image` enlarged `scale` times and encoded as PNG in memory, in base64 for Tk."""
+    if scale > 1:
+        height, width = image.shape[:2]
+        size = (width * scale, height * scale)
+        image = np.asarray(cv2.resize(image, size, interpolation=cv2.INTER_NEAREST), np.uint8)
+    ok, encoded = cv2.imencode(IMAGE_SUFFIX, image)
+    if not ok:
+        raise SpotcheckError("cannot encode a review image")
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+def _import_tkinter() -> ModuleType:
+    try:
+        import tkinter
+    except ImportError:
+        raise SpotcheckError(
+            "--view window needs tkinter, which this Python lacks; use --view files"
+        ) from None
+    return tkinter
+
+
+class WindowReviewer:
+    """Shows each crop in one tkinter window, straight from memory, and records one key
+    per crop: Enter or Space a pedestrian, `n` not a person, `v` a person in a vehicle,
+    Backspace back one crop, `q` or closing the window stop. Crops mode only.
+
+    Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
+    as data. `driver`, if given, is called with the window once it shows the first crop
+    (tests use it to send key events). With `guard`, the window's teardown is a critical
+    step: a signal that lands during it waits until it is done."""
+
+    def __init__(
+        self,
+        driver: Callable[[tkinter.Tk], object] | None = None,
+        guard: _SignalGuard | None = None,
+    ) -> None:
+        self.driver = driver
+        self.guard = guard
+
+    def judge(
+        self, items: Sequence[ReviewItem], mode: Mode, deadline: float
+    ) -> Mapping[int, Judgement]:
+        if mode != "crops":
+            raise SpotcheckError(WINDOW_FRAMES_REFUSAL)
+        if not items:
+            return {}  # nothing to show: no window, and no need for tkinter
+        tk = _import_tkinter()
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            raise SpotcheckError(f"cannot open the review window: {exc}") from None
+        window: _ReviewWindow | None = None
+        try:
+            window = _ReviewWindow(tk, root, items, deadline)
+            return window.run(self.driver)
+        finally:
+            # Critical: a signal raised part-way would skip the rest and leave a cycle.
+            with self.guard.critical() if self.guard is not None else contextlib.nullcontext():
+                if window is not None:
+                    window.close()  # deletes the image now: Tk calls stay in this thread
+                with contextlib.suppress(AttributeError):
+                    del root.report_callback_exception  # the root's reference to the window
+                with contextlib.suppress(tk.TclError):
+                    # Cancel what is still scheduled, or Tcl runs it after the window is gone.
+                    for pending in root.tk.splitlist(root.tk.call("after", "info")):
+                        root.after_cancel(pending)
+                    root.destroy()
+                # Tcl objects must be freed in this thread. Left in a reference cycle, they
+                # would be freed by whichever thread next runs the garbage collector (a
+                # fetch thread, say), and Tcl aborts the process when that is not this one.
+                del window, root
+                gc.collect()
+
+
+class _ReviewWindow:
+    """One review in one window: the state behind WindowReviewer.judge."""
+
+    def __init__(
+        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+    ) -> None:
+        self.tk, self.root, self.items, self.deadline = tk, root, list(items), deadline
+        self.index = 0
+        self.judgements: dict[int, Judgement] = {}
+        self.outcome: BaseException | None = None
+        self.done = False
+        self.photo: tkinter.PhotoImage | None = None
+        root.title(WINDOW_TITLE)
+        root.protocol("WM_DELETE_WINDOW", self._stop)
+        # An exception in a callback (a signal's, too) ends the review instead of being
+        # printed and forgotten by tkinter.
+        root.report_callback_exception = self._callback_failed
+        self.header = tk.Label(root, font=("TkDefaultFont", 14))
+        self.header.pack(padx=8, pady=(8, 4))
+        self.picture = tk.Label(root)
+        self.picture.pack(padx=8)
+        self.legend = tk.Label(root, text=WINDOW_LEGEND)
+        self.legend.pack(padx=8, pady=(4, 8))
+        answers = {"Return": "", "KP_Enter": "", "space": "", "n": "n", "N": "n"}
+        answers |= {"v": "v", "V": "v"}
+        for key, line in answers.items():
+            root.bind(f"<KeyPress-{key}>", self._on_answer(line))
+        root.bind("<KeyPress-BackSpace>", lambda _event: self._back())
+        for key in ("q", "Q"):
+            root.bind(f"<KeyPress-{key}>", lambda _event: self._stop())
+
+    def run(self, driver: Callable[[tkinter.Tk], object] | None) -> dict[int, Judgement]:
+        if not self.items:
+            return {}
+        remaining_ms = math.ceil(max(0.0, self.deadline - time.monotonic()) * 1000)
+        self.root.after(remaining_ms, self._timeout)
+        self.root.after(WINDOW_TICK_MS, self._tick)
+        self._show()
+        self.root.lift()
+        self.root.focus_force()
+        if driver is not None:
+            driver(self.root)
+        self.root.mainloop()  # a signal's exception can also end it, and propagates
+        if self.outcome is not None:
+            raise self.outcome
+        if not self.done:
+            raise ReviewAborted("the review window was closed")
+        return self.judgements
+
+    def _show(self) -> None:
+        item = self.items[self.index]
+        height, width = item.image.shape[:2]
+        data = _png_data(item.image, window_scale(height, width))
+        self.photo = self.tk.PhotoImage(master=self.root, data=data, format="png")
+        self.picture.configure(image=self.photo)
+        self.header.configure(
+            text=f"Image {item.number} ({_describe(item)}): {self.index + 1} of {len(self.items)}"
+        )
+
+    def _on_answer(self, line: str) -> Callable[[object], None]:
+        return lambda _event: self._answer(line)
+
+    def _answer(self, line: str) -> None:
+        if self.done or self.outcome is not None:
+            return
+        item = self.items[self.index]
+        self.judgements[item.number] = parse_line(line, item, "crops")
+        self.index += 1
+        if self.index == len(self.items):
+            self.done = True
+            self.root.quit()
+        else:
+            self._show()
+
+    def _back(self) -> None:
+        if self.done or self.outcome is not None or self.index == 0:
+            return
+        self.index -= 1
+        self.judgements.pop(self.items[self.index].number, None)
+        self._show()
+
+    def _finish(self, outcome: BaseException) -> None:
+        if not self.done and self.outcome is None:
+            self.outcome = outcome
+        self.root.quit()
+
+    def _stop(self) -> None:
+        self._finish(ReviewAborted("the reviewer stopped the review"))
+
+    def _timeout(self) -> None:
+        self._finish(ReviewTimeout("the review timed out"))
+
+    def _tick(self) -> None:
+        if time.monotonic() >= self.deadline + WINDOW_DEADLINE_GRACE_S:
+            self._timeout()  # the timeout callback never ran: end the review regardless
+            return
+        self.root.after(WINDOW_TICK_MS, self._tick)
+
+    def _callback_failed(self, kind: object, value: BaseException, tb: object) -> None:
+        self._finish(value)
+
+    def close(self) -> None:
+        """Drop the image, and the outcome (whose traceback can lead back here), so that
+        no reference cycle keeps a Tcl object alive once the review is over."""
+        self.photo = None
+        self.outcome = None
 
 
 # Statistics ---------------------------------------------------------------------------
@@ -1052,6 +1483,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--reviewer", type=_reviewer_name, default=DEFAULT_REVIEWER)
     ap.add_argument("--model", choices=sorted(detect.MODEL_SHA256), default=DEFAULT_MODEL)
     ap.add_argument(
+        "--view",
+        choices=VIEWS,
+        default=None,
+        help="files: images in a temporary directory; window: crops in a window, nothing "
+        "written (default: window on Windows in crops mode without --judgements, else files)",
+    )
+    ap.add_argument(
         "--judgements",
         default=None,
         help="read judgements from this JSON file (must not exist yet) instead of the keyboard",
@@ -1068,6 +1506,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="sweep a local fake camera server serving the fixture photos (no network)",
     )
     return ap
+
+
+WINDOW_FRAMES_REFUSAL = "--view window shows crops only; frames mode needs --view files"
+
+
+def default_view(platform: str = sys.platform) -> View:
+    """The view used when none is given: the window on Windows, files elsewhere."""
+    return "window" if platform == "win32" else "files"
+
+
+def resolve_view(
+    view: View | None, mode: Mode, judgements: str | None, platform: str = sys.platform
+) -> View:
+    """The view to use. Frames and a judgements file need the files view: without
+    `--view`, they get it; with `--view window`, they are refused (SpotcheckError)."""
+    if view is None:
+        return "files" if mode == "frames" or judgements is not None else default_view(platform)
+    if view == "window" and mode == "frames":
+        raise SpotcheckError(WINDOW_FRAMES_REFUSAL)
+    if view == "window" and judgements is not None:
+        raise SpotcheckError("--view window takes its judgements from keys; drop --judgements")
+    return view
 
 
 def _ci_variables() -> list[str]:
@@ -1122,14 +1582,39 @@ def _print_numbering(workdir: Path, items: Sequence[ReviewItem]) -> None:
     print(f"The numbering and a judgements template are in {NUMBERING_FILE} there.", flush=True)
 
 
-def _review(
+def _collect(
     items: Sequence[ReviewItem],
     mode: Mode,
     reviewer: Reviewer,
     timeout_s: float,
     guard: _SignalGuard,
 ) -> dict[int, Judgement]:
-    """Render to the review directory, collect the judgements, delete the directory."""
+    """Ask the reviewer, under the review timeout, and check what comes back."""
+    deadline = time.monotonic() + timeout_s
+    guard.alarm(timeout_s)
+    try:
+        judgements = reviewer.judge(items, mode, deadline)
+    finally:
+        guard.alarm(0)
+    try:
+        return validate_all(judgements, items, mode)
+    except JudgementError as exc:
+        raise SpotcheckError(f"the reviewer returned an invalid judgement: {exc}") from None
+
+
+def _review(
+    items: Sequence[ReviewItem],
+    mode: Mode,
+    reviewer: Reviewer,
+    timeout_s: float,
+    guard: _SignalGuard,
+    view: View = "files",
+) -> dict[int, Judgement]:
+    """Render to the review directory, collect the judgements, delete the directory. The
+    window view writes nothing: the reviewer is given the images in memory."""
+    if view == "window":
+        print(f"Review window open: {len(items)} crop(s). {WINDOW_LEGEND}", flush=True)
+        return _collect(items, mode, reviewer, timeout_s, guard)
     directory = ReviewDirectory()
     try:
         try:
@@ -1142,16 +1627,7 @@ def _review(
             reason = exc.strerror or type(exc).__name__
             raise SpotcheckError(f"cannot write the review directory: {reason}") from None
         _print_numbering(workdir, items)
-        deadline = time.monotonic() + timeout_s
-        guard.alarm(timeout_s)
-        try:
-            judgements = reviewer.judge(items, mode, deadline)
-        finally:
-            guard.alarm(0)
-        try:
-            return validate_all(judgements, items, mode)
-        except JudgementError as exc:
-            raise SpotcheckError(f"the reviewer returned an invalid judgement: {exc}") from None
+        return _collect(items, mode, reviewer, timeout_s, guard)
     finally:
         # A signal can land before critical() has begun. The guard raises only the
         # first one, so the second attempt cannot be interrupted.
@@ -1172,6 +1648,7 @@ def _run(
     guard: _SignalGuard,
 ) -> int:
     mode: Mode = args.mode
+    view = resolve_view(args.view, mode, args.judgements)
     _check_temp_dir(Path(tempfile.gettempdir()))
     out_dir = Path(args.out_dir)
     if args.dry_run and _is_real_spotchecks(out_dir):
@@ -1183,6 +1660,8 @@ def _run(
             if os.path.lexists(path):
                 raise SpotcheckError(f"{path} already exists; remove it, then start again")
             reviewer = JsonFileReviewer(path)
+        elif view == "window":
+            reviewer = WindowReviewer(guard=guard)
         else:
             reviewer = KeyboardReviewer(sys.stdin.fileno())
     removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
@@ -1199,7 +1678,7 @@ def _run(
     frames_reviewed = len(samples)
     items = render(samples, mode)
     del samples  # the frames are not needed any more
-    judgements = _review(items, mode, reviewer, args.timeout, guard) if items else {}
+    judgements = _review(items, mode, reviewer, args.timeout, guard, view) if items else {}
     stats = compute_stats(
         items,
         judgements,

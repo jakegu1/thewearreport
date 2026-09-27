@@ -1,0 +1,59 @@
+name: windows
+
+# The spot-check on native Windows (T-037). Kept out of ci.yml, whose jobs all run on
+# ubuntu-24.04. Read-only, no secrets.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    # The spot-check on native Windows (T-037): its unit and acceptance tests, the
+    # window reviewer driven by synthetic key events, and a dry run through the window.
+    # The T-008 acceptance tests describe the Unix files view and run on Linux only.
+    # llama-cpp-python has no Windows wheel, and the spot-check never imports it.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # Model- and Tk-dependent tests fail, instead of skipping, when either is missing.
+      WEARREPORT_REQUIRE_MODEL: "1"
+      WEARREPORT_REQUIRE_TK: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+      - name: Install dependencies (without llama-cpp-python)
+        run: uv sync --locked --no-install-package llama-cpp-python
+      - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
+      - name: Spot-check unit and acceptance tests
+        # --capture=sys: pytest's default capture swaps the process's standard handles
+        # for every test and closes them after it. Tcl keeps the standard channels it
+        # made from those handles for the life of the process, so once a handle is
+        # reused Tk fails at random to read its own library ("Can't find a usable
+        # init.tcl"). The tool itself never swaps them.
+        run: >-
+          uv run --no-sync pytest -v -rs --capture=sys
+          engine/tests/unit/test_spotcheck.py
+          engine/tests/unit/test_spotcheck_window.py
+          engine/tests/acceptance/test_t_037.py
+      - name: Dry-run spot-check through the window reviewer
+        run: >-
+          uv run --no-sync pytest -v -s
+          "engine/tests/acceptance/test_t_037.py::test_ac5_dry_run_with_the_window_reviewer_writes_statistics_and_no_image"
