@@ -4,7 +4,8 @@ A spot-check measures how often the detector's person boxes are right on the rea
 cameras, without keeping any image. The tool samples live frames, shows the detections to
 a reviewer, either in a window straight from memory or through a temporary directory that
 it always deletes, and keeps only the tallies. This directory holds one small JSON file of
-statistics per check.
+statistics per check and, in `boxes/`, one per-box file per check run with
+`--record-boxes`: each box's height and label, and nothing else about it.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
@@ -12,7 +13,7 @@ Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
 ```bash
 sh scripts/fetch_model.sh --with-m     # YOLOX-m is the default model
-uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
+uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxes
 ```
 
 | Option | Default | Meaning |
@@ -30,9 +31,13 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
 | `--dry-run` | off | sweep a local fake camera server serving the fixture photos (no network) |
 | `--judge NAME` | none | after the review, send the same crops to this DeepInfra model (see below; crops mode only) |
 | `--judge-max-requests N` | required with `--judge` | the most requests the judge may make, retries included (1 to 10000) |
+| `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
+While it does, it prints progress to stderr: the number of cameras listed, then
+`fetched k of N` and `detected k of N` at least every 100 frames, and a line just before
+the review opens. These lines hold counts only, never a camera id or image data.
 
 On Windows, see [the install notes](../README.md#windows-spot-check-only) first.
 
@@ -48,6 +53,7 @@ directory is created anywhere. One key per crop:
 | `Enter` or `Space` | the box is a pedestrian |
 | `n` | the box is not a person |
 | `v` | the box is a person inside a vehicle |
+| `u` | cannot tell what the box is (left out of the statistics) |
 | `Backspace` | go back one crop, to change it |
 | `q`, or closing the window | stop without writing statistics |
 
@@ -84,12 +90,13 @@ Without `--judgements`, the tool asks for one line per image:
 |---|---|
 | `n<box>` | box is not a person |
 | `v<box>` | box is a person inside a vehicle |
+| `u<box>` | cannot tell what the box is (left out of the statistics) |
 | `m<count>` | people visible in the frame without a box (frames mode only) |
-| bare `n` or `v` | this crop's box (crops mode only) |
+| bare `n`, `v` or `u` | this crop's box (crops mode only) |
 | empty line | every box is a pedestrian, nobody missed |
 | `q` | stop without writing statistics |
 
-Tokens are separated by spaces or commas, for example `n3 v5 m1`. An invalid line is
+Tokens are separated by spaces or commas, for example `n3 v5 u6 m1`. An invalid line is
 rejected with a message and asked again.
 
 #### Judging with a JSON file
@@ -99,13 +106,13 @@ for `PATH` until the timeout. Write one entry per image, keyed by image number:
 
 ```json
 {
-  "1": {"not_person": [2], "in_vehicle": [3], "missed": 1},
-  "2": {"not_person": [], "in_vehicle": [], "missed": 0}
+  "1": {"not_person": [2], "in_vehicle": [3], "unsure": [4], "missed": 1},
+  "2": {"not_person": [], "in_vehicle": [], "unsure": [], "missed": 0}
 }
 ```
 
-`not_person` and `in_vehicle` list box numbers on that image (default: none; a box cannot
-be in both). `missed` is required in frames mode and not allowed in crops mode. A key may
+`not_person`, `in_vehicle` and `unsure` (cannot tell) list box numbers on that image
+(default: none; a box can be in only one of them). `missed` is required in frames mode and not allowed in crops mode. A key may
 appear only once in each object. An invalid file is rejected with a message; fix it and save it again. The file holds only numbers
 and is left in place.
 
@@ -121,7 +128,7 @@ DEEPINFRA_API_KEY=... uv run python -m wearreport.tools.spotcheck --n 20 --revie
 
 `NAME` must be a model of `judge_hosted.DEEPINFRA`. The review runs as usual, with either
 view. Only once the reviewer has finished and the judgements are valid does the tool send
-the crops, one per request, to `https://api.deepinfra.com` (no other endpoint is
+the crops, one per request, except those the reviewer marked `u` (cannot tell), to `https://api.deepinfra.com` (no other endpoint is
 accepted): each crop is the array the reviewer was shown, encoded to PNG in memory. The
 judge never sees a whole frame, a file of the review directory (deleted by then) or the
 reviewer's answers. The prompt and the parsing of the answer are those of the judge
@@ -157,7 +164,7 @@ when the check ran with `--judge` (files without it stay valid):
 | `reviewer` | string | the `--reviewer` name |
 | `mode` | string | `crops` or `frames` |
 | `frames_reviewed` | integer | frames sampled and shown |
-| `boxes_shown` | integer | person boxes shown |
+| `boxes_shown` | integer | person boxes shown and judged (unsure boxes left out) |
 | `boxes_not_person` | integer | boxes judged not a person |
 | `boxes_in_vehicle` | integer | boxes judged a person inside a vehicle |
 | `persons_missed` | integer or null | people without a box; `null` in crops mode |
@@ -167,7 +174,11 @@ when the check ran with `--judge` (files without it stay valid):
 | `detector` | object | `{"model", "sha256", "conf"}`: the model name, its pinned SHA-256 and the confidence threshold |
 | `judge` | object | with `--judge` only: the reviewer x judge agreement, below |
 
-Ratios are rounded to 4 decimal places, and are `null` when their denominator is 0 (no
+A box the reviewer marked unsure (`u`, cannot tell) is left out of every count here, and
+so of every ratio: it is in none of `boxes_shown`, `boxes_not_person` and
+`boxes_in_vehicle`. With `--record-boxes` it is counted in the per-box file (below);
+without it, it is recorded nowhere. Ratios are rounded to 4
+decimal places, and are `null` when their denominator is 0 (no
 boxes shown, or nothing to recall). Recall needs whole frames, so only `frames` mode
 estimates it. The counts are kept so every ratio can be recomputed.
 
@@ -185,7 +196,7 @@ The `judge` block has exactly these fields:
 | `judge_precision` | number or null | the judge's `person` and `in_vehicle` answers over its confident answers (`person`, `in_vehicle`, `not_person`) |
 
 `confusion` has one row per reviewer label, `person` (a pedestrian), `in_vehicle` and
-`not_person` (the reviewer has no unsure answer), and in each row one count per judge
+`not_person` (crops the reviewer marked unsure are not sent to the judge), and in each row one count per judge
 answer: `person`, `in_vehicle`, `not_person` and `unsure`. `judge_precision` is the
 reviewer's `precision_person` computed from the judge's answers instead, with its unsure
 answers left out; it is `null` when the judge gave no confident answer. When `status` is
@@ -193,6 +204,68 @@ answers left out; it is `null` when the judge gave no confident answer. When `st
 
 A `--dry-run` check describes the fixture photos, not the cameras, so it needs an
 `--out-dir` other than `spotchecks/`. Never commit its output here.
+
+## Per-box file
+
+With `--record-boxes` (crops mode only), next to each statistics file
+`<out-dir>/<name>.json` the tool writes `<out-dir>/boxes/<name>.json`, with the same
+name: the name is the first one free in both places, and neither file is ever
+overwritten. It is one line of JSON with exactly these fields:
+
+| Field | Type | Value |
+|---|---|---|
+| `date` | string | the date of the check, as in the statistics file |
+| `started_at` | string | when the sweep began, UTC, to the minute: `YYYY-MM-DDTHH:MMZ` |
+| `light` | string | `day`, `twilight` or `dark` over central London at `started_at` |
+| `frames` | integer | frames reviewed (each from a different camera) |
+| `detector` | object | as in the statistics file |
+| `boxes` | array | one `[height_px, label]` per box shown, sorted |
+
+`height_px` is the box height in source-frame pixels, rounded to a whole number. `label`
+is `person` (a pedestrian), `in_vehicle`, `not_person` or `unsure`. There is no box
+position or width, no camera id, no frame index and no image, and the sorted order says
+nothing about which frame a box came from.
+
+`light` comes from the sun's elevation at `started_at` over 51.5074 N, 0.1278 W (NOAA's
+solar position formulae, the sun's centre, without refraction): `day` at 0° or above,
+`twilight` (civil) from -6° up to 0°, `dark` below -6°. The formula agrees with the US Naval
+Observatory's published sunrise, sunset and civil twilight times for London to within two
+minutes.
+
+## Near-field threshold
+
+```bash
+uv run python -m wearreport.tools.spotcheck_summary --heights [--dir spotchecks] [--data-dir PATH]
+```
+
+reads every per-box file in `<dir>/boxes/` (counts and heights only; no network) and
+chooses the smallest box height worth counting. A malformed file is an error that names
+it (exit 1). Boxes marked `unsure` are left out of every precision and reported as a
+count. Precision is the boxes labelled `person` or `in_vehicle` over the judged ones
+(`person`, `in_vehicle`, `not_person`), with a Wilson 95% interval. It prints:
+
+- for each candidate height H, every distinct height in the files, smallest first: the
+  judged boxes at least H pixels tall, their precision and interval, and the share of all
+  judged person boxes (`person` or `in_vehicle`) they keep;
+- the threshold: the smallest H whose boxes have a precision of at least
+  `TARGET_PRECISION` (0.90) and a Wilson lower bound of at least `MIN_LOWER_BOUND` (0.85),
+  over at least `MIN_BOXES_ABOVE` (100) judged boxes; or `none`;
+- at the threshold (over all boxes when there is none), the precision, n and interval per
+  `light`, and with `--data-dir` per rain condition;
+- a coverage line: sessions, dates, judged boxes, judged boxes per light and per rain
+  condition, and `baseline complete: yes` only with at least `BASELINE_BOXES` (300)
+  judged boxes, 3 sessions on at least 2 dates, and at least `MIN_CONDITION_BOXES` (50)
+  judged boxes each in `day`, `twilight` and `rain` light or weather; otherwise `no` and
+  what is missing. `dark` is reported but not required.
+
+`--data-dir` is a checkout of the data branch. A session is `rain` when the published
+sweep record nearest its `started_at`, within 30 minutes, has `weather.precip_mm` above 0,
+`dry` when that is 0, and `unknown` otherwise (no record that close, or one without
+weather). Without `--data-dir` every session is `unknown`. Only the records within 30
+minutes of a session are read; a malformed one is an error that names it.
+
+Without `--heights` the summary per week below is exactly as before, and the `boxes/`
+directory is not read.
 
 ## Summary per week
 
@@ -220,8 +293,9 @@ estimate are both within 3 points of the reviewer's precision.
 ## Privacy and cleanup
 
 With `--view window`, rendered images exist only in memory and in the window, and
-nothing is written except the statistics file. With `--judge`, the crops also go, in
-memory, to the DeepInfra API (and nowhere else), after the review.
+nothing is written except the statistics file (and, with `--record-boxes`, its per-box
+file). With `--judge`, the crops also go, in memory, to the DeepInfra API (and nowhere
+else), after the review.
 
 With `--view files`, rendered images exist only in the temporary directory, and the tool
 deletes it when it exits: after a normal run, an error, the review timeout, or any
@@ -230,7 +304,7 @@ SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, S
 SIGSTKFLT and the real-time signals, where the platform has them; on Windows, only
 Ctrl-C and Ctrl-Break (SIGBREAK) in the tool's console. Repeated signals (Ctrl-C twice,
 or a closing terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else
-is written except the statistics file.
+is written except the statistics file (and, with `--record-boxes`, its per-box file).
 
 **SIGKILL cannot be handled** (nor can a power cut, or a crash with SIGSEGV, SIGBUS or
 another fault signal). **On Windows, cleanup cannot run** when the process is ended from
