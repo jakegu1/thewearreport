@@ -86,7 +86,8 @@ function Get-Model([string]$Name, [string]$Sha256) {
         Write-Output "fetch_model: $Name present and verified"
         return
     }
-    New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    # New-Item has no -LiteralPath; this takes $Dest (already a full path) literally.
+    [System.IO.Directory]::CreateDirectory($Dest) | Out-Null
     $letters = 'abcdefghijklmnopqrstuvwxyz0123456789'
     $suffix = -join (1..6 | ForEach-Object { $letters[(Get-Random -Maximum $letters.Length)] })
     $part = Join-Path $Dest ".$Name.$suffix"
