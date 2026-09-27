@@ -787,14 +787,23 @@ def test_write_image_needs_a_directory() -> None:
 def test_keyboard_reviewer_over_a_pipe() -> None:
     read_fd, write_fd = os.pipe()
     out = io.StringIO()
+    data = b"x\nn9\n" + b"n" * (spotcheck.MAX_LINE_BYTES + 10) + b"\nn1 m2\nv4\n\n"
+
+    def write() -> None:  # from a thread: the input is larger than a Windows pipe buffer
+        try:
+            os.write(write_fd, data)
+        finally:
+            os.close(write_fd)
+
+    writer = threading.Thread(target=write)
+    writer.start()
     try:
-        os.write(write_fd, b"x\nn9\n" + b"n" * (spotcheck.MAX_LINE_BYTES + 10) + b"\nn1 m2\nv4\n\n")
-        os.close(write_fd)
         got = spotcheck.KeyboardReviewer(read_fd, out).judge(
             _items("frames"), "frames", time.monotonic() + 10
         )
     finally:
-        os.close(read_fd)
+        os.close(read_fd)  # first: a writer still blocked on a full pipe then fails
+        writer.join()
     assert got == {
         1: spotcheck.Judgement(frozenset({1}), frozenset(), 2),
         2: spotcheck.Judgement(frozenset(), frozenset({4}), 0),
