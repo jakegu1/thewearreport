@@ -54,9 +54,11 @@ default. Parses every Python file under engine/ (except engine/tests/) and flags
      through its package, also when the package itself was imported relatively); any
      string or bytes constant that contains its file stem, case-insensitively, wherever
      it appears (a call argument, a subscript such as sys.modules[...], a list item, a
-     path segment); and the dynamic loaders (DYNAMIC_LOADERS and runpy.*: import_module,
-     __import__, spec_from_file_location, exec, compile...) called with any argument
-     that is not a literal, since the module they load cannot then be seen
+     path segment), except the words STEM_WORDS_ALLOWED gives one file (the summary
+     module next to the exempt one may name itself and the statistics directory); and
+     the dynamic loaders (DYNAMIC_LOADERS and runpy.*: import_module, __import__,
+     spec_from_file_location, exec, compile...) called with any argument that is not a
+     literal, since the module they load cannot then be seen
 
 Image-write exemption: the spot-check tool (AGENTS.md INV-1 exception (c)) renders
 detections into a temporary directory it creates and always deletes. Its repository-
@@ -226,6 +228,18 @@ def _package_path(path: str) -> tuple[str, ...] | None:
 # Rule 10: the exempt module's dotted name, and the file stem that a string may not hold.
 EXEMPT_MODULE = ".".join(_package_path(IMAGE_WRITE_EXEMPTION) or ())
 EXEMPT_STEM = PurePosixPath(IMAGE_WRITE_EXEMPTION).stem.lower()
+# Rule 10's one relaxation (T-036): the summary module next to the exempt one, `<stem>_summary`,
+# reads the statistics files the exempt module writes into `<stem>s/` and is run by its own
+# module name. In that file, and no other spelling of it, a string may hold those two
+# words; they are removed before the stem is looked for, so any other string holding the
+# stem is still flagged, and so is every import, attribute access and dynamic load of the
+# exempt module. Both are derived from IMAGE_WRITE_EXEMPTION, the one place that names it.
+STEM_WORDS_ALLOWED: dict[str, tuple[str, ...]] = {
+    IMAGE_WRITE_EXEMPTION.removesuffix(".py") + "_summary.py": (
+        EXEMPT_STEM + "_summary",
+        EXEMPT_STEM + "s",
+    ),
+}
 # Rule 10: callables that load code by a name or path computed at run time. Matched on
 # the last part of the resolved name, so `from importlib import import_module as im` is
 # caught; builtins are matched on their exact name, so re.compile() is not.
@@ -374,6 +388,7 @@ class _Checker:
         self.aliases = _aliases(tree, self.package)
         self.allow_binary = filename in BINARY_WRITE_ALLOWLIST
         self.image_writes = filename == IMAGE_WRITE_EXEMPTION
+        self.stem_words = STEM_WORDS_ALLOWED.get(filename, ())
         self.video_writers = self._video_writer_names(tree)
         self.exempt = self._rule_b_exempt(tree)
 
@@ -618,7 +633,7 @@ class _Checker:
             value = node.value
             if isinstance(value, bytes):
                 value = value.decode("latin-1")
-            if isinstance(value, str) and EXEMPT_STEM in value.lower():
+            if isinstance(value, str) and EXEMPT_STEM in self._without_allowed(value):
                 return message
         elif isinstance(node, ast.Call):
             names = [self.qualname(node.func) or ""]
@@ -632,6 +647,13 @@ class _Checker:
         if any(n == EXEMPT_MODULE or n.startswith(EXEMPT_MODULE + ".") for n in names):
             return message
         return None
+
+    def _without_allowed(self, value: str) -> str:
+        """`value` in lower case, without the words STEM_WORDS_ALLOWED gives this file."""
+        text = value.lower()
+        for word in self.stem_words:
+            text = text.replace(word, "")
+        return text
 
     def is_dynamic_loader(self, func: ast.expr) -> bool:
         qual = self.qualname(func)

@@ -28,6 +28,8 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
 | `--judgements PATH` | none | read judgements from this JSON file instead of the keyboard |
 | `--timeout SECONDS` | 1800 | time allowed for the review |
 | `--dry-run` | off | sweep a local fake camera server serving the fixture photos (no network) |
+| `--judge NAME` | none | after the review, send the same crops to this DeepInfra model (see below; crops mode only) |
+| `--judge-max-requests N` | required with `--judge` | the most requests the judge may make, retries included (1 to 10000) |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -107,10 +109,42 @@ be in both). `missed` is required in frames mode and not allowed in crops mode. 
 appear only once in each object. An invalid file is rejected with a message; fix it and save it again. The file holds only numbers
 and is left in place.
 
+### Pairing with a hosted judge (`--judge`)
+
+No hosted vision model is good enough to replace the reviewer yet. It can, however, judge
+the same crops, so that the reviewer's answers measure its error on real camera crops:
+
+```bash
+DEEPINFRA_API_KEY=... uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME \
+    --judge di-qwen3-vl-235b --judge-max-requests 200
+```
+
+`NAME` must be a model of `judge_hosted.DEEPINFRA`. The review runs as usual, with either
+view. Only once the reviewer has finished and the judgements are valid does the tool send
+the crops, one per request, to `https://api.deepinfra.com` (no other endpoint is
+accepted): each crop is the array the reviewer was shown, encoded to PNG in memory. The
+judge never sees a whole frame, a file of the review directory (deleted by then) or the
+reviewer's answers. The prompt and the parsing of the answer are those of the judge
+bake-off. Nothing about a crop is printed, logged or kept; only the counts go into the
+statistics file.
+
+- `--judge-max-requests N` is required, and at most N requests are made, retries
+  included. Each request has a timeout; throttling and server errors are retried at most
+  three times.
+- The key comes from `DEEPINFRA_API_KEY` only (see `.env.example`) and is sent as
+  `Authorization: Bearer`. Without it, no Authorization header is sent, for an environment
+  that adds the credential itself. The key is never printed, logged or put in an error.
+- A judge failure (the request limit, an HTTP error, a timeout, a malformed reply, Ctrl-C
+  while the judge runs) never loses the review: the statistics are written with the
+  judge's counts so far and `status` `incomplete`.
+- `--judge` is refused with `--mode frames`, and with `--dry-run` unless the judge is a
+  fake server on this machine (the tests' case): a dry run never calls DeepInfra.
+
 ## Statistics file
 
 `<out-dir>/YYYY-MM-DD.json`; if that exists, `YYYY-MM-DD-2.json`, then `-3` and so on.
-An existing file is never overwritten. The file has exactly these fields:
+An existing file is never overwritten. The file has exactly these fields, and `judge`
+when the check ran with `--judge` (files without it stay valid):
 
 | Field | Type | Value |
 |---|---|---|
@@ -126,18 +160,63 @@ An existing file is never overwritten. The file has exactly these fields:
 | `precision_pedestrian` | number or null | 1 − (not_person + in_vehicle) / shown |
 | `recall_estimate` | number or null | (shown − not_person) / (shown − not_person + missed) in frames mode; `null` in crops mode |
 | `detector` | object | `{"model", "sha256", "conf"}`: the model name, its pinned SHA-256 and the confidence threshold |
+| `judge` | object | with `--judge` only: the reviewer x judge agreement, below |
 
 Ratios are rounded to 4 decimal places, and are `null` when their denominator is 0 (no
 boxes shown, or nothing to recall). Recall needs whole frames, so only `frames` mode
 estimates it. The counts are kept so every ratio can be recomputed.
 
+The `judge` block has exactly these fields:
+
+| Field | Type | Value |
+|---|---|---|
+| `model` | string | the `--judge` name, e.g. `di-qwen3-vl-235b` |
+| `provider` | string | `DeepInfra` |
+| `status` | string | `complete` when the judge answered every crop, else `incomplete` |
+| `requests` | integer | requests made, retries included |
+| `input_tokens`, `output_tokens` | integer | tokens reported by the API |
+| `cost_usd` | number | those tokens at the model's published prices (8 decimal places) |
+| `confusion` | object | `{reviewer label: {judge answer: count}}` over the crops the judge answered |
+| `judge_precision` | number or null | the judge's `person` and `in_vehicle` answers over its confident answers (`person`, `in_vehicle`, `not_person`) |
+
+`confusion` has one row per reviewer label, `person` (a pedestrian), `in_vehicle` and
+`not_person` (the reviewer has no unsure answer), and in each row one count per judge
+answer: `person`, `in_vehicle`, `not_person` and `unsure`. `judge_precision` is the
+reviewer's `precision_person` computed from the judge's answers instead, with its unsure
+answers left out; it is `null` when the judge gave no confident answer. When `status` is
+`incomplete`, the counts cover the crops the judge answered, in order, before it stopped.
+
 A `--dry-run` check describes the fixture photos, not the cameras, so it needs an
 `--out-dir` other than `spotchecks/`. Never commit its output here.
+
+## Summary per week
+
+```bash
+uv run python -m wearreport.tools.spotcheck_summary [--dir spotchecks]
+```
+
+reads every statistics file (counts only; no network) and prints, for each ISO week and
+each judge model:
+
+- the reviewer's precision (pooled over the week's files) and n, the boxes shown;
+- the judge's precision (pooled) and n, its confident answers;
+- a corrected judge estimate: the week's judge answers corrected by inverting the
+  reviewer x judge confusion pooled over all *earlier* weeks, Rogan-Gladen style. With
+  the earlier sensitivity Se (the judge says a person when the reviewer does) and
+  specificity Sp (the judge says not a person when the reviewer does), on confident
+  answers, and this week's judge precision q: (q + Sp − 1) / (Se + Sp − 1), clipped to
+  [0, 1]. It is `n/a` in the first week, and when Se + Sp − 1 is 0;
+- the difference between that estimate and the reviewer's precision, in points, and
+  whether it is within 3 points.
+
+The last line says whether the condition holds: the two latest weeks with a corrected
+estimate are both within 3 points of the reviewer's precision.
 
 ## Privacy and cleanup
 
 With `--view window`, rendered images exist only in memory and in the window, and
-nothing is written except the statistics file.
+nothing is written except the statistics file. With `--judge`, the crops also go, in
+memory, to the DeepInfra API (and nowhere else), after the review.
 
 With `--view files`, rendered images exist only in the temporary directory, and the tool
 deletes it when it exits: after a normal run, an error, the review timeout, or any

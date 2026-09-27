@@ -3,6 +3,7 @@
   python -m wearreport.tools.spotcheck --n 20 [--mode crops|frames] [--min-persons 3]
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
+      [--judge NAME --judge-max-requests N]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -51,6 +52,19 @@ and no other engine module may import this one. The tool refuses to run when `CI
 `GITHUB_ACTIONS` is non-empty, and when the temporary directory lies inside this
 repository or any git work tree, before any network access.
 
+With `--judge NAME` (a DeepInfra model of `judge_hosted.DEEPINFRA`; crops mode only), once
+the reviewer has finished and the judgements are valid, the same crops are sent to that
+model, one per request, as PNG bytes encoded in memory from the arrays the reviewer was
+shown: never a whole frame, and never a file of the review directory, which is deleted by
+then. The judge is never shown the reviewer's answers. At most `--judge-max-requests N`
+requests are made, retries included, to https://api.deepinfra.com only
+(`judge_hosted.LiveCropJudge`, the one entry point for live crops); the key comes from
+DEEPINFRA_API_KEY when it is set. The statistics file then gains a `judge` block: the
+reviewer x judge confusion counts, the judge's precision, its requests, tokens and cost. A
+judge failure (the request limit, an HTTP error, a timeout) never loses the reviewer's
+statistics: they are written with the judge's counts so far and `status` "incomplete".
+Nothing about a crop is printed, logged or kept.
+
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
 in fixtures/detect/ (no network). Its statistics describe those photos, not the
 cameras, so it needs an `--out-dir` other than spotchecks/.
@@ -77,6 +91,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +104,7 @@ import numpy.typing as npt
 from wearreport import detect, fetch, registry
 from wearreport._cv import cv2
 from wearreport.settings import SettingsError, load_settings
+from wearreport.tools import judge_hosted
 
 if sys.platform == "win32":
     import ctypes
@@ -186,6 +202,7 @@ MAX_MISSED = 1000  # per image
 MAX_JUDGEMENTS_BYTES = 1024 * 1024
 MAX_LINE_BYTES = 4096
 MAX_FILES_PER_DAY = 1000
+MAX_JUDGE_REQUESTS = 10_000
 JSON_POLL_S = 0.5
 REVIEWER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}")
 
@@ -1353,6 +1370,132 @@ class _ReviewWindow:
         self.outcome = None
 
 
+# The paired judge ---------------------------------------------------------------------
+
+# The reviewer's label for a crop (the keyboard and the window have no unsure answer).
+REVIEWER_LABELS = ("person", "in_vehicle", "not_person")
+JUDGE_POSITIVE: tuple[judge_hosted.Answer, ...] = ("person", "in_vehicle")
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeSetup:
+    """Where the judge's requests go and how long each may take (tests: a loopback fake
+    server, a short timeout and no wait between retries)."""
+
+    endpoint: str | None = None
+    timeout: float = judge_hosted.REQUEST_TIMEOUT
+    sleep: Callable[[float], None] = time.sleep
+
+
+def _is_loopback(endpoint: str | None) -> bool:
+    if endpoint is None:
+        return False
+    try:
+        return urllib.parse.urlsplit(endpoint).hostname in judge_hosted.LOOPBACK
+    except ValueError:
+        return False
+
+
+def open_judge(
+    args: argparse.Namespace, mode: Mode, setup: JudgeSetup
+) -> judge_hosted.LiveCropJudge | None:
+    """The judge that `--judge` names, checked before anything else happens, or None.
+    Raises SpotcheckError when the options do not allow one. Sends nothing."""
+    if args.judge is None:
+        if args.judge_max_requests is not None:
+            raise SpotcheckError("--judge-max-requests needs --judge")
+        return None
+    if mode != "crops":
+        raise SpotcheckError(
+            "--judge works in crops mode only: frames mode would send whole frames"
+        )
+    if args.judge_max_requests is None:
+        raise SpotcheckError("--judge needs --judge-max-requests N, the most requests to make")
+    if args.dry_run and not _is_loopback(setup.endpoint):
+        raise SpotcheckError(
+            "--judge with --dry-run needs a fake judge on this machine: a dry run never "
+            "calls DeepInfra"
+        )
+    try:
+        return judge_hosted.LiveCropJudge(
+            args.judge,
+            budget=judge_hosted.RequestBudget(args.judge_max_requests),
+            endpoint=setup.endpoint,
+            timeout=setup.timeout,
+            sleep=setup.sleep,
+        )
+    except judge_hosted.JudgeError as exc:
+        raise SpotcheckError(f"cannot use the judge: {exc}") from None
+
+
+def ask_judge(
+    crops: Sequence[Frame], judge: judge_hosted.LiveCropJudge
+) -> list[judge_hosted.Answer]:
+    """The judge's answer on each crop, in order, until the first failure. It is given the
+    pixels only, never the reviewer's answers. A failure is reported without any detail of
+    a crop, and ends the judging; a signal does too. Closes the judge."""
+    answers: list[judge_hosted.Answer] = []
+    try:
+        for image in crops:
+            answers.append(judge.classify_live_crop(image))
+    except judge_hosted.JudgeError as exc:  # the request limit, HTTP errors, timeouts
+        _judge_stopped(str(exc))
+    except Interrupted as exc:
+        _judge_stopped(f"stopped by {_signal_name(exc.signum)}")
+    except Exception as exc:  # any other failure must not lose the reviewer's statistics
+        _judge_stopped(f"failed ({type(exc).__name__})")
+    finally:
+        judge.close()
+    return answers
+
+
+def _judge_stopped(reason: str) -> None:
+    print(
+        f"spotcheck: the judge stopped: {reason}; its statistics are incomplete",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _reviewer_label(item: ReviewItem, judgement: Judgement) -> str:
+    (box,) = item.boxes  # crops mode: one box per image
+    if box in judgement.not_person:
+        return "not_person"
+    return "in_vehicle" if box in judgement.in_vehicle else "person"
+
+
+def judge_stats(
+    items: Sequence[ReviewItem],
+    judgements: Mapping[int, Judgement],
+    answers: Sequence[judge_hosted.Answer],
+    judge: judge_hosted.LiveCropJudge,
+    name: str,
+) -> dict[str, object]:
+    """The `judge` block: the reviewer x judge confusion counts over the crops the judge
+    answered (in order, from the first), and the judge's precision computed as the
+    reviewer's is, on its confident answers (person, in_vehicle or not_person)."""
+    confusion: dict[str, dict[judge_hosted.Answer, int]] = {
+        label: dict.fromkeys(judge_hosted.ANSWERS, 0) for label in REVIEWER_LABELS
+    }
+    for item, answer in zip(items[: len(answers)], answers, strict=True):
+        confusion[_reviewer_label(item, judgements[item.number])][answer] += 1
+    positive = sum(row[a] for row in confusion.values() for a in JUDGE_POSITIVE)
+    confident = positive + sum(row["not_person"] for row in confusion.values())
+    usage = judge.usage
+    cost = judge_hosted.cost_usd(judge.candidate, usage.input_tokens, usage.output_tokens)
+    return {
+        "model": name,
+        "provider": "DeepInfra",
+        "status": "complete" if len(answers) == len(items) else "incomplete",
+        "requests": usage.requests,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cost_usd": round(cost, 8),
+        "confusion": confusion,
+        "judge_precision": _ratio(positive, confident),
+    }
+
+
 # Statistics ---------------------------------------------------------------------------
 
 
@@ -1505,6 +1648,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="sweep a local fake camera server serving the fixture photos (no network)",
     )
+    ap.add_argument(
+        "--judge",
+        choices=sorted(judge_hosted.DEEPINFRA),
+        default=None,
+        help="after the review, send the same crops to this DeepInfra model and add a "
+        "reviewer x judge agreement block to the statistics (crops mode only)",
+    )
+    ap.add_argument(
+        "--judge-max-requests",
+        type=_count(1, MAX_JUDGE_REQUESTS),
+        default=None,
+        help="required with --judge: stop after N requests in all (retries count)",
+    )
     return ap
 
 
@@ -1646,9 +1802,28 @@ def _run(
     reviewer: Reviewer | None,
     day: datetime.date,
     guard: _SignalGuard,
+    setup: JudgeSetup | None = None,
 ) -> int:
     mode: Mode = args.mode
     view = resolve_view(args.view, mode, args.judgements)
+    judge = open_judge(args, mode, setup or JudgeSetup())
+    try:
+        return _check(args, pipeline, reviewer, day, guard, mode, view, judge)
+    finally:
+        if judge is not None:
+            judge.close()
+
+
+def _check(
+    args: argparse.Namespace,
+    pipeline: Pipeline | None,
+    reviewer: Reviewer | None,
+    day: datetime.date,
+    guard: _SignalGuard,
+    mode: Mode,
+    view: View,
+    judge: judge_hosted.LiveCropJudge | None,
+) -> int:
     _check_temp_dir(Path(tempfile.gettempdir()))
     out_dir = Path(args.out_dir)
     if args.dry_run and _is_real_spotchecks(out_dir):
@@ -1688,6 +1863,16 @@ def _run(
         info=pipeline.info,
         day=day,
     )
+    if judge is not None:
+        # Only now, with the review over and its judgements valid: the crops in memory.
+        answers = ask_judge([item.image for item in items], judge)
+        block = judge_stats(items, judgements, answers, judge, args.judge)
+        stats["judge"] = block
+        print(
+            f"Judge {args.judge}: {len(answers)} of {len(items)} crop(s) answered "
+            f"({block['status']}), {block['requests']} request(s), ${block['cost_usd']:.6f}",
+            flush=True,
+        )
     del items
     path = write_stats(stats, out_dir, day)
     print(f"Statistics written to {path}")
@@ -1700,8 +1885,13 @@ def main(
     pipeline: Pipeline | None = None,
     reviewer: Reviewer | None = None,
     today: datetime.date | None = None,
+    judge_endpoint: str | None = None,
+    judge_timeout: float = judge_hosted.REQUEST_TIMEOUT,
+    judge_sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    """Run one spot-check. `pipeline` and `reviewer` replace the live ones (tests)."""
+    """Run one spot-check. `pipeline` and `reviewer` replace the live ones, and
+    `judge_endpoint`, `judge_timeout` and `judge_sleep` the judge's origin, request timeout
+    and wait between retries (tests: a fake judge on this machine)."""
     ci = _ci_variables()
     if ci:
         print(
@@ -1715,7 +1905,8 @@ def main(
     try:
         try:
             guard.install()
-            return _run(args, pipeline, reviewer, today or datetime.date.today(), guard)
+            setup = JudgeSetup(judge_endpoint, judge_timeout, judge_sleep)
+            return _run(args, pipeline, reviewer, today or datetime.date.today(), guard, setup)
         finally:
             # Nothing may interrupt the handlers below. A signal that lands before
             # stop() is raised here, is the last one raised, and is caught below.
