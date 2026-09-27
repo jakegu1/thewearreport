@@ -763,13 +763,30 @@ LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})  # a local fake server (
 _MODEL_ID = re.compile(r"[A-Za-z0-9][\w.:-]{0,127}")
 _DEEPINFRA_MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]{0,63}/[A-Za-z0-9][\w.-]{0,127}")
 _TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
-# With no token known, any long run of key-like characters in an error is redacted: it may
-# be an echoed key. Service error names (CamelCase words ending in Exception or Error, such
-# as UnrecognizedClientException) are kept: they are not keys, and they explain the error.
-# Base64 and JWT characters (+ / = .) do not split a run; a run does not end in a period,
-# so the full stop after a word stays.
-_KEY_LIKE = re.compile(r"[A-Za-z0-9_+/=.-]{19,}[A-Za-z0-9_+/=-]")
-_ERROR_NAME = re.compile(r"(?:[A-Z][a-z]+){1,8}(?:Exception|Error)")
+# A provider's error message is reduced to plain words (an allowlist, not a blocklist of
+# key shapes): a word is kept only if it is at most 15 ASCII letters, or one of the service
+# error names below, with at most one trailing punctuation mark. Every other word, which
+# may be an echoed key in any form, becomes "…". Only the first 4 * MAX_ERROR_CHARS
+# characters of a message are examined, so a hostile reply costs linear time at most.
+_PLAIN_WORD = re.compile(r"([A-Za-z]+)([.,:;!?]?)")
+MAX_WORD_LETTERS = 15
+KNOWN_ERROR_NAMES = frozenset(
+    {
+        "AccessDeniedException",
+        "ConflictException",
+        "InternalServerException",
+        "ModelErrorException",
+        "ModelNotReadyException",
+        "ModelStreamErrorException",
+        "ModelTimeoutException",
+        "ResourceNotFoundException",
+        "ServiceQuotaExceededException",
+        "ServiceUnavailableException",
+        "ThrottlingException",
+        "UnrecognizedClientException",
+        "ValidationException",
+    }
+)
 
 
 class RequestLimitReached(JudgeError):
@@ -1137,24 +1154,34 @@ class _HostedClassifier:
             message = self._message(json.loads(raw.decode("utf-8")))
         except (ValueError, TypeError, UnicodeDecodeError, RecursionError, OverflowError):
             message = ""
-        message = self._redact(message)
+        message = self._plain_words(message)
         return text + (f": {message}" if message else "")
 
-    def _redact(self, text: str) -> str:
-        text = "".join(c if c.isprintable() and c.isascii() else " " for c in text)
-        text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
+    def _plain_words(self, text: str) -> str:
+        """`text` with every word that is not plain (see _PLAIN_WORD) replaced by one "…", and
+        the word after "Bearer" always replaced. The known token is removed first, and a
+        word of 8 or more letters found in it is not kept."""
+        text = text[: 4 * MAX_ERROR_CHARS]
         token = self._token or ""
         if token:
-            text = text.replace(token, "[redacted]")
-            words = re.findall(r"\S{12,}", text)
-            for word in words:
-                if word in token or token in word:
-                    text = text.replace(word, "[redacted]")
-        else:
-            text = _KEY_LIKE.sub(
-                lambda m: m[0] if _ERROR_NAME.fullmatch(m[0]) else "[redacted]", text
+            text = text.replace(token, " ")
+        words: list[str] = []
+        after_bearer = False
+        for word in text.split():
+            match = _PLAIN_WORD.fullmatch(word)
+            letters = match[1] if match else ""
+            keep = (
+                match is not None
+                and not after_bearer
+                and (len(letters) <= MAX_WORD_LETTERS or letters in KNOWN_ERROR_NAMES)
+                and not (token and len(letters) >= 8 and letters in token)
             )
-        return text[:MAX_ERROR_CHARS]
+            after_bearer = letters.lower() == "bearer"
+            if keep:
+                words.append(word)
+            elif not words or words[-1] != "…":
+                words.append("…")
+        return " ".join(words)[:MAX_ERROR_CHARS]
 
     def _add_usage(self, input_tokens: int | None, output_tokens: int | None) -> None:
         if input_tokens is None or output_tokens is None:
@@ -1218,9 +1245,9 @@ class BedrockClassifier(_HostedClassifier):
 
     def _error_kind(self, exc: urllib.error.HTTPError, raw: bytes) -> str:
         kind = (exc.headers.get("x-amzn-ErrorType") or "") if exc.headers else ""
-        # Redact the raw value first: once reduced to letters, an echoed token no longer
-        # matches the token or looks key-like.
-        return re.sub(r"[^A-Za-z]", "", self._redact(kind.split(":", 1)[0]))[:64]
+        # Only a known error name is reported: any other value may echo the token.
+        name = kind.split(":", 1)[0].strip()
+        return name if name in KNOWN_ERROR_NAMES else ""
 
     def _retryable(self, status: int, kind: str) -> bool:
         return status == 429 or status >= 500 or kind == "ThrottlingException"
