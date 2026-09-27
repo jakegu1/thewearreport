@@ -227,6 +227,8 @@ jobs:
     # The write token never meets third-party code: no setup-uv, no dependency, no make.
     # The helpers below are engine/wearreport/schedule.py (standard library only) from
     # the checked-out default branch; the downloaded files are data, never run.
+    # PYTHONSAFEPATH=1 is python3 -P: the working directory (the data checkout, in the
+    # commit step) is never on sys.path. test_sweep_workflow.py allowlists this job.
     steps:
       - name: Set DATA_DIR
         run: echo "DATA_DIR=${RUNNER_TEMP}/data" >> "${GITHUB_ENV}"
@@ -248,7 +250,7 @@ jobs:
           ARTIFACT_DIR: ${{ runner.temp }}/artifact
         run: |
           set -euo pipefail
-          PYTHONPATH=engine python3 -m wearreport.schedule check-artifact \
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule check-artifact \
             --dir "${ARTIFACT_DIR}" > "${RUNNER_TEMP}/paths-to-publish"
           cat "${RUNNER_TEMP}/paths-to-publish"
       - name: Check out the data branch (shallow, sparse; orphan on first publish)
@@ -282,7 +284,7 @@ jobs:
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/artifact
         run: |
-          PYTHONPATH=engine python3 -m wearreport.schedule copy-artifact \
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule copy-artifact \
             --artifact "${ARTIFACT_DIR}" --data-dir "${DATA_DIR}"
       - name: Commit and push to the data branch
         id: publish
@@ -296,8 +298,8 @@ jobs:
           git ls-files -z --others --exclude-standard -- ':(glob)sweeps/**/*.json' \
             | xargs -0 -r git add --
           git add -- status.json
-          git diff --cached --name-status \
-            | PYTHONPATH="${GITHUB_WORKSPACE}/engine" python3 -m wearreport.schedule check-staged
+          git diff --cached --name-status | PYTHONSAFEPATH=1 \
+            PYTHONPATH="${GITHUB_WORKSPACE}/engine" python3 -m wearreport.schedule check-staged
           if git diff --cached --quiet; then
             echo "nothing new to publish (the record was already there)"
             exit 0
@@ -312,7 +314,7 @@ jobs:
       - name: Did the published sweep succeed?
         id: record
         run: |
-          PYTHONPATH=engine python3 -m wearreport.schedule outcome \
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule outcome \
             --status "${DATA_DIR}/status.json" >> "${GITHUB_OUTPUT}"
       - name: Result
         id: result

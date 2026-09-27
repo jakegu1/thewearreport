@@ -388,3 +388,30 @@ def test_a_skip_leaves_an_open_alert_issue_open(jobs: dict[str, list[str]]) -> N
     assert _alert_run(fake, 5, "failure") is schedule.Action.COMMENT
     assert "4" in issue["comments"][-1]
     assert _alert_run(fake, 6, "success") is schedule.Action.CLOSE
+
+
+def test_the_commit_step_never_imports_from_the_data_checkout(
+    tmp_path: Path, jobs: dict[str, list[str]]
+) -> None:
+    # The commit step runs check-staged from the data checkout. A `wearreport` package
+    # there must not shadow the engine's: PYTHONSAFEPATH=1 (python3 -P) keeps the
+    # working directory off sys.path.
+    script = _script(jobs, "publish", "Commit and push")
+    assert "PYTHONSAFEPATH=1 \\\n" in script
+    assert "python3 -m wearreport.schedule check-staged" in script
+    shadow = tmp_path / "wearreport"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(f"open({str(tmp_path / 'ran')!r}, 'w').close()\n")
+    env = {**_env(), "PYTHONPATH": str(ROOT / "engine")}
+    for safe, ran in (({"PYTHONSAFEPATH": "1"}, False), ({}, True)):
+        out = subprocess.run(
+            [sys.executable, "-m", "wearreport.schedule", "check-staged"],
+            input="A\tstatus.json\n",
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            env={**env, **safe},
+            timeout=60,
+        )
+        assert (tmp_path / "ran").exists() is ran, out.stderr
+        (tmp_path / "ran").unlink(missing_ok=True)
