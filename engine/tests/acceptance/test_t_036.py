@@ -967,7 +967,7 @@ def test_ac6_one_week_is_not_enough(tmp_path: Path, capsys: pytest.CaptureFixtur
         b'{"date": "2026-09-15", "boxes_shown": 1, "boxes_not_person": 0, "judge": 3}',
         b'{"date": "2026-09-15", "boxes_shown": 1, "boxes_not_person": 0,'
         b' "judge": {"model": "x", "confusion": {"person": {"person": "1"}}}}',
-        b"[" * 100000,
+        pytest.param(b"[" * 100000, id="deep-nesting"),
         b"\xff\xfe",
     ],
 )
