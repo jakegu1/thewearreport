@@ -118,7 +118,8 @@ def _step(jobs: dict[str, list[str]], job: str, name_part: str) -> dict[str, str
 
 def test_ac1_cron_every_20_minutes_in_london_time(top: dict[str, list[str]]) -> None:
     on = "\n".join(top["on"])
-    assert re.search(r'- cron: "\*/20 7-20 \* \* \*"\n\s+timezone: "Europe/London"', on)
+    assert re.search(r'- cron: "7-59/20 6-20 \* \* \*"\n', on)
+    assert "timezone:" not in on
     assert on.count("cron:") == 1
     # 7-20 hours x 3 runs an hour = 42 runs a day
     assert len(range(7, 21)) * len(range(0, 60, 20)) == 42

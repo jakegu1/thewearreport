@@ -1,10 +1,11 @@
 name: sweep
 
 # One sweep every 20 minutes in London daytime, published to the `data` branch (T-007).
+# UTC cron at minutes 7, 27, 47 of hours 06-20 (off the busy top of the hour); the gate keeps 07:00-21:00 London.
 # Cron and workflow_dispatch run from the default branch only. See README.md § Operations.
 #
 # Jobs:
-#   gate   is it 07:00-21:00 Europe/London? (defence in depth behind the cron timezone)
+#   gate   is it 07:00-21:00 Europe/London? (the cron is UTC; this job alone decides)
 #   sweep  run one sweep and push its record and status.json; the only job that writes
 #          contents, and only to the `data` branch
 #   alert  after three consecutive failed sweeps open (or comment on) the `ops-alert`
@@ -14,8 +15,7 @@ name: sweep
 
 on:
   schedule:
-    - cron: "*/20 7-20 * * *"
-      timezone: "Europe/London"
+    - cron: "7-59/20 6-20 * * *"
   workflow_dispatch:
     inputs:
       force_fail:
