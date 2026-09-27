@@ -1176,6 +1176,8 @@ class WindowReviewer:
     ) -> Mapping[int, Judgement]:
         if mode != "crops":
             raise SpotcheckError(WINDOW_FRAMES_REFUSAL)
+        if not items:
+            return {}  # nothing to show: no window, and no need for tkinter
         tk = _import_tkinter()
         try:
             root = tk.Tk()
