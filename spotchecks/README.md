@@ -131,6 +131,10 @@ statistics file.
 - `--judge-max-requests N` is required, and at most N requests are made, retries
   included. Each request has a timeout; throttling and server errors are retried at most
   three times.
+- Worst-case cost for the example model `di-qwen3-vl-235b` ($0.20 per million input
+  tokens, $0.88 per million output tokens): about N × $0.00085, taking every request at
+  the largest crop the judge accepts (2048 × 2048 pixels, about 4,200 input tokens) and
+  its 10 output tokens; for example $0.17 for N = 200 and $8.50 for N = 10000.
 - The key comes from `DEEPINFRA_API_KEY` only (see `.env.example`) and is sent as
   `Authorization: Bearer`. Without it, no Authorization header is sent, for an environment
   that adds the credential itself. The key is never printed, logged or put in an error,
