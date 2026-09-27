@@ -13,7 +13,7 @@ and prints counts.
 Degradation (`degrade`), deterministic for a given item:
 
 1. the box is grown by CROP_MARGIN (50%) on every side and clipped to the photo, exactly
-   as the spot-check tool crops a detection;
+   as the spot-check tool crops a detection (an experiment may pass a wider margin);
 2. that region is shrunk (area interpolation) so that the box is `height_px` high,
    15-80 px, the height of a person in a JamCam frame;
 3. the result is JPEG-encoded at `jpeg_quality`, 35-60, like a JamCam frame, and decoded.
@@ -69,11 +69,13 @@ KINDS: dict[Label, frozenset[str]] = {
 
 # Degradation to JamCam conditions.
 CROP_MARGIN = 0.5  # the spot-check tool's margin: of the box's width and height, each side
+MAX_MARGIN = 4.0  # the widest margin an experiment may ask for (T-035)
 MIN_HEIGHT_PX, MAX_HEIGHT_PX = 15, 80
 MIN_JPEG_QUALITY, MAX_JPEG_QUALITY = 35, 60
 
 # Rendering, as the spot-check tool renders a crop for its reviewer.
 CROP_TARGET_HEIGHT = 240
+MAX_TARGET_HEIGHT = 1024  # the largest render target an experiment may ask for
 MAX_CROP_SCALE = 8
 BOX_COLOUR = (0, 255, 0)  # BGR
 LABEL_COLOUR = (255, 255, 255)
@@ -363,13 +365,17 @@ def read_source(source: Source, source_dir: Path = SOURCE_DIR) -> Image:
     return np.asarray(image, dtype=np.uint8)
 
 
-def crop_bounds(box: FloatBox, width: int, height: int) -> tuple[int, int, int, int]:
-    """The box grown by CROP_MARGIN on every side, in whole pixels, clipped to the frame.
-    The spot-check tool's crop."""
+def crop_bounds(
+    box: FloatBox, width: int, height: int, margin: float = CROP_MARGIN
+) -> tuple[int, int, int, int]:
+    """The box grown by `margin` (of its width and height) on every side, in whole pixels,
+    clipped to the frame. With the default margin, the spot-check tool's crop."""
     x1, y1, x2, y2 = box
     if not all(math.isfinite(v) for v in box) or not (x1 < x2 and y1 < y2):
         raise ValueError("a box must be finite and have a positive area")
-    dx, dy = (x2 - x1) * CROP_MARGIN, (y2 - y1) * CROP_MARGIN
+    if not (math.isfinite(margin) and 0 <= margin <= MAX_MARGIN):
+        raise ValueError(f"the margin must be from 0 to {MAX_MARGIN:g}")
+    dx, dy = (x2 - x1) * margin, (y2 - y1) * margin
     left, top = max(0, math.floor(x1 - dx)), max(0, math.floor(y1 - dy))
     right, bottom = min(width, math.ceil(x2 + dx)), min(height, math.ceil(y2 + dy))
     if not (left < right and top < bottom):
@@ -377,16 +383,23 @@ def crop_bounds(box: FloatBox, width: int, height: int) -> tuple[int, int, int, 
     return left, top, right, bottom
 
 
-def degrade(image: Image, box: Sequence[float], height_px: int, jpeg_quality: int) -> Degraded:
-    """Crop `box` with the spot-check margin, shrink it so that the box is `height_px`
-    high, and pass it through JPEG at `jpeg_quality`. Deterministic."""
+def degrade(
+    image: Image,
+    box: Sequence[float],
+    height_px: int,
+    jpeg_quality: int,
+    margin: float = CROP_MARGIN,
+) -> Degraded:
+    """Crop `box` with `margin` (by default the spot-check margin), shrink it so that the
+    box is `height_px` high, and pass it through JPEG at `jpeg_quality`. Deterministic. A
+    wider margin adds surroundings, never pixels on the box."""
     if not MIN_HEIGHT_PX <= height_px <= MAX_HEIGHT_PX:
         raise ValueError(f"height_px must be from {MIN_HEIGHT_PX} to {MAX_HEIGHT_PX}")
     if not MIN_JPEG_QUALITY <= jpeg_quality <= MAX_JPEG_QUALITY:
         raise ValueError(f"jpeg_quality must be from {MIN_JPEG_QUALITY} to {MAX_JPEG_QUALITY}")
     x1, y1, x2, y2 = (float(v) for v in box)
     height, width = image.shape[:2]
-    left, top, right, bottom = crop_bounds((x1, y1, x2, y2), width, height)
+    left, top, right, bottom = crop_bounds((x1, y1, x2, y2), width, height, margin)
     scale = height_px / (y2 - y1)
     size = (max(1, round((right - left) * scale)), max(1, round((bottom - top) * scale)))
     region = np.ascontiguousarray(image[top:bottom, left:right])
@@ -417,13 +430,23 @@ def _label(image: Image, text: str, x: int, y: int) -> None:
     )
 
 
-def render_crop(frame: Image, box: FloatBox, number: int) -> Image:
+def render_crop(
+    frame: Image,
+    box: FloatBox,
+    number: int,
+    margin: float = CROP_MARGIN,
+    target_height: int = CROP_TARGET_HEIGHT,
+) -> Image:
     """The image the reviewer (and the judge) sees for a box in a frame: the spot-check
-    tool's crop, enlarged by a whole factor, with the box and its number drawn on it."""
+    tool's crop, enlarged by a whole factor, with the box and its number drawn on it. The
+    defaults are the spot-check tool's; an experiment may widen the crop (`margin`) or
+    enlarge it towards another height (`target_height`, still at most MAX_CROP_SCALE)."""
+    if not 1 <= target_height <= MAX_TARGET_HEIGHT:
+        raise ValueError(f"the render target must be from 1 to {MAX_TARGET_HEIGHT} pixels")
     height, width = frame.shape[:2]
-    left, top, right, bottom = crop_bounds(box, width, height)
+    left, top, right, bottom = crop_bounds(box, width, height, margin)
     crop = np.ascontiguousarray(frame[top:bottom, left:right])
-    scale = max(1, min(MAX_CROP_SCALE, CROP_TARGET_HEIGHT // (bottom - top)))
+    scale = max(1, min(MAX_CROP_SCALE, target_height // (bottom - top)))
     size = ((right - left) * scale, (bottom - top) * scale)
     image = np.asarray(cv2.resize(crop, size, interpolation=cv2.INTER_NEAREST), dtype=np.uint8)
     x1, y1 = round((box[0] - left) * scale), round((box[1] - top) * scale)
@@ -434,29 +457,36 @@ def render_crop(frame: Image, box: FloatBox, number: int) -> Image:
 
 
 def degrade_item(
-    manifest: Manifest, item: Item, source_dir: Path = SOURCE_DIR, image: Image | None = None
+    manifest: Manifest,
+    item: Item,
+    source_dir: Path = SOURCE_DIR,
+    image: Image | None = None,
+    margin: float = CROP_MARGIN,
 ) -> Degraded:
     """Degrade one item of the manifest; `image` is its source photo if already read."""
     if image is None:
         image = read_source(manifest.sources[item.source], source_dir)
-    return degrade(image, item.box, item.height_px, item.jpeg_quality)
+    return degrade(image, item.box, item.height_px, item.jpeg_quality, margin)
 
 
 def iter_gold(
     manifest: Manifest,
     source_dir: Path = SOURCE_DIR,
     items: Iterable[Item] | None = None,
+    margin: float = CROP_MARGIN,
+    target_height: int = CROP_TARGET_HEIGHT,
 ) -> Iterator[tuple[Item, Image]]:
     """Each item (all of them, or `items`) with the rendered crop the judge sees. Items
-    are numbered 1, 2, ... in the order given, like the boxes of a spot-check."""
+    are numbered 1, 2, ... in the order given, like the boxes of a spot-check. `margin`
+    and `target_height` are the crop variant (the defaults: the spot-check tool's)."""
     cache: dict[str, Image] = {}
     selected = manifest.items if items is None else tuple(items)
     for number, item in enumerate(selected, start=1):
         if item.source not in cache:
             cache.clear()  # items of one source are usually next to each other
             cache[item.source] = read_source(manifest.sources[item.source], source_dir)
-        degraded = degrade_item(manifest, item, source_dir, cache[item.source])
-        yield item, render_crop(degraded.frame, degraded.box, number)
+        degraded = degrade_item(manifest, item, source_dir, cache[item.source], margin)
+        yield item, render_crop(degraded.frame, degraded.box, number, margin, target_height)
 
 
 # Command line ----------------------------------------------------------------------------

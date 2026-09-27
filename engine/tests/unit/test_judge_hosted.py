@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import email.message
 import http.server
 import json
+import random
 import re
+import string
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.error
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -259,7 +263,7 @@ def test_deepinfra_errors_redact_an_echoed_bearer_credential(server: Any) -> Non
     fake = server(error(400, f"invalid key Bearer {secret}"))
     with pytest.raises(judge.JudgeError) as caught:
         deepinfra(fake).classify(crop())
-    assert secret not in str(caught.value) and "Bearer [redacted]" in str(caught.value)
+    assert secret not in str(caught.value) and "invalid key Bearer …" in str(caught.value)
 
 
 ECHOED_KEY = "FAKEKEY0123456789abcdef"  # made up; no "Bearer" in front of it
@@ -318,6 +322,48 @@ def test_bedrock_auth_errors_with_the_injected_credential_report_no_message(
     with pytest.raises(judge.JudgeError) as caught:
         clf.classify(crop())
     assert str(caught.value) == f"Bedrock answered HTTP {status} UnrecognizedClientException"
+
+
+@pytest.mark.parametrize(
+    "echoed",
+    ["a" * 16, "Z9_-" * 6, "UnrecognizedClient0Exception", "SomeUnknownException", "k9", "é"],
+)
+def test_deepinfra_words_that_are_not_plain_are_replaced(server: Any, echoed: str) -> None:
+    fake = server(error(422, f"bad input {echoed} {echoed}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert echoed not in str(caught.value)
+    assert str(caught.value) == "DeepInfra answered HTTP 422: bad input …"
+
+
+def test_deepinfra_plain_words_and_known_error_names_are_kept(server: Any) -> None:
+    kept = "a" * 15 + " is busy, try later! ModelNotReadyException: ValidationException."
+    fake = server(error(422, kept))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == f"DeepInfra answered HTTP 422: {kept}"
+
+
+def test_deepinfra_error_messages_are_cut_to_the_limit(server: Any) -> None:
+    fake = server(error(422, "word " * 1000))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    message = str(caught.value).split(": ", 1)[1]
+    assert len(message) == judge.MAX_ERROR_CHARS and set(message) == set("word ")
+
+
+def test_bedrock_error_kinds_that_echo_the_token_are_redacted(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"  # noqa: S105  (made up)
+    monkeypatch.setenv(judge.TOKEN_ENV, token)
+    fake = server(Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": f"Bad{token}:x"}))
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(2), endpoint=fake.url
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert token not in str(caught.value) and token[:12] not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -769,3 +815,339 @@ def test_a_bedrock_run_without_the_variable_relies_on_the_injected_credential(
     for request in fake.requests:
         assert "authorization" not in {k.lower() for k in request["headers"]}
     assert "requests 2, input tokens 240, output tokens 4" in capsys.readouterr().out
+
+
+def _fragments(key: str, text: str, size: int = 8) -> list[str]:
+    """The runs of `size` characters of `key` that appear in `text`."""
+    return [key[i : i + size] for i in range(len(key) - size + 1) if key[i : i + size] in text]
+
+
+def test_deepinfra_the_aws_example_secret_is_redacted_whole(server: Any) -> None:
+    secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # noqa: S105  (AWS docs example)
+    fake = server(error(422, f"bad secret {secret}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == "DeepInfra answered HTTP 422: bad secret …"
+    assert _fragments(secret, str(caught.value), 4) == []
+
+
+def test_deepinfra_a_base64_bedrock_key_leaves_no_fragment(server: Any) -> None:
+    raw = bytes(range(7, 250, 3)) + b"\xfb\xff"  # includes + and /, and ends in =
+    key = "ABSK" + base64.b64encode(raw).decode()
+    assert "+" in key and "/" in key and key.endswith("=")
+    fake = server(error(422, f"key {key} is invalid"))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    exc = caught.value
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert _fragments(key, shown) == []
+    assert str(exc) == "DeepInfra answered HTTP 422: key … is invalid"
+
+
+@pytest.mark.parametrize(
+    "name", ["UnrecognizedClientException", "ValidationException", "AccessDeniedException"]
+)
+def test_deepinfra_aws_error_names_stay_readable(server: Any, name: str) -> None:
+    fake = server(error(422, f"failed: {name}."))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert f"failed: {name}." in str(caught.value)
+
+
+# Made up. Digits among long runs of letters: reduced to letters, it is no longer the token.
+BEDROCK_TOKEN = "Fake9Token5Made4Up6ByTheTestSuiteOnly7ForRedaction"  # noqa: S105
+
+
+@pytest.mark.parametrize("known", [True, False])
+def test_bedrock_an_error_type_echoing_the_token_leaves_no_fragment(
+    server: Any, monkeypatch: pytest.MonkeyPatch, known: bool
+) -> None:
+    token = BEDROCK_TOKEN
+    if known:
+        monkeypatch.setenv(judge.TOKEN_ENV, token)
+    else:
+        monkeypatch.delenv(judge.TOKEN_ENV, raising=False)
+    fake = server(Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": f"{token}:http://x/"}))
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(2),
+        endpoint=fake.url,
+        injected_credential=not known,
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    exc = caught.value
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert _fragments(token, shown) == []
+    assert _fragments(re.sub(r"[^A-Za-z]", "", token), shown) == []
+    assert str(exc).startswith("Bedrock answered HTTP 400")
+
+
+def test_bedrock_a_throttling_error_type_is_still_read(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, BEDROCK_TOKEN)
+    throttled = Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": "ThrottlingException:x"})
+    fake = server(throttled)
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())),
+        budget=judge.RequestBudget(100),
+        endpoint=fake.url,
+        sleep=lambda _: None,
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert str(caught.value) == "Bedrock answered HTTP 400 ThrottlingException"
+    # Retried: the kind was read as a known error name.
+    assert len(fake.requests) == judge.MAX_RETRIES + 1
+
+
+def test_bedrock_an_unknown_error_type_is_left_out(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(judge.TOKEN_ENV, BEDROCK_TOKEN)
+    fake = server(Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": "Unheard:x"}))
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(2), endpoint=fake.url
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    assert str(caught.value) == "Bedrock answered HTTP 400"
+
+
+@pytest.mark.parametrize("where", ["header", "body"])
+def test_bedrock_a_prefixed_partial_echo_of_the_token_leaves_no_fragment(
+    server: Any, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    # The re-review's reproduction: "x=" and the first 40 characters of a known token.
+    token = _base64_key(random.Random(40))  # noqa: S311  (seeded fake keys, not security)
+    monkeypatch.setenv(judge.TOKEN_ENV, token)
+    echo = f"x={token[:40]}:y"
+    if where == "header":
+        reply = Reply(status=400, body=b"{}", headers={"x-amzn-ErrorType": echo})
+    else:
+        reply = Reply(status=400, body=json.dumps({"message": f"bad {echo} here"}).encode())
+    fake = server(reply)
+    clf = judge.BedrockClassifier(
+        next(iter(judge.HOSTED.values())), budget=judge.RequestBudget(2), endpoint=fake.url
+    )
+    with pytest.raises(judge.JudgeError) as caught:
+        clf.classify(crop())
+    exc = caught.value
+    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+    assert _fragments(token, shown) == []
+    assert str(exc) == ("Bedrock answered HTTP 400" + ("" if where == "header" else ": bad … here"))
+
+
+# The class test: generated hostile replies ------------------------------------------------
+
+
+def _base64_key(rng: random.Random) -> str:
+    """A Bedrock API key shape: ABSK and base64."""
+    return "ABSK" + base64.b64encode(rng.randbytes(rng.randint(30, 120))).decode()
+
+
+def _sk_key(rng: random.Random) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "sk-" + "".join(rng.choices(alphabet, k=rng.randint(20, 64)))
+
+
+def _jwt(rng: random.Random) -> str:
+    def part(size: int) -> str:
+        return base64.urlsafe_b64encode(rng.randbytes(size)).decode().rstrip("=")
+
+    return f"eyJ{part(24)}.{part(rng.randint(30, 150))}.{part(32)}"
+
+
+KEY_MAKERS = (_base64_key, _sk_key, _jwt)
+# Where a reply puts the key `k`: {p} is a prefix of 8 or more characters, {q} one of 16 or
+# more, {w} one of 8 to 15 (a bare fragment; only a known token can be told from a word).
+BODY_SHAPES = (
+    "{k}",
+    "key {k} is invalid",
+    "Invalid API key: {k}",
+    "({k})",
+    "'{k}',",
+    "api_key={k}",
+    '"{k}"',
+    "Bearer {k}",
+    "denied for Bearer {k}.",
+    "x={p}:y",
+    "x={p}",
+    "token {q} was refused",
+    "{q}. try again",
+    "{k}{k} and {k}",
+    "{k}\x07 bad",  # a control character
+)
+KNOWN_TOKEN_SHAPES = ("the token {w} is bad", "{w}")
+HEADER_SHAPES = (
+    "{k}:http://x/",
+    "{k}",
+    "x={p}:y",
+    "Invalid {k}",
+    "{p}:x",
+    "ValidationException:{k}",
+    "ThrottlingException{k}",
+)
+
+
+def _hostile_replies(count: int) -> Iterator[tuple[str, str, int, str, str]]:
+    """(mode, key, status, message, error-type header) for `count` generated replies. In
+    mode "known" the key is the Bedrock token the classifier holds; in "injected" and
+    "deepinfra" no token is held."""
+    rng = random.Random(35)  # noqa: S311  (seeded fake keys, not security)
+    for i in range(count):
+        mode = ("known", "injected", "deepinfra")[i % 3]
+        key = rng.choice(KEY_MAKERS)(rng)
+        shapes = BODY_SHAPES + (KNOWN_TOKEN_SHAPES if mode == "known" else ())
+        fill = {
+            "k": key,
+            "p": key[: rng.randint(8, len(key))],
+            "q": key[: rng.randint(16, len(key))],
+            "w": key[: rng.randint(8, 15)],
+        }
+        message = rng.choice(shapes).format(**fill)
+        header = rng.choice(HEADER_SHAPES).format(**fill) if mode != "deepinfra" else ""
+        status = rng.choice([400, 404, 409, 422, 429, 500, 503])
+        yield mode, key, status, message, header
+
+
+def _classifiers(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """One classifier for each mode. Each is built once (an SSL context is slow to make);
+    the "known" one is given each reply's key as its token before the reply."""
+    local = "http://127.0.0.1:9"  # never contacted: _send is replaced in the test
+    bedrock = next(iter(judge.HOSTED.values()))
+    monkeypatch.setenv(judge.TOKEN_ENV, "placeholder")
+    known = judge.BedrockClassifier(bedrock, budget=judge.RequestBudget(1), endpoint=local)
+    monkeypatch.delenv(judge.TOKEN_ENV)
+    injected = judge.BedrockClassifier(
+        bedrock, budget=judge.RequestBudget(1), endpoint=local, injected_credential=True
+    )
+    deepinfra = judge.DeepInfraClassifier(
+        candidate(), budget=judge.RequestBudget(1), endpoint=local
+    )
+    for clf in (known, injected, deepinfra):
+        clf._sleep = lambda _: None
+    return {"known": known, "injected": injected, "deepinfra": deepinfra}
+
+
+def test_no_generated_hostile_reply_leaks_a_fragment_of_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classifiers = _classifiers(monkeypatch)
+    checked = 0
+    for mode, key, status, message, header in _hostile_replies(1200):
+        clf = classifiers[mode]
+        if mode == "known":
+            clf._token = key  # as if AWS_BEARER_TOKEN_BEDROCK held it
+        raw = json.dumps({"message": message, "error": {"message": message}}).encode()
+        headers = email.message.Message()
+        if header:
+            headers["x-amzn-ErrorType"] = header
+
+        def send(
+            body: bytes,
+            clf: Any = clf,
+            headers: Any = headers,
+            raw: bytes = raw,
+            status: int = status,
+        ) -> Any:
+            exc = urllib.error.HTTPError(clf._url, status, "error", headers, None)
+            return status, raw, clf._error_kind(exc, raw)
+
+        monkeypatch.setattr(clf, "_send", send)
+        with pytest.raises(judge.JudgeError) as caught:
+            clf._call(b"")
+        exc = caught.value
+        shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+        assert _fragments(key, shown) == [], (mode, status)
+        assert str(exc).startswith(f"{clf.provider} answered HTTP {status}")
+        checked += 1
+    assert checked >= 1000
+
+
+# The input cut: a key split by it ---------------------------------------------------------
+
+
+def _aws_secret(rng: random.Random) -> str:
+    return "".join(rng.choices(string.ascii_letters + string.digits + "+/", k=40))
+
+
+def _alphanumeric_key(rng: random.Random) -> str:
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=32))
+
+
+CUT_KEY_MAKERS = (_aws_secret, _base64_key, _jwt, _alphanumeric_key)
+CUT_FILLERS = ("x1 ", " ", "a-b\t")  # non-plain words, whitespace alone, a mix
+
+
+def test_a_key_split_by_the_input_cut_leaves_no_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classifiers = _classifiers(monkeypatch)
+    limit = 4 * judge.MAX_ERROR_CHARS
+    rng = random.Random(4035)  # noqa: S311  (seeded fake keys, not security)
+    checked = 0
+    for maker in CUT_KEY_MAKERS:
+        for filler in CUT_FILLERS:
+            for before in range(8, 16):  # characters of the key that fall before the cut
+                for mode in ("injected", "deepinfra"):  # no token held
+                    clf = classifiers[mode]
+                    key = maker(rng)
+                    lead = (filler * limit)[: limit - before]
+                    lead = lead[:-1] + " " if lead else lead  # the key starts a word
+                    message = lead + key + " and more"
+                    assert message[limit - before : limit] == key[:before]
+                    raw = json.dumps({"message": message}).encode()
+
+                    def send(body: bytes, raw: bytes = raw) -> Any:
+                        return 422, raw, ""
+
+                    monkeypatch.setattr(clf, "_send", send)
+                    with pytest.raises(judge.JudgeError) as caught:
+                        clf._call(b"")
+                    exc = caught.value
+                    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+                    assert _fragments(key, shown) == [], (maker.__name__, filler, before)
+                    checked += 1
+    assert checked == len(CUT_KEY_MAKERS) * len(CUT_FILLERS) * 8 * 2
+
+
+@pytest.mark.parametrize("gap", ["", " "])
+def test_only_the_start_of_a_long_message_is_examined(server: Any, gap: str) -> None:
+    limit = 4 * judge.MAX_ERROR_CHARS
+    lead = ("x1 " * limit)[:limit] + gap  # non-plain words up to the cut
+    fake = server(error(422, lead + "visible words after the cut"))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == "DeepInfra answered HTTP 422: …"
+
+
+def test_a_plain_word_ending_at_the_cut_is_kept(server: Any) -> None:
+    limit = 4 * judge.MAX_ERROR_CHARS
+    message = ("x1 " * limit)[: limit - 5] + " busy later"
+    assert message[limit - 4 : limit] == "busy" and message[limit] == " "
+    fake = server(error(422, message))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == "DeepInfra answered HTTP 422: … busy"
+
+
+# Pathological lengths ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("unit", [".", "a."])
+def test_deepinfra_a_one_mebibyte_error_message_ends_within_the_timeout(
+    server: Any, unit: str
+) -> None:
+    wrapper = len(json.dumps({"error": {"message": ""}}))
+    run = (unit * judge.MAX_RESPONSE_BYTES)[: judge.MAX_RESPONSE_BYTES - wrapper]
+    body = json.dumps({"error": {"message": run}}).encode()
+    assert len(body) == judge.MAX_RESPONSE_BYTES  # read in full, not refused as oversized
+    fake = server(Reply(status=422, body=body))
+    timeout = 2.0
+    start = time.monotonic()
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake, timeout=timeout).classify(crop())
+    assert time.monotonic() - start < timeout + 1.0
+    assert str(caught.value) == "DeepInfra answered HTTP 422: …"

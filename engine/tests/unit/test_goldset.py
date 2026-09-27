@@ -247,6 +247,33 @@ def test_iter_gold_numbers_items_in_order(tmp_path: Path) -> None:
     assert np.array_equal(got[0][1], goldset.render_crop(degraded.frame, degraded.box, 1))
 
 
+def test_iter_gold_renders_a_crop_variant(tmp_path: Path) -> None:
+    ok, encoded = cv2.imencode(".png", _frame())
+    assert ok
+    body = encoded.tobytes()
+    (tmp_path / "src-1").write_bytes(body)
+    source = dict(SOURCE, sha256=hashlib.sha256(body).hexdigest())
+    manifest = goldset.parse_manifest(_raw(_manifest(sources=[source])))
+    item = manifest.items[0]
+    ((_, default),) = goldset.iter_gold(manifest, tmp_path)
+    ((_, wide),) = goldset.iter_gold(manifest, tmp_path, margin=1.0, target_height=480)
+    degraded = goldset.degrade_item(manifest, item, tmp_path, margin=1.0)
+    expected = goldset.render_crop(degraded.frame, degraded.box, 1, 1.0, 480)
+    assert np.array_equal(wide, expected)
+    assert wide.shape[0] > default.shape[0]
+    assert degraded.frame.shape[0] > goldset.degrade_item(manifest, item, tmp_path).frame.shape[0]
+
+
+def test_degrade_refuses_a_margin_out_of_range() -> None:
+    for margin in (-0.5, goldset.MAX_MARGIN + 0.1, float("nan")):
+        with pytest.raises(ValueError):
+            goldset.degrade(_frame(), (150, 80, 181, 201), 30, 40, margin=margin)
+
+
+def test_a_zero_margin_crops_the_box_itself() -> None:
+    assert goldset.crop_bounds((10.2, 20.7, 30.1, 60.0), 100, 100, margin=0.0) == (10, 20, 31, 60)
+
+
 def test_main_checks_every_item_and_prints_counts(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
