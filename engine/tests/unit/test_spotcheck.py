@@ -127,6 +127,12 @@ def _items(mode: spotcheck.Mode) -> list[spotcheck.ReviewItem]:
 FRAMES_OK = {"1": {"missed": 0}, "2": {"missed": 0}, "3": {"missed": 0}}
 
 
+def _short_id(raw: bytes) -> str | None:
+    """A short test id for a large input. pytest puts the id in PYTEST_CURRENT_TEST, and
+    Windows refuses environment variables longer than 32767 characters."""
+    return f"{raw[:16]!r}...{len(raw)}-bytes" if len(raw) > 200 else None
+
+
 def _frames(**changes: Any) -> bytes:
     data: dict[str, Any] = {k: dict(v) for k, v in FRAMES_OK.items()}
     for key, value in changes.items():
@@ -167,6 +173,7 @@ def _frames(**changes: Any) -> bytes:
         b"\x00" * 64,
         b"\xff\xd8\xff\xe0",  # a JPEG header is not a judgements file
     ],
+    ids=_short_id,
 )
 def test_parse_judgements_rejects_hostile_input(raw: bytes) -> None:
     with pytest.raises(spotcheck.JudgementError):
