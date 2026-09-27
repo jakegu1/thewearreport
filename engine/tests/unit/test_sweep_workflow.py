@@ -414,6 +414,14 @@ SHELL_ENDS = {"fi", "done"}
 GIT_SUBCOMMANDS = {"init", "remote", "ls-remote", "sparse-checkout", "fetch", "checkout"}
 GIT_SUBCOMMANDS |= {"ls-files", "add", "diff", "commit", "push"}
 GIT_CONFIG = re.compile(r"(user\.name|user\.email|http\.extraheader)=.*", re.DOTALL)
+# git options that name a program to run on the other side of a fetch or push. git also
+# accepts any unambiguous prefix of a long option, so a prefix of these is refused too.
+GIT_PROGRAM_OPTIONS = ("--upload-pack", "--receive-pack", "--exec")
+# A sed script may only be one s command with these flags: never e (run the pattern
+# space), w (write a file), or any other command.
+SED_FLAGS = re.compile(r"[gpI0-9]*")
+# The only line a write job may hold at its key indent: a plain, unquoted key.
+JOB_KEY_LINE = re.compile(r"^    [\w-]+:( |$)")
 # python3 runs only the engine's standard-library helpers from the checked-out engine,
 # never with the working directory on sys.path (-P, or PYTHONSAFEPATH=1).
 ENGINE_PATHS = {"engine", "${GITHUB_WORKSPACE}/engine"}
@@ -441,6 +449,16 @@ def write_job_problems(text: str) -> list[str]:
         permissions = _children(keys.get("permissions", [""])[1:], 6)
         if "write" not in "".join(permissions.get("contents", [])):
             continue
+        # _children reads only plain keys: a quoted key or one with a space before the
+        # colon would be dropped silently, so any other line at this indent is a problem.
+        found += [
+            f"{name}: unreadable line {line.strip()!r}"
+            for line in job[1:]
+            if line.strip()
+            and not line.lstrip().startswith("#")
+            and len(line) - len(line.lstrip(" ")) == 4
+            and not JOB_KEY_LINE.match(line)
+        ]
         found += [f"{name}: job key {k}" for k in keys if k not in WRITE_JOB_KEYS]
         env = _children(keys.get("env", [""])[1:], 6)
         found += [f"{name}: env {k}" for k in env if LOADER_ENV.fullmatch(k)]
@@ -453,6 +471,9 @@ def write_job_problems(text: str) -> list[str]:
 
 def _step_problems(step: dict[str, str]) -> list[str]:
     found = [f"step key {k}" for k in step if k not in WRITE_STEP_KEYS]
+    if "uses" not in step and "run" not in step:
+        # e.g. a flow-style step, `- {run: curl x}`, which _steps reads as no keys
+        found.append(f"a step with neither uses nor run: {sorted(step)}")
     env = _children(step.get("env", "").splitlines(), 10)
     found += [f"step env {k}" for k in env if LOADER_ENV.fullmatch(k)]
     if "uses" in step:
@@ -606,9 +627,72 @@ def _command_problems(words: list[str]) -> list[str]:
         found += _command_problems(rest)
     elif command == "git":
         found += _git_problems(args)
-    elif command == "sed" and any(a.startswith(("-i", "--in-place")) for a in args):
-        found.append("sed edits a file in place")
+    elif command == "sed":
+        found += _sed_problems(args)
+    elif command == "printf" and args[:1] and args[0].startswith("-v"):
+        target = args[0][2:] or "".join(args[1:2])
+        found += _loader_target_problems("printf -v", target)
+    elif command == "mapfile":
+        found += _mapfile_problems(args)
     return found
+
+
+def _loader_target_problems(command: str, target: str) -> list[str]:
+    name = target.split("[", 1)[0]  # an element of a scalar is the scalar
+    return [f"{command} sets {name}"] if LOADER_ENV.fullmatch(name) else []
+
+
+def _mapfile_problems(args: list[str]) -> list[str]:
+    """mapfile's target is its first word after the options (MAPFILE by default); -C
+    runs a callback."""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "--":
+        if args[i].startswith("-C"):
+            return ["mapfile runs a callback"]
+        takes_value = args[i] in ("-d", "-n", "-O", "-s", "-u", "-c")
+        i += 2 if takes_value else 1
+    rest = args[i + (args[i : i + 1] == ["--"]) :]
+    return _loader_target_problems("mapfile", rest[0] if rest else "MAPFILE")
+
+
+def _sed_problems(args: list[str]) -> list[str]:
+    """sed runs only one s command per script, with flags from SED_FLAGS (never e or w),
+    from its arguments (never -f), and never edits a file in place."""
+    found, scripts, operands = [], [], []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith(("-i", "--in-place")):
+            found.append("sed edits a file in place")
+        elif arg.startswith(("-f", "--file")):
+            found.append("sed reads its script from a file")
+        elif arg == "-e" or arg == "--expression":
+            scripts.append("".join(args[i + 1 : i + 2]))
+            i += 1
+        elif arg.startswith("--expression="):
+            scripts.append(arg.partition("=")[2])
+        elif arg.startswith("-e"):
+            scripts.append(arg[2:])
+        elif not arg.startswith("-"):
+            operands.append(arg)
+        i += 1
+    if not scripts:
+        scripts = operands[:1]
+    return found + [f"sed script {s!r}" for s in scripts if not _plain_substitution(s)]
+
+
+def _plain_substitution(script: str) -> bool:
+    """Whether `script` is exactly `s<d>regex<d>replacement<d>flags`, flags in SED_FLAGS."""
+    if len(script) < 2 or script[0] != "s" or script[1] in "\\\n":
+        return False
+    delimiter, i, parts = script[1], 2, 0
+    while i < len(script) and parts < 2:
+        if script[i] == "\\":
+            i += 1
+        elif script[i] == delimiter:
+            parts += 1
+        i += 1
+    return parts == 2 and SED_FLAGS.fullmatch(script[i:]) is not None
 
 
 def _github_env_problems(words: list[str]) -> list[str]:
@@ -646,6 +730,10 @@ def _git_problems(args: list[str]) -> list[str]:
         args = args[2:]
     if args[:1] == [] or args[0] not in GIT_SUBCOMMANDS:
         found.append(f"git {''.join(args[:1])}")
+    for arg in args[1 : (args.index("--") if "--" in args else len(args))]:
+        option = arg.partition("=")[0]
+        if len(option) > 2 and any(p.startswith(option) for p in GIT_PROGRAM_OPTIONS):
+            found.append(f"git {args[0]} {option}")
     return found
 
 
@@ -743,6 +831,68 @@ def test_the_write_job_check_catches_a_job_key(where: str, mutant: str) -> None:
 def test_the_write_job_check_catches_a_step(mutant: str) -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert write_job_problems(_into_publish(text, "    steps:\n", mutant)) != []
+
+
+@pytest.mark.parametrize(
+    ("where", "mutant"),
+    [
+        # YAML spellings the line-based reader does not read as keys
+        ("    steps:\n", "      - {run: curl x}\n"),
+        ("    steps:\n", "      - {uses: evil/img@v1}\n"),
+        ("\n  publish:\n", '    "container": node:22\n'),
+        ("\n  publish:\n", "    'container': node:22\n"),
+        ("\n  publish:\n", "    container : node:22\n"),
+        ("\n  publish:\n", "    ? container\n    : node:22\n"),
+        ("\n  publish:\n", "    {container: node:22}\n"),
+    ],
+)
+def test_the_write_job_check_catches_an_unread_spelling(where: str, mutant: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert write_job_problems(_into_publish(text, where, mutant)) != []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # allowed commands that can still run code or set a loader variable
+        "      - run: sed -n 's/x/id/e' f\n",
+        "      - run: sed 'e id' f\n",
+        "      - run: sed 's/x/y/w /tmp/x' f\n",
+        "      - run: sed 'w /tmp/x' f\n",
+        "      - run: sed -e 's/a/b/' -e 'e id' f\n",
+        "      - run: sed --expression='s/a/b/;e id' f\n",
+        "      - run: sed -f /tmp/script f\n",
+        "      - run: git fetch --upload-pack=/tmp/x origin\n",
+        "      - run: git fetch --upload-p=/tmp/x origin\n",
+        "      - run: git ls-remote --upload-pack /tmp/x origin\n",
+        "      - run: git push --receive-pack=/tmp/x origin\n",
+        "      - run: git push --exec=/tmp/x origin\n",
+        "      - run: printf -v PATH '%s' /tmp\n",
+        "      - run: printf -vLD_PRELOAD '%s' /tmp/x.so\n",
+        "      - run: printf -v 'PYTHONPATH[0]' '%s' /tmp\n",
+        "      - run: mapfile -t PATH < f\n",
+        "      - run: mapfile -d x -n 1 GIT_DIR < f\n",
+        "      - run: mapfile -C id -c 1 x < f\n",
+    ],
+)
+def test_the_write_job_check_catches_an_allowed_command_running_code(mutant: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert write_job_problems(_into_publish(text, "    steps:\n", mutant)) != []
+
+
+def test_the_write_job_check_allows_plain_uses_of_those_commands() -> None:
+    for script in (
+        "sed -n 's#^\\(a/[0-9]\\{4\\}\\)/[^/]*$#/\\1/#p' f",
+        "sed -e 's/a/b/g' -e 's|c|d|2' f",
+        "git fetch -q --depth=1 --no-tags origin refs/heads/data",
+        "git ls-remote --exit-code --heads origin refs/heads/data",
+        "git add -- --exec",
+        "printf -v auth '%s' x",
+        "printf '%s' x",
+        "mapfile -t days < f",
+        "mapfile -t -d x days < f",
+    ):
+        assert run_problems(script) == [], script
 
 
 def test_the_write_job_check_catches_a_changed_download_or_if() -> None:
