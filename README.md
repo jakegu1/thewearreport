@@ -65,6 +65,40 @@ make help    # list all targets
 on `PATH`, and gitleaks and actionlint (both MIT, development tools only) into
 `.tools/bin/`. Every download is verified against a pinned SHA-256 checksum.
 
+### Windows (spot-check only)
+
+The spot-check tool ([spotchecks/README.md](./spotchecks/README.md)) also runs on native
+Windows 10 or 11, without WSL. Nothing else is supported there, and the `make` targets
+are for Linux. You need `git` and [uv](https://docs.astral.sh/uv/) 0.12.18; Windows ships
+`curl.exe` and PowerShell.
+
+Everything large can go to a drive other than `C:`: the clone (with its `.venv` and
+`.models`), uv's cache and the Python that uv installs. Point uv at that drive before the
+first `uv` command, for example `D:\uv`:
+
+```powershell
+setx UV_CACHE_DIR D:\uv\cache              # for new terminals
+setx UV_PYTHON_INSTALL_DIR D:\uv\python
+$env:UV_CACHE_DIR = 'D:\uv\cache'          # and for this one
+$env:UV_PYTHON_INSTALL_DIR = 'D:\uv\python'
+git clone <this repository's URL> D:\thewearreport
+cd D:\thewearreport
+uv sync --locked --no-install-package llama-cpp-python
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_model.ps1
+uv run --no-sync python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
+```
+
+- `--no-install-package llama-cpp-python` leaves out the judge's runtime, which has no
+  Windows wheel; the spot-check never imports it. Run commands with `uv run --no-sync`:
+  a plain `uv run` would install it again, which means compiling llama.cpp.
+- `scripts\fetch_model.ps1` downloads YOLOX-s and YOLOX-m into `.models\` and checks
+  each against the same pinned SHA-256 as `scripts/fetch_model.sh`. It fails closed: a
+  file that does not match is deleted, and nothing unverified is left behind.
+- On Windows the spot-check shows each crop in a window (`--view window`, the default
+  there) and writes no image at all. `--mode frames` uses the temporary directory
+  instead (`%TEMP%`, on `C:` by default; set `TEMP` to a folder elsewhere to move it,
+  outside any git clone).
+
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
 

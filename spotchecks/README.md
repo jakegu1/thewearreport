@@ -2,8 +2,9 @@
 
 A spot-check measures how often the detector's person boxes are right on the real
 cameras, without keeping any image. The tool samples live frames, shows the detections to
-a reviewer through a temporary directory that it always deletes, and keeps only the
-tallies. This directory holds one small JSON file of statistics per check.
+a reviewer, either in a window straight from memory or through a temporary directory that
+it always deletes, and keeps only the tallies. This directory holds one small JSON file of
+statistics per check.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
@@ -23,13 +24,43 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
 | `--reviewer NAME` | `unnamed` | recorded in the statistics (letters, digits, space, `.`, `_`, `-`) |
 | `--out-dir DIR` | `spotchecks` | where the statistics file goes |
 | `--model FILE` | `yolox_m.onnx` | a pinned model in `.models/` |
+| `--view files\|window` | `window` on Windows, else `files` | show the images in a window from memory, or as files in a temporary directory (see below) |
 | `--judgements PATH` | none | read judgements from this JSON file instead of the keyboard |
 | `--timeout SECONDS` | 1800 | time allowed for the review |
 | `--dry-run` | off | sweep a local fake camera server serving the fixture photos (no network) |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
-It renders them into a new directory `$TMPDIR/wearreport-spotcheck-XXXXXXXX` (mode 0700)
+
+On Windows, see [the install notes](../README.md#windows-spot-check-only) first.
+
+### Judging in a window (`--view window`)
+
+With `--view window` (crops mode only) the tool opens one window and shows each crop
+there, enlarged by a whole factor, with its image number, "k of N" and a one-line key
+legend. The crop goes from memory into the window as PNG data: no image file and no
+directory is created anywhere. One key per crop:
+
+| Key | Meaning |
+|---|---|
+| `Enter` or `Space` | the box is a pedestrian |
+| `n` | the box is not a person |
+| `v` | the box is a person inside a vehicle |
+| `Backspace` | go back one crop, to change it |
+| `q`, or closing the window | stop without writing statistics |
+
+The window closes after the last crop, and the statistics are exactly those the keyboard
+would give for the same answers. The review timeout closes the window too, and the tool
+exits without statistics.
+
+This is the default on Windows, unless `--mode frames` or `--judgements` is given: those
+need the image files, so they use `--view files`. `--view window` with either is refused.
+Elsewhere the default stays `--view files`; `--view window` works where Python has
+tkinter and there is a display.
+
+### Judging from files (`--view files`)
+
+The tool renders the images into a new directory `$TMPDIR/wearreport-spotcheck-XXXXXXXX` (mode 0700)
 and prints its path and the numbering. It refuses to start when that temporary directory
 lies inside this repository or any git work tree, where a `git add` could commit the
 images; set `TMPDIR` to a directory outside it.
@@ -43,7 +74,7 @@ Boxes are numbered 1, 2, 3, ... across the whole check. File names never carry a
 id. `numbering.json` in the same directory lists each image's boxes and holds a template
 for the judgements file.
 
-### Judging from the keyboard
+#### Judging from the keyboard
 
 Without `--judgements`, the tool asks for one line per image:
 
@@ -59,7 +90,7 @@ Without `--judgements`, the tool asks for one line per image:
 Tokens are separated by spaces or commas, for example `n3 v5 m1`. An invalid line is
 rejected with a message and asked again.
 
-### Judging with a JSON file
+#### Judging with a JSON file
 
 With `--judgements PATH` (the file must not exist when the tool starts), the tool polls
 for `PATH` until the timeout. Write one entry per image, keyed by image number:
@@ -105,20 +136,26 @@ A `--dry-run` check describes the fixture photos, not the cameras, so it needs a
 
 ## Privacy and cleanup
 
-Rendered images exist only in the temporary directory, and the tool deletes it when it
-exits: after a normal run, an error, the review timeout, or any catchable signal whose
-default action ends the process: Ctrl-C (SIGINT), SIGTERM, SIGHUP, SIGQUIT, SIGUSR1,
-SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, SIGPWR, SIGSTKFLT and the
-real-time signals, where the platform has them. Repeated signals (Ctrl-C twice, or a
-closing terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else is
-written except the statistics file.
+With `--view window`, rendered images exist only in memory and in the window, and
+nothing is written except the statistics file.
 
-**SIGKILL cannot be handled** (nor can a power cut, or a crash with SIGSEGV, SIGBUS or
-another fault signal): the directory then stays behind.
-While it runs, the tool holds a lock on its directory; at start it deletes every
-`wearreport-spotcheck-*` directory of the current user that is older than the timeout
-and not locked by a running instance. To clean up by hand:
-`rm -rf "${TMPDIR:-/tmp}"/wearreport-spotcheck-*`.
+With `--view files`, rendered images exist only in the temporary directory, and the tool
+deletes it when it exits: after a normal run, an error, the review timeout, or any
+catchable signal whose default action ends the process: Ctrl-C (SIGINT), SIGTERM, SIGHUP,
+SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, SIGPWR,
+SIGSTKFLT and the real-time signals, where the platform has them; on Windows, Ctrl-C,
+Ctrl-Break (SIGBREAK) and SIGTERM. Repeated signals (Ctrl-C twice, or a closing
+terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else is written
+except the statistics file.
+
+**SIGKILL cannot be handled** (nor can a power cut, a process ended from Task Manager
+or `taskkill /f` on Windows, or a crash with SIGSEGV, SIGBUS or another fault signal):
+the directory then stays behind.
+While it runs, the tool holds a lock on its directory (on Windows, on a `.lock` file in
+it); at start it deletes every `wearreport-spotcheck-*` directory of the current user
+that is older than the timeout and not locked by a running instance. To clean up by
+hand: `rm -rf "${TMPDIR:-/tmp}"/wearreport-spotcheck-*`, or in PowerShell
+`Remove-Item -Recurse -Force "$env:TEMP\wearreport-spotcheck-*"`.
 
 Never open the rendered images with a tool that uploads them (for example an AI
 assistant's file reader), and never copy them out of the directory.
