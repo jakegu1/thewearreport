@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import datetime
 import http.server
+import itertools
 import json
+import string
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -221,3 +223,46 @@ def test_a_redirect_is_not_followed_and_the_key_goes_nowhere_else(
     out = capsys.readouterr()
     for text in (out.out, out.err, _stats_text(env)):
         assert key not in text
+
+
+# The live judge never prints the provider's message -------------------------------------
+
+# AbCdEf ... UvWx12345678, built rather than written out so no key-shaped literal is committed.
+SPLIT_KEY = (
+    "".join(map(str.__add__, string.ascii_uppercase[:24:2], string.ascii_lowercase[1:24:2]))
+    + "12345678"
+)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("key " + " ".join(SPLIT_KEY), id="one-character-words"),
+        pytest.param("key AbCdEfG GhIjKlM MnOpQrS StUvWx 1234567 8", id="seven-letter-words"),
+    ],
+)
+def test_a_failed_request_is_reported_by_its_status_only(
+    env: Path,
+    serve: Callable[..., Fake],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    message: str,
+) -> None:
+    monkeypatch.setenv(KEY_ENV, SPLIT_KEY)
+    judge = serve(default=error(400, message))
+    assert _run(judge, env) == 0
+    assert len(judge.requests) == 1  # a 400 is not retried
+    assert json.loads(_stats_text(env))["judge"]["status"] == "incomplete"
+    out = capsys.readouterr()
+    printed = out.out + out.err
+    words = [w for w in message.split()[1:] if w.isalpha()]
+    # No letter run of 2 or more from the reply, and no two of its letter words in a row.
+    for word in words:
+        if len(word) >= 2:
+            assert word not in printed
+    for pair in itertools.pairwise(words):
+        assert " ".join(pair) not in printed
+    assert "key A" not in printed
+    assert (
+        "spotcheck: the judge stopped: DeepInfra answered HTTP 400; its statistics are incomplete\n"
+    ) in out.err

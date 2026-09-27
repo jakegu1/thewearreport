@@ -133,7 +133,8 @@ statistics file.
   three times.
 - The key comes from `DEEPINFRA_API_KEY` only (see `.env.example`) and is sent as
   `Authorization: Bearer`. Without it, no Authorization header is sent, for an environment
-  that adds the credential itself. The key is never printed, logged or put in an error.
+  that adds the credential itself. The key is never printed, logged or put in an error,
+  and a failed request is reported by its HTTP status only, never DeepInfra's message.
 - A judge failure (the request limit, an HTTP error, a timeout, a malformed reply, Ctrl-C
   while the judge runs) never loses the review: the statistics are written with the
   judge's counts so far and `status` `incomplete`.

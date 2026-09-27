@@ -813,11 +813,17 @@ API_KEY_ENV = "DEEPINFRA_API_KEY"  # the variable name, not a key
 
 
 class _LiveDeepInfra(DeepInfraClassifier):
-    """DeepInfraClassifier with the key of a local run: sent as a bearer token when set."""
+    """DeepInfraClassifier with the key of a local run: sent as a bearer token when set.
+    Its errors never carry the provider's message text, which a hostile reply could fill
+    with pieces of the key."""
 
     def __init__(self, candidate: HostedCandidate, *, key: str | None, **kwargs: Any) -> None:
         super().__init__(candidate, **kwargs)
         self._token = key
+
+    def _describe(self, status: int, kind: str, raw: bytes) -> str:
+        """The HTTP status and the error kind only."""
+        return f"{self.provider} answered HTTP {status}" + (f" {kind}" if kind else "")
 
 
 class LiveCropJudge:
@@ -828,7 +834,8 @@ class LiveCropJudge:
     may only replace it with a server on this machine (tests). Every request counts against
     `budget`, retries included. The key is read from API_KEY_ENV once, here: when it is set
     it is sent as `Authorization: Bearer`, and it never appears in an error; when it is not
-    set, no Authorization header is sent. Raises JudgeError for an unknown model, another
+    set, no Authorization header is sent. An HTTP error names only its status, never the
+    provider's message. Raises JudgeError for an unknown model, another
     endpoint or a malformed key, before any request."""
 
     def __init__(
