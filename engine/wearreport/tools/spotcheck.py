@@ -1199,10 +1199,16 @@ class WindowReviewer:
 
     Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
     as data. `driver`, if given, is called with the window once it shows the first crop
-    (tests use it to send key events)."""
+    (tests use it to send key events). With `guard`, the window's teardown is a critical
+    step: a signal that lands during it waits until it is done."""
 
-    def __init__(self, driver: Callable[[tkinter.Tk], object] | None = None) -> None:
+    def __init__(
+        self,
+        driver: Callable[[tkinter.Tk], object] | None = None,
+        guard: _SignalGuard | None = None,
+    ) -> None:
         self.driver = driver
+        self.guard = guard
 
     def judge(
         self, items: Sequence[ReviewItem], mode: Mode, deadline: float
@@ -1221,20 +1227,22 @@ class WindowReviewer:
             window = _ReviewWindow(tk, root, items, deadline)
             return window.run(self.driver)
         finally:
-            if window is not None:
-                window.close()  # deletes the image now: Tk calls must stay in this thread
-            with contextlib.suppress(AttributeError):
-                del root.report_callback_exception  # the root's reference to the window
-            with contextlib.suppress(tk.TclError):
-                # Cancel what is still scheduled, or Tcl runs it after the window is gone.
-                for pending in root.tk.splitlist(root.tk.call("after", "info")):
-                    root.after_cancel(pending)
-                root.destroy()
-            # Tcl objects must be freed in this thread. Left in a reference cycle, they
-            # would be freed by whichever thread next runs the garbage collector (a fetch
-            # thread, say), and Tcl aborts the process when that is not this one.
-            del window, root
-            gc.collect()
+            # Critical: a signal raised part-way would skip the rest and leave a cycle.
+            with self.guard.critical() if self.guard is not None else contextlib.nullcontext():
+                if window is not None:
+                    window.close()  # deletes the image now: Tk calls stay in this thread
+                with contextlib.suppress(AttributeError):
+                    del root.report_callback_exception  # the root's reference to the window
+                with contextlib.suppress(tk.TclError):
+                    # Cancel what is still scheduled, or Tcl runs it after the window is gone.
+                    for pending in root.tk.splitlist(root.tk.call("after", "info")):
+                        root.after_cancel(pending)
+                    root.destroy()
+                # Tcl objects must be freed in this thread. Left in a reference cycle, they
+                # would be freed by whichever thread next runs the garbage collector (a
+                # fetch thread, say), and Tcl aborts the process when that is not this one.
+                del window, root
+                gc.collect()
 
 
 class _ReviewWindow:
@@ -1653,7 +1661,7 @@ def _run(
                 raise SpotcheckError(f"{path} already exists; remove it, then start again")
             reviewer = JsonFileReviewer(path)
         elif view == "window":
-            reviewer = WindowReviewer()
+            reviewer = WindowReviewer(guard=guard)
         else:
             reviewer = KeyboardReviewer(sys.stdin.fileno())
     removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)

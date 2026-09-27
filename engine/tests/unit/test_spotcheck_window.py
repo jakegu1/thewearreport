@@ -332,6 +332,39 @@ def test_a_signal_while_the_window_is_idle_stops_the_tool_promptly(
     assert not (tmp_path / "out").exists()
 
 
+def test_a_signal_during_the_window_teardown_waits_until_it_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The signal lands as the teardown starts (right after the window drops its image).
+    Under the guard it is raised only once the teardown is done, so no reference cycle
+    keeps the window alive for another thread's garbage collector."""
+    _need_window()
+    close = spotcheck._ReviewWindow.close
+
+    def close_then_signal(window: spotcheck._ReviewWindow) -> None:
+        close(window)
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(spotcheck._ReviewWindow, "close", close_then_signal)
+    send = _send("<Return>")
+    guard = spotcheck._SignalGuard()
+    guard.install()
+    gc.disable()  # only the review's own clean-up may free it
+    try:
+        with pytest.raises(spotcheck.Interrupted) as raised:
+            spotcheck.WindowReviewer(driver=send, guard=guard).judge(
+                _crops([1]), "crops", time.monotonic() + WAIT_S
+            )
+        assert raised.value.signum == signal.SIGTERM
+        del raised  # its traceback holds the frames the review ran in
+        root = weakref.ref(send.root)
+        del send
+        assert root() is None
+    finally:
+        gc.enable()
+        guard.restore()
+
+
 def test_an_error_in_the_driver_propagates_and_the_window_closes() -> None:
     _need_window()
     roots: list[Any] = []
