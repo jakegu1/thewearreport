@@ -42,6 +42,49 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
+      - name: "TEMPORARY: Tk create/destroy stress (diagnosis for T-037)"
+        continue-on-error: true
+        run: |
+          $code = @'
+          import os, sys, tempfile, tkinter
+          print("base_prefix", sys.base_prefix, "cwd", os.getcwd(), flush=True)
+          def cycle(label, n, between=None):
+              bad = 0
+              for i in range(n):
+                  if between: between(i)
+                  try:
+                      r = tkinter.Tk(); r.update(); r.destroy(); del r
+                  except Exception as exc:
+                      bad += 1
+                      if bad <= 2: print(label, "FAILED at", i, repr(exc)[:160], flush=True)
+              print(label, "failures", bad, "of", n, flush=True)
+          start = os.getcwd()
+          base = tempfile.mkdtemp()
+          cycle("plain", 60)
+          def chdir_new(i):
+              d = os.path.join(base, "c%d" % i); os.mkdir(d); os.chdir(d)
+          cycle("chdir-new-dir", 60, chdir_new)
+          os.chdir(start)
+          def chdir_back_and_forth(i):
+              os.chdir(base if i % 2 else start)
+          cycle("chdir-two-dirs", 60, chdir_back_and_forth)
+          os.chdir(start)
+          def env_only(i):
+              d = os.path.join(base, "e%d" % i); os.mkdir(d)
+              for v in ("HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR"): os.environ[v] = d
+          cycle("env-only", 60, env_only)
+          def userprofile_only(i):
+              d = os.path.join(base, "u%d" % i); os.mkdir(d); os.environ["USERPROFILE"] = d
+          cycle("userprofile-only", 60, userprofile_only)
+          def home_only(i):
+              d = os.path.join(base, "h%d" % i); os.mkdir(d); os.environ["HOME"] = d
+          cycle("home-only", 60, home_only)
+          def temp_only(i):
+              d = os.path.join(base, "t%d" % i); os.mkdir(d)
+              for v in ("TEMP", "TMP"): os.environ[v] = d
+          cycle("temp-only", 60, temp_only)
+          '@
+          $code | uv run --no-sync python -u -
       - name: Spot-check unit and acceptance tests
         run: >-
           uv run --no-sync pytest -v -rs
