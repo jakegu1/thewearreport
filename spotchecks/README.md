@@ -4,8 +4,8 @@ A spot-check measures how often the detector's person boxes are right on the rea
 cameras, without keeping any image. The tool samples live frames, shows the detections to
 a reviewer, either in a window straight from memory or through a temporary directory that
 it always deletes, and keeps only the tallies. This directory holds one small JSON file of
-statistics per check and, in `boxes/`, one per-box file per check: each box's height and
-label, and nothing else about it.
+statistics per check and, in `boxes/`, one per-box file per check run with
+`--record-boxes`: each box's height and label, and nothing else about it.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
@@ -13,7 +13,7 @@ Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
 ```bash
 sh scripts/fetch_model.sh --with-m     # YOLOX-m is the default model
-uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
+uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxes
 ```
 
 | Option | Default | Meaning |
@@ -31,6 +31,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
 | `--dry-run` | off | sweep a local fake camera server serving the fixture photos (no network) |
 | `--judge NAME` | none | after the review, send the same crops to this DeepInfra model (see below; crops mode only) |
 | `--judge-max-requests N` | required with `--judge` | the most requests the judge may make, retries included (1 to 10000) |
+| `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -175,7 +176,8 @@ when the check ran with `--judge` (files without it stay valid):
 
 A box the reviewer marked unsure (`u`, cannot tell) is left out of every count here, and
 so of every ratio: it is in none of `boxes_shown`, `boxes_not_person` and
-`boxes_in_vehicle`. It is counted in the per-box file (below). Ratios are rounded to 4
+`boxes_in_vehicle`. With `--record-boxes` it is counted in the per-box file (below);
+without it, it is recorded nowhere. Ratios are rounded to 4
 decimal places, and are `null` when their denominator is 0 (no
 boxes shown, or nothing to recall). Recall needs whole frames, so only `frames` mode
 estimates it. The counts are kept so every ratio can be recomputed.
@@ -205,10 +207,10 @@ A `--dry-run` check describes the fixture photos, not the cameras, so it needs a
 
 ## Per-box file
 
-Next to each statistics file `<out-dir>/<name>.json`, the tool writes
-`<out-dir>/boxes/<name>.json`, with the same name: the name is the first one free in both
-places, and neither file is ever overwritten. It is one line of JSON with exactly these
-fields:
+With `--record-boxes` (crops mode only), next to each statistics file
+`<out-dir>/<name>.json` the tool writes `<out-dir>/boxes/<name>.json`, with the same
+name: the name is the first one free in both places, and neither file is ever
+overwritten. It is one line of JSON with exactly these fields:
 
 | Field | Type | Value |
 |---|---|---|
@@ -291,8 +293,9 @@ estimate are both within 3 points of the reviewer's precision.
 ## Privacy and cleanup
 
 With `--view window`, rendered images exist only in memory and in the window, and
-nothing is written except the statistics file and its per-box file. With `--judge`, the crops also go, in
-memory, to the DeepInfra API (and nowhere else), after the review.
+nothing is written except the statistics file (and, with `--record-boxes`, its per-box
+file). With `--judge`, the crops also go, in memory, to the DeepInfra API (and nowhere
+else), after the review.
 
 With `--view files`, rendered images exist only in the temporary directory, and the tool
 deletes it when it exits: after a normal run, an error, the review timeout, or any
@@ -301,7 +304,7 @@ SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, S
 SIGSTKFLT and the real-time signals, where the platform has them; on Windows, only
 Ctrl-C and Ctrl-Break (SIGBREAK) in the tool's console. Repeated signals (Ctrl-C twice,
 or a closing terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else
-is written except the statistics file and its per-box file.
+is written except the statistics file (and, with `--record-boxes`, its per-box file).
 
 **SIGKILL cannot be handled** (nor can a power cut, or a crash with SIGSEGV, SIGBUS or
 another fault signal). **On Windows, cleanup cannot run** when the process is ended from

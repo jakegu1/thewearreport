@@ -247,7 +247,7 @@ def test_window_unsure_is_left_out_of_the_statistics_and_kept_in_the_box_file(
     _need_window()
     out = tmp_path / "out"
     keys = ["<KeyPress-u>", "<KeyPress-n>", "<Return>"]
-    args = ["--n", "1", "--min-persons", "1", "--view", "window"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "window", "--record-boxes"]
     reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
     assert _run(args, out, pipeline=_pipeline([3]), reviewer=reviewer) == 0
     name = f"{DAY.isoformat()}.json"
@@ -582,3 +582,18 @@ def test_windows_handles_ctrl_break() -> None:
     assert getattr(signal, "SIGBREAK") in spotcheck.HANDLED_SIGNALS  # noqa: B009  (Windows only)
     assert {signal.SIGINT, signal.SIGTERM} <= set(spotcheck.HANDLED_SIGNALS)
     assert spotcheck.ALARM_SIGNALS == ()
+
+
+def test_window_unsure_without_record_boxes_writes_only_the_statistics(
+    env: Path, tmp_path: Path
+) -> None:
+    _need_window()
+    out = tmp_path / "out"
+    keys = ["<KeyPress-u>", "<KeyPress-n>", "<Return>"]
+    args = ["--n", "1", "--min-persons", "1", "--view", "window"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    assert _run(args, out, pipeline=_pipeline([3]), reviewer=reviewer) == 0
+    name = f"{DAY.isoformat()}.json"
+    stats = json.loads((out / name).read_text(encoding="utf-8"))
+    assert stats["boxes_shown"] == 2 and stats["boxes_not_person"] == 1
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*")] == [name]

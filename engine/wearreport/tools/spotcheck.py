@@ -3,7 +3,7 @@
   python -m wearreport.tools.spotcheck --n 20 [--mode crops|frames] [--min-persons 3]
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
-      [--judge NAME --judge-max-requests N]
+      [--judge NAME --judge-max-requests N] [--record-boxes]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -16,10 +16,11 @@ and the reviewer judges each one from the keyboard, or by writing a JSON file
 Windows) one tkinter window shows each crop straight from memory and takes one key per
 crop, and no image is written anywhere. The reviewer can answer "cannot tell" (`u`) for a
 box; such a box is left out of the statistics. The tool then writes one statistics file,
-`<out-dir>/YYYY-MM-DD.json` (then `-2`, `-3`...), and next to it one per-box file with the
-same name, `<out-dir>/boxes/YYYY-MM-DD.json`: each box's height in source-frame pixels and
-its label, the light at the start of the sweep, and no image, position or camera id. It
-writes nothing else. The formats are in `spotchecks/README.md`.
+`<out-dir>/YYYY-MM-DD.json` (then `-2`, `-3`...). With `--record-boxes` (crops mode only)
+it also writes, next to it, one per-box file with the same name,
+`<out-dir>/boxes/YYYY-MM-DD.json`: each box's height in source-frame pixels and its label,
+the light at the start of the sweep, and no image, position or camera id. It writes
+nothing else. The formats are in `spotchecks/README.md`.
 
 While it fetches and detects, the tool prints progress to stderr: the number of cameras
 listed, then every PROGRESS_EVERY frames fetched and run through the detector, and a line
@@ -1866,10 +1867,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="required with --judge: stop after N requests in all (retries count)",
     )
+    ap.add_argument(
+        "--record-boxes",
+        action="store_true",
+        help="also write each box's height and label to <out-dir>/boxes/ (crops mode only)",
+    )
     return ap
 
 
 WINDOW_FRAMES_REFUSAL = "--view window shows crops only; frames mode needs --view files"
+RECORD_BOXES_FRAMES_REFUSAL = "--record-boxes works in crops mode only; drop it or --mode frames"
 
 
 def default_view(platform: str = sys.platform) -> View:
@@ -2011,6 +2018,8 @@ def _run(
     clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
     mode: Mode = args.mode
+    if args.record_boxes and mode == "frames":
+        raise SpotcheckError(RECORD_BOXES_FRAMES_REFUSAL)
     view = resolve_view(args.view, mode, args.judgements)
     judge = open_judge(args, mode, setup or JudgeSetup())
     try:
@@ -2086,15 +2095,17 @@ def _check(
         info=pipeline.info,
         day=day,
     )
-    boxes = box_record(
-        items,
-        judgements,
-        heights,
-        frames_reviewed=frames_reviewed,
-        info=pipeline.info,
-        day=day,
-        started_at=started_at,
-    )
+    boxes: dict[str, object] | None = None
+    if args.record_boxes:
+        boxes = box_record(
+            items,
+            judgements,
+            heights,
+            frames_reviewed=frames_reviewed,
+            info=pipeline.info,
+            day=day,
+            started_at=started_at,
+        )
     if judge is not None:
         # Only now, with the review over and its judgements valid: the crops in memory,
         # except those the reviewer could not tell.
@@ -2110,7 +2121,10 @@ def _check(
         del judged
     del items
     path = write_stats(stats, out_dir, day, boxes)
-    print(f"Statistics written to {path}, box heights to {path.parent / BOXES_DIR / path.name}")
+    if boxes is None:
+        print(f"Statistics written to {path}")
+    else:
+        print(f"Statistics written to {path}, box heights to {path.parent / BOXES_DIR / path.name}")
     return 0
 
 

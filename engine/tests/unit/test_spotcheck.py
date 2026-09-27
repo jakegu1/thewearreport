@@ -449,6 +449,16 @@ def test_ci_refusal_precedes_argument_parsing(monkeypatch: pytest.MonkeyPatch) -
     assert spotcheck.main(["--no-such-option"], pipeline=_untouchable()) == 2
 
 
+def test_record_boxes_in_frames_mode_is_refused_before_the_sweep(
+    env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["--n", "1", "--mode", "frames", "--record-boxes"]
+    out = tmp_path / "out"
+    assert _run(args, out, pipeline=_untouchable(), reviewer=Scripted()) == 1
+    assert spotcheck.RECORD_BOXES_FRAMES_REFUSAL in capsys.readouterr().err
+    assert not out.exists() and list(env.iterdir()) == []
+
+
 def test_unwritable_out_dir_is_refused_before_the_sweep(env: Path, tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("x", encoding="utf-8")
@@ -1449,21 +1459,15 @@ def _windows_lock(review: Path) -> list[Path]:
     return [spotcheck.lock_file(review)] if sys.platform == "win32" else []
 
 
-def _box_file(stats_file: Path) -> Path:
-    """The per-box file written next to `stats_file`."""
-    return stats_file.parent / spotcheck.BOXES_DIR / stats_file.name
-
-
 def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path) -> None:
-    """Every write is inside the one review directory, or is the statistics file or its
-    per-box file (or a directory made for them); and the images were written there."""
+    """Every write is inside the one review directory, or is the statistics file (or the
+    directory made for it); and the images were written there."""
     made = [Path(path) for kind, path in events if kind == "mkdtemp"]
     assert len(made) == 1, made
     review = made[0]
     assert review.name.startswith(spotcheck.TEMP_PREFIX)
     written = [Path(path) for kind, path in events if kind == "write"]
-    box_file = _box_file(stats_file)
-    allowed = [stats_file, stats_file.parent, box_file, box_file.parent, *_windows_lock(review)]
+    allowed = [stats_file, stats_file.parent, *_windows_lock(review)]
     stray = [p for p in written if p not in allowed]
     stray = [p for p in stray if not p.is_relative_to(review)]
     assert stray == [], stray
@@ -1633,8 +1637,7 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
     events = MARKER.findall(stderr)
     assert [text for kind, text in events if kind == "escape"] == []
     written = {work / text for kind, text in events if kind == "write"}  # cwd-relative
-    box_file = _box_file(stats_file)
-    allowed = {stats_file, work / "stats", box_file, box_file.parent, *_windows_lock(workdir)}
+    allowed = {stats_file, work / "stats", *_windows_lock(workdir)}
     for path in written - allowed:
         assert path.is_relative_to(tmp), path
         top = path.relative_to(tmp).parts[0]
@@ -1647,8 +1650,7 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
     }
 
     files = _all_files([work, home, tmp])
-    assert sorted(files) == sorted([stats_file, box_file])
-    assert "Fake_" not in box_file.read_text(encoding="utf-8")
+    assert list(files) == [stats_file]
     for data in files.values():
         assert not any(sig in data for sig in SIGNATURES)
     assert not any(sig.decode("latin-1") in output for sig in SIGNATURES)
