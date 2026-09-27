@@ -42,48 +42,20 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
-      - name: "TEMPORARY: Tk failure diagnosis (T-037)"
+      - name: "TEMPORARY: repeat with --capture=sys (T-037 diagnosis)"
         continue-on-error: true
         run: |
-          $plugin = @'
-          import os, subprocess, sys, threading, time, tkinter
-          _real = tkinter.Tk.__init__
-          _count = [0]
-          def _init(self, *args, **kwargs):
-              _count[0] += 1
-              try:
-                  _real(self, *args, **kwargs)
-              except tkinter.TclError as exc:
-                  init = os.path.join(sys.base_prefix, "tcl", "tcl8.6", "init.tcl")
-                  print("\nTKDIAG failure at Tk #%d: %s" % (_count[0], str(exc).splitlines()[0]), flush=True)
-                  print("TKDIAG threads:", [(t.name, t.daemon) for t in threading.enumerate()], flush=True)
-                  print("TKDIAG cwd:", os.getcwd(), "exists:", os.path.exists(init), flush=True)
-                  try:
-                      with open(init, "rb") as fh:
-                          print("TKDIAG python read ok:", len(fh.read()), flush=True)
-                  except OSError as err:
-                      print("TKDIAG python read failed:", err, flush=True)
-                  for attempt in range(1, 6):
-                      time.sleep(0.2)
-                      try:
-                          tkinter.Tk().destroy()
-                          print("TKDIAG retry", attempt, "ok", flush=True)
-                          break
-                      except tkinter.TclError as again:
-                          print("TKDIAG retry", attempt, "failed:", str(again).splitlines()[-3:], flush=True)
-                  child = subprocess.run([sys.executable, "-c", "import tkinter; tkinter.Tk().destroy(); print('child ok')"], capture_output=True, text=True)
-                  print("TKDIAG fresh process:", child.returncode, child.stdout.strip(), child.stderr.strip()[-200:], flush=True)
-                  raise
-          tkinter.Tk.__init__ = _init
-          '@
-          $dir = Join-Path $env:RUNNER_TEMP "tkdiag"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Set-Content -Path (Join-Path $dir "tkdiag.py") -Value $plugin -Encoding utf8
-          $env:PYTHONPATH = $dir
-          uv run --no-sync pytest -q -s -p tkdiag engine/tests/unit/test_spotcheck.py engine/tests/unit/test_spotcheck_window.py engine/tests/acceptance/test_t_037.py 2>&1 | Select-String -Pattern "TKDIAG|passed|failed"
+          foreach ($i in 1..3) {
+            uv run --no-sync pytest -q --capture=sys engine/tests/unit/test_spotcheck.py engine/tests/unit/test_spotcheck_window.py engine/tests/acceptance/test_t_037.py 2>&1 | Select-String -Pattern "passed|failed|FAILED"
+          }
       - name: Spot-check unit and acceptance tests
+        # --capture=sys: pytest's default capture swaps the process's standard handles
+        # for every test and closes them after it. Tcl keeps the standard channels it
+        # made from those handles for the life of the process, so once a handle is
+        # reused Tk fails at random to read its own library ("Can't find a usable
+        # init.tcl"). The tool itself never swaps them.
         run: >-
-          uv run --no-sync pytest -v -rs
+          uv run --no-sync pytest -v -rs --capture=sys
           engine/tests/unit/test_spotcheck.py
           engine/tests/unit/test_spotcheck_window.py
           engine/tests/acceptance/test_t_037.py
