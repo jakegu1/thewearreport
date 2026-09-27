@@ -449,6 +449,16 @@ def test_ci_refusal_precedes_argument_parsing(monkeypatch: pytest.MonkeyPatch) -
     assert spotcheck.main(["--no-such-option"], pipeline=_untouchable()) == 2
 
 
+def test_record_boxes_in_frames_mode_is_refused_before_the_sweep(
+    env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["--n", "1", "--mode", "frames", "--record-boxes"]
+    out = tmp_path / "out"
+    assert _run(args, out, pipeline=_untouchable(), reviewer=Scripted()) == 1
+    assert spotcheck.RECORD_BOXES_FRAMES_REFUSAL in capsys.readouterr().err
+    assert not out.exists() and list(env.iterdir()) == []
+
+
 def test_unwritable_out_dir_is_refused_before_the_sweep(env: Path, tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_text("x", encoding="utf-8")
@@ -1106,7 +1116,7 @@ elif scenario == "signal_in_handler":
         def __init__(self, real):
             self.real, self.sent = real, False
         def write(self, text):
-            if not self.sent:
+            if not self.sent and "No space left" in text:  # the error, not a progress line
                 self.sent = True
                 kill_self(signal.SIGTERM)
             return self.real.write(text)
