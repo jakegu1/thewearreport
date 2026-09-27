@@ -31,6 +31,7 @@ from tests.acceptance.test_t_007 import (
     _env,
     _git,
     _run_step,
+    _scalar,
     _steps,
     _tool,
 )
@@ -388,6 +389,377 @@ def test_a_skip_leaves_an_open_alert_issue_open(jobs: dict[str, list[str]]) -> N
     assert _alert_run(fake, 5, "failure") is schedule.Action.COMMENT
     assert "4" in issue["comments"][-1]
     assert _alert_run(fake, 6, "success") is schedule.Action.CLOSE
+
+
+# The job that writes contents runs only what is allowed (T-034) -------------------------
+
+# Everything a job holding `contents: write` may contain. Anything else (container,
+# services, uses, strategy, defaults, ...) could run code that is not ours.
+WRITE_JOB_KEYS = {"needs", "if", "runs-on", "timeout-minutes", "permissions", "outputs"}
+WRITE_JOB_KEYS |= {"env", "steps"}
+WRITE_STEP_KEYS = {"name", "id", "if", "uses", "with", "env", "run"}  # no shell:
+# The actions such a job may use (pinned to a full SHA), with these inputs: the download
+# exactly {name, path}, so it reads this run's artifact with this run's token.
+WRITE_ACTIONS = {
+    "actions/checkout": {"persist-credentials", "sparse-checkout"},
+    "actions/download-artifact": {"name", "path"},
+}
+# Environment variables that change what a program loads or runs.
+LOADER_ENV = re.compile(r"PYTHON\w*|LD_\w*|BASH_ENV|ENV|PATH|GIT_\w*")
+# The commands a `run:` script may run, and the shell words around them.
+WRITE_COMMANDS = {"git", "python3", "sed", "sort", "cat", "echo", "printf", "base64"}
+WRITE_COMMANDS |= {"mapfile", "xargs", "set", "cd", "test", "[", "exit"}
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "do", "!"}
+SHELL_ENDS = {"fi", "done"}
+GIT_SUBCOMMANDS = {"init", "remote", "ls-remote", "sparse-checkout", "fetch", "checkout"}
+GIT_SUBCOMMANDS |= {"ls-files", "add", "diff", "commit", "push"}
+GIT_CONFIG = re.compile(r"(user\.name|user\.email|http\.extraheader)=.*", re.DOTALL)
+# python3 runs only the engine's standard-library helpers from the checked-out engine,
+# never with the working directory on sys.path (-P, or PYTHONSAFEPATH=1).
+ENGINE_PATHS = {"engine", "${GITHUB_WORKSPACE}/engine"}
+# Where a script may write with a redirection.
+WRITE_TARGETS = re.compile(
+    r"/dev/null|\$\{GITHUB_OUTPUT\}|\$\{GITHUB_ENV\}|\$\{RUNNER_TEMP\}/[\w.-]+"
+)
+STATUS_FUNCTION = re.compile(r"\b(always|success|failure|cancelled)\s*\(")
+ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)=(.*)", re.DOTALL)
+REDIRECTION = re.compile(r"[0-9]*(<<<|<<|<|>>|>|&>)(&[0-9-]+)?")
+SUBSTITUTION = "$()"  # stands for a command or process substitution inside a word
+
+
+def write_job_problems(text: str) -> list[str]:
+    """Everything in the workflow `text` that lets a job holding `contents: write` run
+    code other than git, a few shell utilities and the engine's own helpers: a job or
+    step key outside the allowlists, an action or action input outside WRITE_ACTIONS, a
+    loader variable in any env (workflow, job, step, inline or GITHUB_ENV), a command
+    outside WRITE_COMMANDS, and a status function in the job's `if:` (it must not run
+    after the sweep failed)."""
+    top = _children(text.splitlines(), 0)
+    found = [f"workflow: {key}" for key in top if key in ("env", "defaults")]
+    for name, job in _children(top["jobs"][1:], 2).items():
+        keys = _children(job, 4)
+        permissions = _children(keys.get("permissions", [""])[1:], 6)
+        if "write" not in "".join(permissions.get("contents", [])):
+            continue
+        found += [f"{name}: job key {k}" for k in keys if k not in WRITE_JOB_KEYS]
+        env = _children(keys.get("env", [""])[1:], 6)
+        found += [f"{name}: env {k}" for k in env if LOADER_ENV.fullmatch(k)]
+        if "if" in keys and STATUS_FUNCTION.search(_scalar(keys["if"])):
+            found.append(f"{name}: a status function in if:")
+        for step in _steps(job):
+            found += [f"{name}: {problem}" for problem in _step_problems(step)]
+    return found
+
+
+def _step_problems(step: dict[str, str]) -> list[str]:
+    found = [f"step key {k}" for k in step if k not in WRITE_STEP_KEYS]
+    env = _children(step.get("env", "").splitlines(), 10)
+    found += [f"step env {k}" for k in env if LOADER_ENV.fullmatch(k)]
+    if "uses" in step:
+        action, _, ref = step["uses"].split(" #", 1)[0].strip().partition("@")
+        inputs = set(_children(step.get("with", "").splitlines(), 10))
+        if action not in WRITE_ACTIONS or not re.fullmatch(r"[0-9a-f]{40}", ref):
+            found.append(f"uses {step['uses']}")
+        elif not inputs <= WRITE_ACTIONS[action] or (
+            action == "actions/download-artifact" and inputs != WRITE_ACTIONS[action]
+        ):
+            found.append(f"{action} with {sorted(inputs)}")
+        elif action == "actions/checkout" and "persist-credentials: false" not in step.get(
+            "with", ""
+        ):
+            found.append("checkout keeps the token")
+        if "run" in step:
+            found.append("uses and run in one step")
+    return found + run_problems(step.get("run", ""))
+
+
+def run_problems(script: str) -> list[str]:
+    """Commands in the shell `script` outside the allowlist, including every command in
+    a command or process substitution and after a shell keyword; xargs may run only git.
+    A script this cannot read (backquotes, unbalanced quotes) is a problem, never a pass."""
+    try:
+        commands = shell_commands(script)
+    except ValueError as exc:
+        return [f"unreadable script: {exc}"]
+    return [problem for words in commands for problem in _command_problems(words)]
+
+
+def shell_commands(script: str) -> list[list[str]]:
+    """The simple commands in `script`, each as its words with the quotes removed. A
+    command or process substitution is its own command and stands as SUBSTITUTION in
+    the word that holds it. Raises ValueError for what this reader does not handle."""
+    done: list[list[str]] = []
+    # one level per substitution: [words, current word or None, inside double quotes]
+    levels: list[list[Any]] = [[[], None, False]]
+
+    def end_word() -> None:
+        if levels[-1][1] is not None:
+            levels[-1][0].append(levels[-1][1])
+            levels[-1][1] = None
+
+    def end_command() -> None:
+        end_word()
+        if levels[-1][0]:
+            done.append(levels[-1][0])
+        levels[-1][0] = []
+
+    def add(text: str) -> None:
+        levels[-1][1] = (levels[-1][1] or "") + text
+
+    i = 0
+    while i < len(script):
+        level, c = levels[-1], script[i]
+        if c == "`":
+            raise ValueError("backquotes")
+        if script.startswith(("$(", "<(", ">("), i) and not script.startswith("$((", i):
+            levels.append([[], None, False])
+            i += 2
+        elif level[2]:  # inside double quotes
+            if c == '"':
+                level[2] = False
+            elif c == "\\":
+                add(script[i : i + 2])
+                i += 1
+            else:
+                add(c)
+            i += 1
+        elif c == ")" and len(levels) > 1:
+            end_command()
+            levels.pop()
+            add(SUBSTITUTION)
+            i += 1
+        elif c == "'":
+            end = script.find("'", i + 1)
+            if end < 0:
+                raise ValueError("unbalanced single quote")
+            add(script[i + 1 : end])
+            i = end + 1
+        elif c == '"':
+            add("")
+            level[2] = True
+            i += 1
+        elif c == "\\":
+            if script[i + 1 : i + 2] != "\n":
+                add(script[i + 1 : i + 2])
+            i += 2
+        elif c == "#" and level[1] is None:
+            i = script.find("\n", i) % (len(script) + 1)
+        elif (m := REDIRECTION.match(script, i)) and (level[1] is None or c in "<>&"):
+            end_word()
+            level[0].append(m.group(0).lstrip("0123456789"))
+            i = m.end()
+        elif c in " \t":
+            end_word()
+            i += 1
+        elif c in "\n;&|":
+            end_command()
+            i += 1
+        else:
+            add(c)
+            i += 1
+    if len(levels) > 1 or levels[0][2]:
+        raise ValueError("unbalanced quotes or parentheses")
+    end_command()
+    return done
+
+
+def _command_problems(words: list[str]) -> list[str]:
+    found: list[str] = []
+    plain: list[str] = []
+    for word, target in zip(words, [*words[1:], ""], strict=True):
+        if plain and plain[-1] == "\0":  # the target of the previous redirection
+            plain[-1] = ""
+            continue
+        m = REDIRECTION.fullmatch(word) if word and word[0] in "<>&" else None
+        if not m:
+            plain.append(word)
+            continue
+        if ">" in m.group(1) and not m.group(2):
+            if target == "${GITHUB_ENV}":
+                found += _github_env_problems(words)
+            elif not WRITE_TARGETS.fullmatch(target):
+                found.append(f"writes to {target}")
+        if not m.group(2):
+            plain.append("\0")
+    words = [w for w in plain if w]
+    while words and words[0] in SHELL_KEYWORDS:
+        words = words[1:]
+    assigned = {}
+    while words and (m := ASSIGNMENT.fullmatch(words[0])):
+        assigned[m.group(1)] = m.group(2)
+        words = words[1:]
+    if not words or words[0] in SHELL_ENDS:
+        # an assignment alone lasts for the rest of the script
+        return found + [f"sets {k}" for k in assigned if LOADER_ENV.fullmatch(k)]
+    if words[0] == "for" and words[2:3] == ["in"]:
+        return found  # the loop's words are data; its body is checked command by command
+    command, args = words[0], words[1:]
+    if command not in WRITE_COMMANDS:
+        return [*found, f"runs {command}"]
+    if command == "python3":
+        return found + _python_problems(assigned, args)
+    found += [f"sets {k} for {command}" for k in assigned if LOADER_ENV.fullmatch(k)]
+    if command == "xargs":
+        rest = [a for a in args if not a.startswith("-")]
+        if rest[:1] != ["git"]:
+            found.append("xargs runs something other than git")
+        found += _command_problems(rest)
+    elif command == "git":
+        found += _git_problems(args)
+    elif command == "sed" and any(a.startswith(("-i", "--in-place")) for a in args):
+        found.append("sed edits a file in place")
+    return found
+
+
+def _github_env_problems(words: list[str]) -> list[str]:
+    """A write to GITHUB_ENV sets a variable for every later step: only `echo NAME=...`
+    of a name that is not a loader variable."""
+    m = ASSIGNMENT.fullmatch(words[1]) if len(words) == 4 and words[0] == "echo" else None
+    if m is None:
+        return [f"writes GITHUB_ENV: {' '.join(words)}"]
+    return [f"sets {m.group(1)} in GITHUB_ENV"] if LOADER_ENV.fullmatch(m.group(1)) else []
+
+
+def _python_problems(assigned: dict[str, str], args: list[str]) -> list[str]:
+    found = []
+    for name, value in assigned.items():
+        allowed = (name == "PYTHONPATH" and value in ENGINE_PATHS) or (
+            name == "PYTHONSAFEPATH" and value == "1"
+        )
+        if not allowed:
+            found.append(f"sets {name}={value} for python3")
+    safe = assigned.get("PYTHONSAFEPATH") == "1"
+    if args[:1] == ["-P"]:
+        safe, args = True, args[1:]
+    if args[:2] != ["-m", "wearreport.schedule"]:
+        found.append(f"python3 runs {' '.join(args[:2])}")
+    if not safe:
+        found.append("python3 without -P: the working directory is on sys.path")
+    return found
+
+
+def _git_problems(args: list[str]) -> list[str]:
+    found = []
+    while args[:1] == ["-c"]:
+        if not GIT_CONFIG.fullmatch("".join(args[1:2])):
+            found.append(f"git -c {''.join(args[1:2])}")
+        args = args[2:]
+    if args[:1] == [] or args[0] not in GIT_SUBCOMMANDS:
+        found.append(f"git {''.join(args[:1])}")
+    return found
+
+
+def test_the_write_job_runs_only_allowed_code() -> None:
+    assert write_job_problems(WORKFLOW.read_text(encoding="utf-8")) == []
+
+
+def test_the_shell_reader_finds_every_command() -> None:
+    script = (
+        "set -euo pipefail\n"
+        "# a comment; rm -rf /\n"
+        'auth="$(printf \'x:%s\' "${T}" | base64 -w0)"\n'
+        "mapfile -t days < <(sed -n 's#\\(a\\)#\\1#p' \"f\" | sort -u)\n"
+        'if [ "${rc}" -eq 0 ]; then echo "a (b); c" >&2; fi\n'
+        "git ls-files -z -- x \\\n  | xargs -0 -r git add -- 2> /dev/null\n"
+    )
+    assert shell_commands(script) == [
+        ["set", "-euo", "pipefail"],
+        ["printf", "x:%s", "${T}"],
+        ["base64", "-w0"],
+        ["auth=$()"],
+        ["sed", "-n", "s#\\(a\\)#\\1#p", "f"],
+        ["sort", "-u"],
+        ["mapfile", "-t", "days", "<", "$()"],
+        ["if", "[", "${rc}", "-eq", "0", "]"],
+        ["then", "echo", "a (b); c", ">&2"],
+        ["fi"],
+        ["git", "ls-files", "-z", "--", "x"],
+        ["xargs", "-0", "-r", "git", "add", "--", ">", "/dev/null"],
+    ]
+    for bad in ("echo `id`", "echo 'x", 'echo "x', "echo $(id"):
+        with pytest.raises(ValueError):
+            shell_commands(bad)
+
+
+def _into_publish(text: str, where: str, mutant: str) -> str:
+    start = text.index("\n  publish:\n")
+    at = text.index(where, start) + len(where)
+    return text[:at] + mutant + text[at:]
+
+
+@pytest.mark.parametrize(
+    ("where", "mutant"),
+    [
+        ("\n  publish:\n", "    container: node:22\n"),
+        ("\n  publish:\n", "    services:\n      cache:\n        image: redis:7\n"),
+        ("\n  publish:\n", "    strategy:\n      matrix:\n        x: [1]\n"),
+        ("\n  publish:\n", "    defaults:\n      run:\n        shell: python {0}\n"),
+        ("\n  publish:\n", "    uses: ./.github/workflows/other.yml\n"),
+        ("\n    env:\n", "      PYTHONPATH: /tmp/x\n"),
+        ("\n    env:\n", "      GIT_CONFIG_GLOBAL: /tmp/x\n"),
+    ],
+)
+def test_the_write_job_check_catches_a_job_key(where: str, mutant: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert write_job_problems(_into_publish(text, where, mutant)) != []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        "      - run: docker run --rm evil/img\n",
+        "      - run: npx some-tool\n",
+        "      - run: node x.js\n",
+        '      - run: bash "${RUNNER_TEMP}/artifact/x"\n',
+        "      - run: . ./x\n",
+        "      - run: eval x\n",
+        "      - run: echo x | sh\n",
+        "      - run: echo $(curl -s https://example.org)\n",
+        '      - run: echo "$(curl -s https://example.org)"\n',
+        "      - run: git status && make\n",
+        "      - run: xargs sh -c x < list\n",
+        "      - run: git -c core.fsmonitor=x status\n",
+        "      - run: git config core.hooksPath x\n",
+        "      - run: sed -i s/a/b/ x\n",
+        "      - run: echo x > .git/config\n",
+        "      - run: python3 -m wearreport.schedule gate\n",
+        "      - run: PYTHONSAFEPATH=1 python3 x.py\n",
+        "      - run: PYTHONSAFEPATH=1 PYTHONPATH=/tmp python3 -m wearreport.schedule gate\n",
+        "      - run: PATH=/tmp/x\n",
+        '      - run: echo "PYTHONPATH=/tmp" >> "${GITHUB_ENV}"\n',
+        '      - run: cat x >> "${GITHUB_ENV}"\n',
+        '      - run: echo /tmp >> "${GITHUB_PATH}"\n',
+        "      - name: x\n        shell: python {0}\n        run: print(1)\n",
+        "      - name: x\n        env:\n          PYTHONPATH: /tmp/artifact\n        run: echo\n",
+        "      - name: x\n        env:\n          LD_PRELOAD: /tmp/x.so\n        run: echo\n",
+        "      - name: x\n        env:\n          BASH_ENV: /tmp/x\n        run: echo\n",
+        "      - uses: actions/checkout@v7\n",
+        "      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7\n",
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+        "        with:\n          ref: other\n          persist-credentials: false\n",
+        "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+    ],
+)
+def test_the_write_job_check_catches_a_step(mutant: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert write_job_problems(_into_publish(text, "    steps:\n", mutant)) != []
+
+
+def test_the_write_job_check_catches_a_changed_download_or_if() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    download = "          name: sweep-records\n"
+    for extra in ("          run-id: 1\n", "          github-token: x\n"):
+        assert write_job_problems(_into_publish(text, download, extra)) != []
+    old = "    if: needs.sweep.outputs.skipped != 'true'\n"
+    assert old in text
+    for cond in ("always() && ", "success() && ", "!cancelled() && "):
+        assert write_job_problems(text.replace(old, old.replace("if: ", f"if: {cond}"))) != []
+
+
+def test_the_write_job_check_catches_workflow_env_and_defaults() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    for block in ("env:\n  PYTHONPATH: /tmp\n", "defaults:\n  run:\n    shell: sh\n"):
+        assert write_job_problems(text.replace("\njobs:\n", f"\n{block}\njobs:\n")) != []
 
 
 def test_the_commit_step_never_imports_from_the_data_checkout(
