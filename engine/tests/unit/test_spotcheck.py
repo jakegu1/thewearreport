@@ -39,6 +39,10 @@ SIGNATURES = (b"\xff\xd8\xff", b"\x89PNG", b"/9j/", b"iVBORw0KGgo")
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
 # Windows has no SIGHUP; the tests that send it are POSIX-only.
 SIGHUP = getattr(signal, "SIGHUP", signal.SIGTERM)
+# Tests that send POSIX signals to a process: on Windows, os.kill() and send_signal() end it.
+POSIX_SIGNALS = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX signals; Windows ends the process"
+)
 
 
 def _box(k: int) -> tuple[float, float, float, float]:
@@ -628,14 +632,19 @@ def test_alarm_stops_a_reviewer_that_ignores_its_deadline(env: Path, tmp_path: P
     assert code == 3
     assert time.monotonic() - started < WAIT_S / 2
     assert _leftovers(env) == []
-    assert signal.getsignal(signal.SIGALRM) in (signal.SIG_DFL, signal.SIG_IGN, None) or callable(
-        signal.getsignal(signal.SIGALRM)
-    )
-    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    if hasattr(signal, "SIGALRM"):  # Windows has no SIGALRM: the alarm is a timer thread
+        assert signal.getsignal(signal.SIGALRM) in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+            None,
+        ) or callable(signal.getsignal(signal.SIGALRM))
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
 
 def test_signal_handlers_are_restored(env: Path, tmp_path: Path) -> None:
-    before = {s: signal.getsignal(s) for s in (*spotcheck.HANDLED_SIGNALS, signal.SIGALRM)}
+    before = {
+        s: signal.getsignal(s) for s in (*spotcheck.HANDLED_SIGNALS, *spotcheck.ALARM_SIGNALS)
+    }
     assert (
         _run(
             ["--n", "1", "--min-persons", "1"],
@@ -653,6 +662,7 @@ def _deliver(signum: int) -> None:
     time.sleep(0.05)  # the Python-level handler runs at the latest here
 
 
+@POSIX_SIGNALS
 def test_signal_guard_raises_only_the_first_signal() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -669,6 +679,7 @@ def test_signal_guard_raises_only_the_first_signal() -> None:
         guard.restore()
 
 
+@POSIX_SIGNALS
 def test_signal_guard_holds_a_signal_inside_critical_then_latches() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -682,6 +693,7 @@ def test_signal_guard_holds_a_signal_inside_critical_then_latches() -> None:
         guard.restore()
 
 
+@POSIX_SIGNALS
 def test_signal_guard_stop_drops_every_signal() -> None:
     guard = spotcheck._SignalGuard()
     guard.install()
@@ -907,6 +919,7 @@ def _stale_dirs(tmp: Path, names: Sequence[str]) -> list[Path]:
     return made
 
 
+@POSIX_SIGNALS
 def test_remove_stale_finishes_a_removal_that_a_signal_lands_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1085,11 +1098,11 @@ def _finish(proc: subprocess.Popen[bytes]) -> tuple[int, str]:
 @pytest.mark.parametrize(
     ("scenario", "code", "message"),
     [
-        ("while_writing_SIGTERM", 128 + signal.SIGTERM, "SIGTERM"),
-        ("while_writing_SIGINT", 128 + signal.SIGINT, "SIGINT"),
-        ("while_writing_SIGHUP", 128 + SIGHUP, "SIGHUP"),
-        ("in_mkdtemp", 128 + signal.SIGINT, "SIGINT"),
-        ("in_rmtree", 128 + signal.SIGTERM, "SIGTERM"),
+        pytest.param("while_writing_SIGTERM", 128 + signal.SIGTERM, "SIGTERM", marks=POSIX_SIGNALS),
+        pytest.param("while_writing_SIGINT", 128 + signal.SIGINT, "SIGINT", marks=POSIX_SIGNALS),
+        pytest.param("while_writing_SIGHUP", 128 + SIGHUP, "SIGHUP", marks=POSIX_SIGNALS),
+        pytest.param("in_mkdtemp", 128 + signal.SIGINT, "SIGINT", marks=POSIX_SIGNALS),
+        pytest.param("in_rmtree", 128 + signal.SIGTERM, "SIGTERM", marks=POSIX_SIGNALS),
         ("stats_fail", 1, "No space left"),
     ],
 )
@@ -1127,6 +1140,7 @@ def _terminating() -> set[int]:
     return {int(s) for s in signal.valid_signals() if _name(s) not in excluded}
 
 
+@POSIX_SIGNALS
 def test_every_catchable_terminating_signal_is_handled() -> None:
     expected = _terminating()
     assert set(spotcheck.HANDLED_SIGNALS) == expected
@@ -1145,6 +1159,7 @@ def _sent_while_waiting() -> list[int]:
     return [*chosen, signal.SIGALRM]
 
 
+@POSIX_SIGNALS
 def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
     runs = []
     for signum in _sent_while_waiting():
@@ -1162,6 +1177,7 @@ def test_child_every_handled_signal_while_waiting(tmp_path: Path) -> None:
         assert not workdir.exists() and _leftovers(tmp) == [], signum
 
 
+@POSIX_SIGNALS
 @pytest.mark.parametrize(
     ("scenario", "code"),
     [
@@ -1183,6 +1199,7 @@ def test_child_signals_as_cleanup_starts_still_clean_up(
     assert not (tmp_path / "out").exists()
 
 
+@POSIX_SIGNALS
 def test_child_signal_while_reporting_an_error(tmp_path: Path) -> None:
     proc, tmp = _spawn(tmp_path, "signal_in_handler", ["--n", "2", "--min-persons", "1"])
     returncode, output = _finish(proc)
@@ -1195,6 +1212,7 @@ STRESS_RUNS = 20
 BURST = (signal.SIGINT, signal.SIGTERM, signal.SIGINT, SIGHUP)
 
 
+@POSIX_SIGNALS
 def test_child_repeated_signals_stress(tmp_path: Path) -> None:
     """INT, TERM, INT, HUP back to back while the review is open, in many processes."""
     runs = []
@@ -1243,6 +1261,7 @@ def test_child_keyboard_timeout_and_end_of_input(tmp_path: Path) -> None:
     assert _leftovers(tmp) == []
 
 
+@POSIX_SIGNALS
 def test_second_instance_never_deletes_a_running_instances_directory(tmp_path: Path) -> None:
     args = ["--n", "2", "--min-persons", "1", "--judgements", str(tmp_path / "j.json")]
     first, tmp = _spawn(tmp_path, "json", args)
@@ -1276,6 +1295,7 @@ def test_sigkill_leftover_is_removed_by_the_next_run(tmp_path: Path) -> None:
     assert _leftovers(tmp) == []
 
 
+@POSIX_SIGNALS
 @pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"])
 def test_child_signal_during_the_stale_sweep_still_removes_the_directory(
     tmp_path: Path, signame: str
