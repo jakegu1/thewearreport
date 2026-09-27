@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
 import weakref
 from collections.abc import Iterator, Sequence
@@ -271,6 +272,53 @@ def test_a_signal_while_the_window_waits_stops_the_tool(env: Path, tmp_path: Pat
     assert code == 128 + signal.SIGTERM
     assert not (tmp_path / "out").exists()
     assert signal.getsignal(signal.SIGTERM) == before
+
+
+class _SignalLater:
+    """A driver that presses no key and has a timer thread send `signum` to the process
+    `delay` seconds after the window shows: a signal that arrives while the window sits
+    idle in Tk's event loop. On Windows the thread raises SIGINT, as Ctrl-C would, since
+    os.kill there ends the process instead."""
+
+    def __init__(self, signum: int, delay: float) -> None:
+        self.signum, self.delay = signum, delay
+        self.timer: threading.Timer | None = None
+
+    def __call__(self, root: Any) -> None:
+        if sys.platform == "win32":
+            self.timer = threading.Timer(self.delay, signal.raise_signal, (self.signum,))
+        else:
+            self.timer = threading.Timer(self.delay, os.kill, (os.getpid(), self.signum))
+        self.timer.daemon = True
+        self.timer.start()
+
+
+def test_a_signal_while_the_window_is_idle_stops_the_tool_promptly(
+    env: Path, tmp_path: Path
+) -> None:
+    """Tk's event loop sees a signal only when an event wakes it; the tool's tick is
+    that event. Without it, Ctrl-C would wait for the review timeout."""
+    _need_window()
+    signum = signal.SIGINT if sys.platform == "win32" else signal.SIGTERM
+    timeout = 20
+    later = _SignalLater(signum, 0.5)
+    started = time.monotonic()
+    try:
+        code = _run(
+            ["--n", "1", "--min-persons", "1", "--view", "window", "--timeout", str(timeout)],
+            tmp_path / "out",
+            pipeline=_pipeline([1]),
+            reviewer=spotcheck.WindowReviewer(driver=later),
+        )
+    finally:
+        if later.timer is not None:
+            later.timer.cancel()
+            later.timer.join()
+    elapsed = time.monotonic() - started
+    assert later.timer is not None  # the window showed
+    assert code == 128 + signum
+    assert elapsed < timeout / 4
+    assert not (tmp_path / "out").exists()
 
 
 def test_an_error_in_the_driver_propagates_and_the_window_closes() -> None:
