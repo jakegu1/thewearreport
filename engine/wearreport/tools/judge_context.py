@@ -238,7 +238,10 @@ def main(
         print(line, flush=True)
 
     held = held_out_by_source(manifest)
-    moved = len(judge.held_out(manifest)) - len(held)
+    held_out = judge.held_out(manifest)
+    if not {item.id for item in held} <= {item.id for item in held_out}:
+        raise AssertionError("the held-out set by source photo is not within the held-out set")
+    moved = len(held_out) - len(held)
     emit(DIAGNOSTIC)
     emit(
         f"held-out items by source photo: {len(held)} of {len(manifest.items)}; "
