@@ -42,6 +42,42 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
+      - name: "TEMPORARY: Tk create/destroy stress (diagnosis for T-037)"
+        continue-on-error: true
+        run: |
+          $code = @'
+          import gc, os, sys, tempfile, threading, time, tkinter
+          print("base_prefix", sys.base_prefix, "TCL_LIBRARY", os.environ.get("TCL_LIBRARY"))
+          init = os.path.join(sys.base_prefix, "tcl", "tcl8.6", "init.tcl")
+          print("init.tcl exists", os.path.exists(init))
+          def cycle(label, n, between=None):
+              for i in range(n):
+                  if between: between(i)
+                  try:
+                      r = tkinter.Tk(); r.update(); r.destroy(); del r
+                  except Exception as exc:
+                      print(label, "FAILED at", i, "exists", os.path.exists(init), repr(exc)[:300])
+                      return
+              print(label, "ok", n)
+          cycle("plain", 100)
+          base = tempfile.mkdtemp()
+          def env(i):
+              d = os.path.join(base, str(i)); os.mkdir(d); os.chdir(d)
+              for v in ("HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR"): os.environ[v] = d
+          cycle("env+chdir", 100, env)
+          stop = False
+          def collector():
+              while not stop:
+                  gc.collect(); time.sleep(0.001)
+          t = threading.Thread(target=collector, daemon=True); t.start()
+          cycle("gc-thread", 100)
+          class Holder: pass
+          def leak(i):
+              h = Holder(); h.root = tkinter.Tk(); h.root.h = h; h.root.destroy()
+          cycle("cycles-with-gc-thread", 100, leak)
+          stop = True
+          '@
+          $code | uv run --no-sync python -
       - name: Spot-check unit and acceptance tests
         run: >-
           uv run --no-sync pytest -v -rs

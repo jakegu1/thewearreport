@@ -1443,6 +1443,12 @@ sys.exit(sc.main(sys.argv[2:], pipeline=pipeline, reviewer=Scripted()))
 """
 
 
+def _windows_lock(review: Path) -> list[Path]:
+    """The lock file next to the review directory: Windows only, and never an image (the
+    file scans show it is gone after the run)."""
+    return [spotcheck.lock_file(review)] if sys.platform == "win32" else []
+
+
 def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path) -> None:
     """Every write is inside the one review directory, or is the statistics file (or the
     directory made for it); and the images were written there."""
@@ -1451,7 +1457,8 @@ def _assert_writes_confined(events: Sequence[tuple[str, str]], stats_file: Path)
     review = made[0]
     assert review.name.startswith(spotcheck.TEMP_PREFIX)
     written = [Path(path) for kind, path in events if kind == "write"]
-    stray = [p for p in written if p not in (stats_file, stats_file.parent)]
+    allowed = [stats_file, stats_file.parent, *_windows_lock(review)]
+    stray = [p for p in written if p not in allowed]
     stray = [p for p in stray if not p.is_relative_to(review)]
     assert stray == [], stray
     assert [p for p in written if p.suffix == spotcheck.IMAGE_SUFFIX], "no image write seen"
@@ -1589,28 +1596,38 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
         mode,
     ]
     args += ["--judgements", str(judgements), "--reviewer", "tester", "--out-dir", "stats"]
-    proc = subprocess.Popen(
-        [sys.executable, "-c", AUDITED, *args],
-        cwd=work,
-        env=environ,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    workdir = _wait_for_review(tmp, proc)
+    # The output goes to files, outside every scanned directory: the audit writes a line
+    # per event, more than a Windows pipe holds before the child blocks on it.
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    with open(logs / "out", "wb") as out_fh, open(logs / "err", "wb") as err_fh:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", AUDITED, *args],
+            cwd=work,
+            env=environ,
+            stdout=out_fh,
+            stderr=err_fh,
+        )
+    try:
+        workdir = _wait_for_review(tmp, proc)
+    except AssertionError:
+        proc.kill()
+        proc.wait(timeout=WAIT_S)
+        raise AssertionError((logs / "err").read_bytes().decode(errors="replace")) from None
     images = [p for p in workdir.iterdir() if p.read_bytes().startswith(IMAGE_MAGIC)]
     assert images
     numbering = json.loads((workdir / spotcheck.NUMBERING_FILE).read_text(encoding="utf-8"))
     judgements.write_text(json.dumps(numbering["template"]), encoding="utf-8")
-    out, err = proc.communicate(timeout=WAIT_S)
-    stderr = err.decode(errors="replace")
+    proc.wait(timeout=WAIT_S)
+    stderr = (logs / "err").read_bytes().decode(errors="replace")
     assert proc.returncode == 0, stderr
-    output = out.decode(errors="replace") + MARKER.sub("", stderr)
+    output = (logs / "out").read_bytes().decode(errors="replace") + MARKER.sub("", stderr)
 
     stats_file = work / "stats" / f"{datetime.date.today().isoformat()}.json"
     events = MARKER.findall(stderr)
     assert [text for kind, text in events if kind == "escape"] == []
     written = {work / text for kind, text in events if kind == "write"}  # cwd-relative
-    allowed = {stats_file, work / "stats"}
+    allowed = {stats_file, work / "stats", *_windows_lock(workdir)}
     for path in written - allowed:
         assert path.is_relative_to(tmp), path
         top = path.relative_to(tmp).parts[0]

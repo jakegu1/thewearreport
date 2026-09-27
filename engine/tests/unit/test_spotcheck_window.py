@@ -92,8 +92,16 @@ def _run(args: Sequence[str], out: Path, **kwargs: Any) -> int:
     return spotcheck.main(argv, today=DAY, **kwargs)
 
 
-def _send(*keys: str, extra: Any = None) -> Any:
-    """A driver that sends `keys`, 20 ms apart, then calls `extra(root)` if given."""
+# Keypad Enter as Tk on Windows sees it: VK_RETURN with its extended-key flag
+# (EXTENDED_MASK in Tk's tkWinInt.h). There, `event generate <KP_Enter>` finds no keycode
+# for the keysym and delivers nothing.
+WINDOWS_KP_ENTER = ("<KeyPress>", {"keycode": 0x0D, "state": 1 << 16})
+KP_ENTER = WINDOWS_KP_ENTER if sys.platform == "win32" else "<KP_Enter>"
+
+
+def _send(*keys: str | tuple[str, dict[str, int]], extra: Any = None) -> Any:
+    """A driver that sends `keys` (a sequence, or a sequence and its event fields), 20 ms
+    apart, then calls `extra(root)` if given."""
 
     def drive(root: Any) -> None:
         pending = list(keys)
@@ -101,7 +109,9 @@ def _send(*keys: str, extra: Any = None) -> Any:
         def step() -> None:
             if pending:
                 root.focus_force()
-                root.event_generate(pending.pop(0))
+                key = pending.pop(0)
+                sequence, fields = (key, {}) if isinstance(key, str) else key
+                root.event_generate(sequence, **fields)
                 root.after(20, step)
             elif extra is not None:
                 extra(root)
@@ -197,7 +207,7 @@ def test_no_display_is_a_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_window_accepts_keypad_enter_and_capitals_and_ignores_keys_after_the_last() -> None:
     _need_window()
-    keys = ["<KP_Enter>", "<KeyPress-N>", "<KeyPress-V>", "<KeyPress-n>", "<KeyPress-q>"]
+    keys = [KP_ENTER, "<KeyPress-N>", "<KeyPress-V>", "<KeyPress-n>", "<KeyPress-q>"]
     reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
     judgements = reviewer.judge(_crops([1, 2, 3]), "crops", time.monotonic() + WAIT_S)
     assert dict(judgements) == {
