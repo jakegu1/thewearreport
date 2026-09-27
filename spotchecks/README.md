@@ -143,14 +143,18 @@ With `--view files`, rendered images exist only in the temporary directory, and 
 deletes it when it exits: after a normal run, an error, the review timeout, or any
 catchable signal whose default action ends the process: Ctrl-C (SIGINT), SIGTERM, SIGHUP,
 SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU (`ulimit -t`), SIGVTALRM, SIGPROF, SIGPOLL, SIGPWR,
-SIGSTKFLT and the real-time signals, where the platform has them; on Windows, Ctrl-C,
-Ctrl-Break (SIGBREAK) and SIGTERM. Repeated signals (Ctrl-C twice, or a closing
-terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else is written
-except the statistics file.
+SIGSTKFLT and the real-time signals, where the platform has them; on Windows, only
+Ctrl-C and Ctrl-Break (SIGBREAK) in the tool's console. Repeated signals (Ctrl-C twice,
+or a closing terminal's SIGHUP then SIGTERM) cannot interrupt the deletion. Nothing else
+is written except the statistics file.
 
-**SIGKILL cannot be handled** (nor can a power cut, a process ended from Task Manager
-or `taskkill /f` on Windows, or a crash with SIGSEGV, SIGBUS or another fault signal):
-the directory then stays behind.
+**SIGKILL cannot be handled** (nor can a power cut, or a crash with SIGSEGV, SIGBUS or
+another fault signal). **On Windows, cleanup cannot run** when the process is ended from
+outside: from Task Manager, by `taskkill /f`, or by any SIGTERM sent from another process
+(Windows terminates the process outright). Nor can it run when the console window or
+terminal tab is closed, or at log-off or shutdown: Windows ends the process before the
+deletion finishes. In all these cases the directory stays behind, and a later run deletes
+it once it is older than its timeout (see below).
 While it runs, the tool holds a lock on its directory (on Windows, on a lock file next to
 it, `.wearreport-spotcheck-*.lock`, deleted with the directory); at start it deletes every `wearreport-spotcheck-*` directory of the current user
 that is older than the timeout and not locked by a running instance. To clean up by
