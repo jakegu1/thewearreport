@@ -2,7 +2,8 @@
 branches, the data-branch checkout widens its sparse window until the failure
 streak's start is in it, so the published consecutive_failures traces back to the
 records (INV-6), and a sweep skipped as too soon after the last one (T-039) publishes
-nothing and is ignored by the alert.
+nothing and is ignored by the alert. The sweep job checks out and sweeps; the publish
+job commits and pushes (T-034).
 
 Uses the acceptance tests' reader for the workflow and their step runner, so these tests
 run exactly the scripts the acceptance tests run.
@@ -131,7 +132,7 @@ def _history(tmp_path: Path, jobs: dict[str, list[str]], records: list[Any]) -> 
     _run_step(_script(jobs, "sweep", "Check out the data branch"), tmp_path, remote, seed)
     for record in records:
         publish.publish(seed, record, now=aggregate.parse_utc(record["finished_at"]))
-    _run_step(_script(jobs, "sweep", "Commit and push"), tmp_path, remote, seed)
+    _run_step(_script(jobs, "publish", "Commit and push"), tmp_path, remote, seed)
     return remote
 
 
@@ -143,7 +144,7 @@ def _publish_now(
     data_dir = tmp_path / "run"
     _run_step(_script(jobs, "sweep", "Check out the data branch"), tmp_path, remote, data_dir)
     publish.publish(data_dir, record, now=now)
-    _run_step(_script(jobs, "sweep", "Commit and push"), tmp_path, remote, data_dir)
+    _run_step(_script(jobs, "publish", "Commit and push"), tmp_path, remote, data_dir)
     status = json.loads(_git(remote, "show", "data:status.json"))
     assert isinstance(status, dict)
     return data_dir, status
@@ -199,8 +200,8 @@ def test_no_widening_after_a_published_success(tmp_path: Path, jobs: dict[str, l
 # A sweep skipped as too soon after the last one (T-039) --------------------------------
 
 
-def _step_named(jobs: dict[str, list[str]], name: str) -> dict[str, str]:
-    [step] = [s for s in _steps(jobs["sweep"]) if s.get("name") == name]
+def _step_named(jobs: dict[str, list[str]], name: str, job: str = "sweep") -> dict[str, str]:
+    [step] = [s for s in _steps(jobs[job]) if s.get("name") == name]
     return step
 
 
@@ -266,20 +267,26 @@ def test_the_sweep_step_matches_the_cli_skip_line(jobs: dict[str, list[str]]) ->
     assert f"grep -q '^{cli.SKIPPED_PREFIX}'" in _step_named(jobs, "Sweep")["run"]
 
 
-def test_publish_and_record_steps_do_not_run_on_a_skip(jobs: dict[str, list[str]]) -> None:
+def test_nothing_is_collected_or_published_on_a_skip(jobs: dict[str, list[str]]) -> None:
     names = [s.get("name") for s in _steps(jobs["sweep"])]
-    # run_outcome recognises a past skip by these two step names
-    assert schedule.SWEEP_STEP in names and schedule.RECORD_STEP in names
-    for name in ("Commit and push to the data branch", schedule.RECORD_STEP):
-        assert _step_named(jobs, name)["if"] == "steps.sweep.outputs.skipped != 'true'"
+    # run_outcome's step names: the Sweep step in the sweep job, the record step in publish
+    assert schedule.SWEEP_STEP in names
+    assert schedule.RECORD_STEP in [s.get("name") for s in _steps(jobs["publish"])]
+    for step in _steps(jobs["sweep"]):
+        if step.get("id") in ("collect", "upload"):
+            assert step["if"] == "steps.sweep.outputs.skipped != 'true'"
+    publish_job = _children(jobs["publish"], 4)
+    assert "needs.sweep.outputs.skipped != 'true'" in publish_job["if"][0]
 
 
-def _result(jobs: dict[str, list[str]], tmp_path: Path, **outcomes: str) -> str:
-    """Run the Result step's script with the given step outcomes; return its stage."""
-    step = _step_named(jobs, "Result")
+def _result(jobs: dict[str, list[str]], tmp_path: Path, job: str = "sweep", **outcomes: str) -> str:
+    """Run a job's Result step script with the given step outcomes; return its stage."""
+    step = _step_named(jobs, "Result", job)
     names = re.findall(r"^\s*(\w+): \$\{\{ steps\.", step["env"], re.MULTILINE)
-    assert "SKIPPED" in names
-    values = {name: "success" for name in names} | {"FORCED": "skipped", "SKIPPED": ""}
+    values = {name: "success" for name in names}
+    if job == "sweep":
+        assert "SKIPPED" in names
+        values |= {"FORCED": "skipped", "SKIPPED": ""}
     values |= outcomes
     output = tmp_path / "result"
     output.write_text("")
@@ -297,18 +304,39 @@ def _result(jobs: dict[str, list[str]], tmp_path: Path, **outcomes: str) -> str:
 
 
 def test_the_result_stage_of_a_skip(tmp_path: Path, jobs: dict[str, list[str]]) -> None:
-    skip = {"SKIPPED": "true", "PUBLISH": "skipped", "RECORD": "skipped"}
+    skip = {"SKIPPED": "true", "COLLECT": "skipped", "UPLOAD": "skipped"}
     assert _result(jobs, tmp_path, **skip) == "skipped"
     assert _result(jobs, tmp_path) == "none"
     assert _result(jobs, tmp_path, SWEEP="failure") == "sweep"
-    assert _result(jobs, tmp_path, PUBLISH="skipped", RECORD="skipped") == "publish"
+    assert _result(jobs, tmp_path, UPLOAD="failure") == "publish"
+    assert _result(jobs, tmp_path, COLLECT="skipped", UPLOAD="skipped") == "publish"
     for stage in ("skipped", "none", "sweep", "publish"):
         assert stage in schedule.STAGES
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "stage"),
+    [
+        ({}, "none"),
+        ({"DOWNLOAD": "failure", "CHECK": "skipped"}, "publish"),
+        ({"CHECK": "failure"}, "publish"),
+        ({"COPY": "failure", "PUBLISH": "skipped", "RECORD": "skipped"}, "publish"),
+        ({"PUBLISH": "failure", "RECORD": "skipped"}, "publish"),
+        ({"RECORD": "failure"}, "record"),
+    ],
+)
+def test_the_result_stage_of_the_publish_job(
+    tmp_path: Path, jobs: dict[str, list[str]], outcomes: dict[str, str], stage: str
+) -> None:
+    assert _result(jobs, tmp_path, "publish", **outcomes) == stage
+    assert stage in schedule.STAGES
+
+
 def _alert_run(fake: FakeGitHub, run_id: int, sweep: str) -> schedule.Action:
-    """One run as the workflow reports it: `sweep` is success, failure or skip. The alert
-    job runs while the run is in progress; the run then completes with its jobs."""
+    """One run as the T-007 workflow reported it, before the publish job existed (such
+    runs stay in the history the alert reads): `sweep` is success, failure or skip. The
+    alert job runs while the run is in progress; the run then completes with its jobs.
+    The four-job layout is covered by test_t_034."""
     fake.add_run(run_id, None)
     fake.runs[0]["status"] = "in_progress"
     gh = schedule.GitHub(REPO, "t0ken", transport=fake, sleep=lambda _: None)

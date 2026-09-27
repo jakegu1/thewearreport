@@ -170,25 +170,40 @@ Scheduled and manual runs start from the default branch only.
 - **Spacing.** A sweep that would start less than 12 minutes after the last published
   one (`last_sweep_at` in `status.json`) is skipped, so a delayed scheduled run and a
   manual trigger that land close together publish once, not twice. The skipped run
-  contacts no camera, writes nothing, and its publish and record steps do not run; its
-  result stage is `skipped`. A missing or unreadable `status.json` never blocks a sweep.
+  contacts no camera, writes nothing, uploads nothing, and the publish job does not run;
+  its result stage is `skipped`. A missing or unreadable `status.json` never blocks a sweep.
 - **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the
   SHA-256 of both models on every run, and the sweep checks it again when it loads YOLOX-m.
-- **Timeout.** The sweep job stops after 15 minutes.
-- **Publishing.** The sweep job checks out the `data` branch shallow and sparse:
-  `status.json` and the last three UTC days of records. If none of those records is a
-  success and the previous `status.json` does not report one, it adds older days until
-  the newest success is in the tree, so `consecutive_failures` counts every failure since.
-  If the branch does not exist, the job creates it as an orphan. The job stages only new `sweeps/**/*.json` records and
-  `status.json`, checks the staged list, then commits and pushes. It is the only job with
-  `contents: write`.
-- **Alert.** A failed sweep is a sweep job that fails (for example, the registry is
-  unreachable, so no record is written) or a published record that is not a success
-  (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert
+- **Timeout.** The sweep job stops after 15 minutes, the publish job after 5.
+- **Sweeping.** The sweep job has `contents: read` only: it installs the dependencies,
+  loads the model and runs the detector, so it is the one that runs third-party code. It
+  checks out the `data` branch shallow and sparse: `status.json` and the last three UTC
+  days of records. If none of those records is a success and the previous `status.json`
+  does not report one, it adds older days until the newest success is in the tree, so
+  `consecutive_failures` counts every failure since. The search reads each older day's
+  records once, from git, and checks them as the publisher does (`streak-days`); it
+  stops after 400 days, and a streak older than that counts as unbounded:
+  `consecutive_failures` is then the failures in those days, a lower bound far above the
+  alert threshold. The job then uploads only the new `sweeps/**/*.json` record and
+  `status.json` as a workflow artifact kept for one day.
+- **Publishing.** The publish job is the only job with `contents: write`, and it runs no
+  third-party code: no `setup-uv`, no dependency, no `make`; only the pinned first-party
+  checkout and download-artifact actions, `git`, and the runner's `python3` with the
+  engine's standard-library helpers. It downloads the artifact and checks it: only
+  regular files, `status.json` and new records stored under their own date and
+  `sweep_id`, each JSON and at most 1 MiB. It checks out the `data` branch (creating it
+  as an orphan if it does not exist), copies the files in (an existing record must be
+  identical), stages only new records and `status.json`, checks the staged list, then
+  commits and pushes. A failed publish job can be re-run on its own while the artifact
+  lasts.
+- **Alert.** A failed sweep is a sweep or publish job that fails (for example, the
+  registry is unreachable, so no record is written) or a published record that is not a
+  success (`consecutive_failures` in `status.json`). After three failed sweeps in a row, the alert
   job opens an issue labelled `ops-alert` with the failure summary. While it is open, a
   further failure comments on it only when the failed stage changes, or when there has
-  been no such note for an hour. The next successful sweep closes it. Runs skipped by the
-  gate or by the spacing are ignored: they neither count as failures, nor break a run of
+  been no such note for an hour. The next successful sweep closes it. Earlier runs are
+  read in the order they were created. Runs skipped by the gate or by the spacing are
+  ignored: they neither count as failures, nor break a run of
   failures, nor close the issue. The alert job is the only job with `issues: write`.
 - **Manual run.** Actions → sweep → Run workflow. Tick `force_fail` to fail the sweep job
   before it does anything, which tests the alert without publishing. Manual runs obey the
