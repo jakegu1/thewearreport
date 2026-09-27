@@ -167,6 +167,11 @@ Scheduled and manual runs start from the default branch only.
   with that branch's unreviewed code.
 - **One run at a time.** All runs share one concurrency group. A queued run waits, and a
   run that is publishing is never cancelled.
+- **Spacing.** A sweep that would start less than 12 minutes after the last published
+  one (`last_sweep_at` in `status.json`) is skipped, so a delayed scheduled run and a
+  manual trigger that land close together publish once, not twice. The skipped run
+  contacts no camera, writes nothing, and its publish and record steps do not run; its
+  result stage is `skipped`. A missing or unreadable `status.json` never blocks a sweep.
 - **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the
   SHA-256 of both models on every run, and the sweep checks it again when it loads YOLOX-m.
 - **Timeout.** The sweep job stops after 15 minutes.
@@ -183,7 +188,8 @@ Scheduled and manual runs start from the default branch only.
   job opens an issue labelled `ops-alert` with the failure summary. While it is open, a
   further failure comments on it only when the failed stage changes, or when there has
   been no such note for an hour. The next successful sweep closes it. Runs skipped by the
-  gate are ignored. The alert job is the only job with `issues: write`.
+  gate or by the spacing are ignored: they neither count as failures, nor break a run of
+  failures, nor close the issue. The alert job is the only job with `issues: write`.
 - **Manual run.** Actions → sweep → Run workflow. Tick `force_fail` to fail the sweep job
   before it does anything, which tests the alert without publishing. Manual runs obey the
   gate too.

@@ -1,7 +1,8 @@
 """sweep.yml's own scripts, run for real: the gate refuses manual runs from other
-branches, and the data-branch checkout widens its sparse window until the failure
+branches, the data-branch checkout widens its sparse window until the failure
 streak's start is in it, so the published consecutive_failures traces back to the
-records (INV-6).
+records (INV-6), and a sweep skipped as too soon after the last one (T-039) publishes
+nothing and is ignored by the alert.
 
 Uses the acceptance tests' reader for the workflow and their step runner, so these tests
 run exactly the scripts the acceptance tests run.
@@ -21,8 +22,10 @@ from typing import Any
 import pytest
 
 from tests.acceptance.test_t_007 import (
+    REPO,
     ROOT,
     WORKFLOW,
+    FakeGitHub,
     _children,
     _env,
     _git,
@@ -30,7 +33,7 @@ from tests.acceptance.test_t_007 import (
     _steps,
     _tool,
 )
-from wearreport import aggregate, publish
+from wearreport import aggregate, cli, publish, schedule
 
 
 @pytest.fixture(scope="module")
@@ -191,3 +194,169 @@ def test_no_widening_after_a_published_success(tmp_path: Path, jobs: dict[str, l
     assert status["consecutive_failures"] == 1
     assert not publish.record_path(data_dir, success["sweep_id"]).exists()
     assert not publish.record_path(data_dir, old_failure["sweep_id"]).exists()
+
+
+# A sweep skipped as too soon after the last one (T-039) --------------------------------
+
+
+def _step_named(jobs: dict[str, list[str]], name: str) -> dict[str, str]:
+    [step] = [s for s in _steps(jobs["sweep"]) if s.get("name") == name]
+    return step
+
+
+def _sweep_step(tmp_path: Path, jobs: dict[str, list[str]], uv: str) -> tuple[int, list[str]]:
+    """Run the Sweep step's script with `uv` standing in for uv (a shell script body).
+    Returns its exit status and its GITHUB_OUTPUT lines."""
+    shim = tmp_path / "bin"
+    shim.mkdir(exist_ok=True)
+    (shim / "uv").write_text(f"#!/bin/sh\n{uv}")
+    (shim / "uv").chmod(0o755)
+    output = tmp_path / "output"
+    output.write_text("")
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir(exist_ok=True)
+    env = _env(
+        PATH=f"{shim}{os.pathsep}{os.environ['PATH']}",
+        DATA_DIR=str(tmp_path / "data"),
+        RUNNER_TEMP=str(runner_temp),
+        GITHUB_OUTPUT=str(output),
+    )
+    result = subprocess.run(
+        [_tool("bash"), "-e", "-c", _step_named(jobs, "Sweep")["run"]],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    return result.returncode, output.read_text().splitlines()
+
+
+def test_the_sweep_step_reports_a_real_skip(tmp_path: Path, jobs: dict[str, list[str]]) -> None:
+    # The real command: status.json says the last sweep started a minute ago.
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    last = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=1)
+    publish.publish(data_dir, _record(last, ok=True), now=last + timedelta(minutes=4))
+    before = sorted(p.relative_to(data_dir) for p in data_dir.rglob("*"))
+    # uv run --locked --no-dev wearreport ARGS...: run the engine's CLI with ARGS
+    uv = f'shift 4\nexec {sys.executable} -m wearreport.cli "$@"\n'
+    status, output = _sweep_step(tmp_path, jobs, uv)
+    assert status == 0
+    assert output == ["skipped=true"]
+    assert sorted(p.relative_to(data_dir) for p in data_dir.rglob("*")) == before
+
+
+def test_the_sweep_step_reports_no_skip_for_a_sweep_that_ran(
+    tmp_path: Path, jobs: dict[str, list[str]]
+) -> None:
+    status, output = _sweep_step(tmp_path, jobs, "echo 'sweep_id: 20260715T1227Z'\n")
+    assert (status, output) == (0, [])
+
+
+def test_the_sweep_step_fails_when_the_sweep_fails(
+    tmp_path: Path, jobs: dict[str, list[str]]
+) -> None:
+    # A failure after the skip line would still fail the step (pipefail through tee).
+    status, _ = _sweep_step(tmp_path, jobs, f"echo '{cli.SKIPPED_PREFIX} x'\nexit 1\n")
+    assert status != 0
+
+
+def test_the_sweep_step_matches_the_cli_skip_line(jobs: dict[str, list[str]]) -> None:
+    assert f"grep -q '^{cli.SKIPPED_PREFIX}'" in _step_named(jobs, "Sweep")["run"]
+
+
+def test_publish_and_record_steps_do_not_run_on_a_skip(jobs: dict[str, list[str]]) -> None:
+    names = [s.get("name") for s in _steps(jobs["sweep"])]
+    # run_outcome recognises a past skip by these two step names
+    assert schedule.SWEEP_STEP in names and schedule.RECORD_STEP in names
+    for name in ("Commit and push to the data branch", schedule.RECORD_STEP):
+        assert _step_named(jobs, name)["if"] == "steps.sweep.outputs.skipped != 'true'"
+
+
+def _result(jobs: dict[str, list[str]], tmp_path: Path, **outcomes: str) -> str:
+    """Run the Result step's script with the given step outcomes; return its stage."""
+    step = _step_named(jobs, "Result")
+    names = re.findall(r"^\s*(\w+): \$\{\{ steps\.", step["env"], re.MULTILINE)
+    assert "SKIPPED" in names
+    values = {name: "success" for name in names} | {"FORCED": "skipped", "SKIPPED": ""}
+    values |= outcomes
+    output = tmp_path / "result"
+    output.write_text("")
+    result = subprocess.run(
+        [_tool("bash"), "-e", "-c", step["run"]],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=_env(GITHUB_OUTPUT=str(output), **values),
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    [line] = output.read_text().splitlines()
+    return line.removeprefix("stage=")
+
+
+def test_the_result_stage_of_a_skip(tmp_path: Path, jobs: dict[str, list[str]]) -> None:
+    skip = {"SKIPPED": "true", "PUBLISH": "skipped", "RECORD": "skipped"}
+    assert _result(jobs, tmp_path, **skip) == "skipped"
+    assert _result(jobs, tmp_path) == "none"
+    assert _result(jobs, tmp_path, SWEEP="failure") == "sweep"
+    assert _result(jobs, tmp_path, PUBLISH="skipped", RECORD="skipped") == "publish"
+    for stage in ("skipped", "none", "sweep", "publish"):
+        assert stage in schedule.STAGES
+
+
+def _alert_run(fake: FakeGitHub, run_id: int, sweep: str) -> schedule.Action:
+    """One run as the workflow reports it: `sweep` is success, failure or skip. The alert
+    job runs while the run is in progress; the run then completes with its jobs."""
+    fake.add_run(run_id, None)
+    fake.runs[0]["status"] = "in_progress"
+    gh = schedule.GitHub(REPO, "t0ken", transport=fake, sleep=lambda _: None)
+    job_result = "failure" if sweep == "failure" else "success"
+    stage = {"success": "none", "failure": "sweep", "skip": "skipped"}[sweep]
+    action = schedule.alert(
+        gh,
+        run_id=run_id,
+        branch="main",
+        current=schedule.current_outcome("success", job_result, stage),
+        stage=stage,
+        record_failures=None,
+        server_url="https://github.com",
+    )
+    fake.runs[0]["status"] = "completed"
+    record = {"success": "success", "failure": "skipped", "skip": "skipped"}[sweep]
+    steps = [
+        {"name": schedule.SWEEP_STEP, "conclusion": job_result},
+        {"name": schedule.RECORD_STEP, "conclusion": record},
+    ]
+    fake.runs[0]["jobs"].append({"name": "sweep", "conclusion": job_result, "steps": steps})
+    return action
+
+
+def test_failure_skip_failure_counts_two(jobs: dict[str, list[str]]) -> None:
+    fake = FakeGitHub()
+    fake.add_run(1, "success")
+    assert _alert_run(fake, 2, "failure") is schedule.Action.NOTHING
+    assert _alert_run(fake, 3, "skip") is schedule.Action.NOTHING
+    assert _alert_run(fake, 4, "failure") is schedule.Action.NOTHING  # 2, not 3
+    assert fake.issues == {}
+    assert _alert_run(fake, 5, "skip") is schedule.Action.NOTHING
+    assert _alert_run(fake, 6, "failure") is schedule.Action.OPEN  # 3: the streak held
+    [issue] = fake.open_issues()
+    assert "3 consecutive failures" in issue["title"]
+    assert "runs/3" not in issue["body"] and "runs/5" not in issue["body"]
+
+
+def test_a_skip_leaves_an_open_alert_issue_open(jobs: dict[str, list[str]]) -> None:
+    fake = FakeGitHub()
+    for run_id in (1, 2, 3):
+        _alert_run(fake, run_id, "failure")
+    [issue] = fake.open_issues()
+    comments = len(issue["comments"])
+    assert _alert_run(fake, 4, "skip") is schedule.Action.NOTHING
+    assert fake.open_issues() == [issue]
+    assert len(issue["comments"]) == comments  # not even a comment
+    # the next failure still counts on from 3
+    assert _alert_run(fake, 5, "failure") is schedule.Action.COMMENT
+    assert "4" in issue["comments"][-1]
+    assert _alert_run(fake, 6, "success") is schedule.Action.CLOSE

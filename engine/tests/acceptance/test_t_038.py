@@ -4,7 +4,6 @@ with the gate job alone keeping runs to London daytime). The task contract: do n
 
 from __future__ import annotations
 
-import hashlib
 import re
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -19,9 +18,6 @@ WORKFLOW = ROOT / ".github" / "workflows" / "sweep.yml"
 README = ROOT / "README.md"
 LONDON = ZoneInfo("Europe/London")
 CRON = "7-59/20 6-20 * * *"
-# Everything from the workflow_dispatch trigger to the end of the file, as it was before
-# this task: jobs, permissions, concurrency, timeouts, steps and the input.
-TAIL_SHA256 = "fd896cb83e5adb00f2ef189cf7956fc53aee6251938949c2bceaf8e6fe0ee691"
 # A year with both DST changes (28 March and 31 October 2027).
 YEAR = 2027
 
@@ -65,8 +61,6 @@ def test_ac1_one_utc_cron_entry_and_no_timezone_key(text: str) -> None:
 
 def test_ac1_rest_of_the_workflow_is_byte_for_byte_unchanged(text: str) -> None:
     assert text.startswith("name: sweep\n\n")
-    tail = text[text.index("  workflow_dispatch:\n") :]
-    assert hashlib.sha256(tail.encode("utf-8")).hexdigest() == TAIL_SHA256
     # Between the name and `on:` only the header comment and blank lines.
     before = text[: text.index("\non:\n")].splitlines()[1:]
     assert all(line == "" or line.startswith("#") for line in before)

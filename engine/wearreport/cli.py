@@ -5,7 +5,10 @@
       go into a new temporary directory, whose path is printed. No git state is touched.
   wearreport sweep --data-dir PATH [--model NAME]
       One live sweep, published into PATH, a checkout of the `data` branch. Nothing is
-      committed or pushed; the scheduled workflow (T-007) does that.
+      committed or pushed; the scheduled workflow (T-007) does that. A sweep that would
+      start less than 12 minutes after the last one published in PATH (status.json's
+      `last_sweep_at`) is skipped: it prints one `sweep skipped:` line, touches nothing
+      (no camera, weather or model) and exits 0.
 
 The detector is YOLOX-m (`yolox_m.onnx`) unless `--model` names another pinned model.
 The record's `model_sha256` is the digest of the file that was loaded, read before and
@@ -13,7 +16,8 @@ after loading. Weather comes only from `wearreport.weather.current_conditions`; 
 WeatherConfigError (the dev-only weather flag set in production) stops the sweep with
 exit status 1 before any camera is contacted, and nothing is written.
 
-Exit status: 0 when the record was published (or was already there, identical), 1 when
+Exit status: 0 when the record was published (or was already there, identical) or the
+sweep was skipped as too soon, 1 when
 the sweep or the publish failed, 2 for a usage error. Logs are JSON lines on stderr.
 """
 
@@ -36,6 +40,8 @@ from wearreport.settings import SettingsError
 
 DEFAULT_MODEL = "yolox_m.onnx"
 DRY_RUN_PREFIX = "wearreport-sweep-"
+# The first word of the one line a skipped sweep prints; sweep.yml looks for it.
+SKIPPED_PREFIX = "sweep skipped:"
 
 logger = logging.getLogger("wearreport.cli")
 
@@ -122,10 +128,29 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _skip(data_dir: Path) -> bool:
+    """Whether this sweep starts too soon after the last one published in `data_dir`;
+    if so, say so in one line on stdout."""
+    now = aggregate._utc_now()
+    last = publish.last_sweep_at(data_dir)
+    if last is None or not publish.too_soon(last, now):
+        return False
+    minutes = int(publish.MIN_SWEEP_SPACING.total_seconds() // 60)
+    started, previous = aggregate.format_utc(now), aggregate.format_utc(last)
+    logger.info("sweep skipped", extra={"started_at": started, "last_sweep_at": previous})
+    print(
+        f"{SKIPPED_PREFIX} started {started}, too soon after the last sweep at {previous} "
+        f"(minimum spacing {minutes} minutes)"
+    )
+    return True
+
+
 def _sweep(args: argparse.Namespace) -> int:
     if args.data_dir is not None and not args.data_dir.is_dir():
         print(f"error: data directory {args.data_dir} does not exist", file=sys.stderr)
         return 1
+    if args.data_dir is not None and _skip(args.data_dir):
+        return 0
     try:
         detector, digest = load_detector(args.model)
         record = aggregate.run_sweep(detector, digest, model_name=Path(args.model).stem)
