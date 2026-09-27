@@ -89,7 +89,9 @@ external call has a timeout and a bounded retry policy.
 
 **INV-9 Public repository.** Nothing private in this repository (§1). Workflows run with
 least-privilege `permissions:` (only the data-publishing job gets `contents: write`),
-pin every third-party action to a full-length commit SHA, and run on `ubuntu-24.04`.
+pin every third-party action to a full-length commit SHA, and run on `ubuntu-24.04`. The one
+exception is the Windows portability job in `.github/workflows/windows.yml`, which runs on
+`windows-latest` with `contents: read` and no secrets.
 Never use `pull_request_target` or run untrusted code with secrets. Never store AI-service
 tokens (e.g. `CLAUDE_CODE_OAUTH_TOKEN`) in this repository's secrets. AI-agent workflows,
 if ever added, may only be triggered by the maintainer.
