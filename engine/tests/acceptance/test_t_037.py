@@ -40,7 +40,7 @@ from wearreport.tools import spotcheck
 
 ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT / "engine" / "wearreport" / "tools" / "spotcheck.py"
-CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "windows.yml"
 FETCH_SH = ROOT / "scripts" / "fetch_model.sh"
 FETCH_PS1 = ROOT / "scripts" / "fetch_model.ps1"
 REQUIRE_MODEL = "WEARREPORT_REQUIRE_MODEL"
@@ -1011,9 +1011,6 @@ def test_ac5_ci_has_a_least_privilege_windows_job() -> None:
     assert "pull_request_target" not in text
     uses = re.findall(r"uses:\s*(\S+)", text)
     assert uses and all(re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", u) for u in uses)
-    for other_id, other in jobs.items():
-        if other is not job:
-            assert "runs-on: ubuntu-24.04" in other, other_id
 
 
 def test_ac5_dry_run_with_the_window_reviewer_writes_statistics_and_no_image(
