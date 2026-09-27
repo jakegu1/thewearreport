@@ -1149,6 +1149,27 @@ def test_copy_artifact_allows_any_status_over_a_missing_or_unusable_one(
     assert (data / "status.json").read_bytes() == _status_at("2026-07-15T09:07:00Z")
 
 
+def test_check_artifact_refuses_a_symlink_to_a_valid_file_outside(tmp_path: Path) -> None:
+    # The targets are valid status and record files, so only the symlink check itself
+    # can refuse them (a link to the record would fail the status check instead).
+    record = _sweep(NOON, 10)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "status.json").write_bytes(b'{"consecutive_failures": 0}\n')
+    (outside / "record.json").write_bytes(publish.serialize(record))
+    artifact = _artifact(tmp_path / "a", record)
+    (artifact / "status.json").unlink()
+    (artifact / "status.json").symlink_to(outside / "status.json")
+    with pytest.raises(schedule.ScheduleError, match=r"'status\.json' is not a regular file"):
+        schedule.check_artifact(artifact)
+    artifact = _artifact(tmp_path / "b", record)
+    path = publish.record_path(artifact, record["sweep_id"])
+    path.unlink()
+    path.symlink_to(outside / "record.json")
+    with pytest.raises(schedule.ScheduleError, match="is not a regular file"):
+        schedule.check_artifact(artifact)
+
+
 def test_copy_artifact_checks_before_copying(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path / "a", _sweep(NOON, 10))
     (artifact / "notes.txt").write_text("x")
