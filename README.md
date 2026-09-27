@@ -152,14 +152,19 @@ a photo with a screening item. On the screen, no variant brought either model wi
 ## Operations
 
 [`.github/workflows/sweep.yml`](./.github/workflows/sweep.yml) runs one sweep every 20
-minutes from 07:00 to 20:40 London time (cron `*/20 7-20 * * *` with
-`timezone: "Europe/London"`, 42 runs a day). Scheduled and manual runs start from the
-default branch only.
+minutes in London daytime. The schedule is a plain UTC cron, `7-59/20 6-20 * * *`: minutes
+7, 27 and 47 of every hour from 06 to 20 UTC. That covers 07:00–21:00 London in both GMT
+and BST, and the gate skips the firings outside it, so about 42 sweeps run a day (from
+07:07 to 20:47 London time). The minutes are off the top of the hour because GitHub
+delays or drops scheduled runs under load, most of all at the start of every hour.
+Scheduled and manual runs start from the default branch only.
 
-- **Gate.** The first job checks the London time again and skips the sweep outside
-  07:00–21:00, for example when a scheduled run starts late. It also refuses a manual run
-  started from any branch other than the default branch: every branch carries the
-  workflow, and a run there would sweep and publish with that branch's unreviewed code.
+- **Gate.** The first job checks the London time and skips the sweep outside
+  07:00–21:00. It alone decides whether a run is in London daytime: in GMT it skips the
+  06 UTC firings, in BST the 20 UTC ones, and it also skips a scheduled run that starts
+  late. It also refuses a manual run started from any branch other than the default
+  branch: every branch carries the workflow, and a run there would sweep and publish
+  with that branch's unreviewed code.
 - **One run at a time.** All runs share one concurrency group. A queued run waits, and a
   run that is publishing is never cancelled.
 - **Model.** `.models/` is cached between runs. `scripts/fetch_model.sh` checks the
