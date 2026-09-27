@@ -42,49 +42,45 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
-      - name: "TEMPORARY: Tk create/destroy stress (diagnosis for T-037)"
+      - name: "TEMPORARY: Tk failure diagnosis (T-037)"
         continue-on-error: true
         run: |
-          $code = @'
-          import os, sys, tempfile, tkinter
-          print("base_prefix", sys.base_prefix, "cwd", os.getcwd(), flush=True)
-          def cycle(label, n, between=None):
-              bad = 0
-              for i in range(n):
-                  if between: between(i)
+          $plugin = @'
+          import os, subprocess, sys, threading, time, tkinter
+          _real = tkinter.Tk.__init__
+          _count = [0]
+          def _init(self, *args, **kwargs):
+              _count[0] += 1
+              try:
+                  _real(self, *args, **kwargs)
+              except tkinter.TclError as exc:
+                  init = os.path.join(sys.base_prefix, "tcl", "tcl8.6", "init.tcl")
+                  print("\nTKDIAG failure at Tk #%d: %s" % (_count[0], str(exc).splitlines()[0]), flush=True)
+                  print("TKDIAG threads:", [(t.name, t.daemon) for t in threading.enumerate()], flush=True)
+                  print("TKDIAG cwd:", os.getcwd(), "exists:", os.path.exists(init), flush=True)
                   try:
-                      r = tkinter.Tk(); r.update(); r.destroy(); del r
-                  except Exception as exc:
-                      bad += 1
-                      if bad <= 2: print(label, "FAILED at", i, repr(exc)[:160], flush=True)
-              print(label, "failures", bad, "of", n, flush=True)
-          start = os.getcwd()
-          base = tempfile.mkdtemp()
-          cycle("plain", 60)
-          def chdir_new(i):
-              d = os.path.join(base, "c%d" % i); os.mkdir(d); os.chdir(d)
-          cycle("chdir-new-dir", 60, chdir_new)
-          os.chdir(start)
-          def chdir_back_and_forth(i):
-              os.chdir(base if i % 2 else start)
-          cycle("chdir-two-dirs", 60, chdir_back_and_forth)
-          os.chdir(start)
-          def env_only(i):
-              d = os.path.join(base, "e%d" % i); os.mkdir(d)
-              for v in ("HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR"): os.environ[v] = d
-          cycle("env-only", 60, env_only)
-          def userprofile_only(i):
-              d = os.path.join(base, "u%d" % i); os.mkdir(d); os.environ["USERPROFILE"] = d
-          cycle("userprofile-only", 60, userprofile_only)
-          def home_only(i):
-              d = os.path.join(base, "h%d" % i); os.mkdir(d); os.environ["HOME"] = d
-          cycle("home-only", 60, home_only)
-          def temp_only(i):
-              d = os.path.join(base, "t%d" % i); os.mkdir(d)
-              for v in ("TEMP", "TMP"): os.environ[v] = d
-          cycle("temp-only", 60, temp_only)
+                      with open(init, "rb") as fh:
+                          print("TKDIAG python read ok:", len(fh.read()), flush=True)
+                  except OSError as err:
+                      print("TKDIAG python read failed:", err, flush=True)
+                  for attempt in range(1, 6):
+                      time.sleep(0.2)
+                      try:
+                          tkinter.Tk().destroy()
+                          print("TKDIAG retry", attempt, "ok", flush=True)
+                          break
+                      except tkinter.TclError as again:
+                          print("TKDIAG retry", attempt, "failed:", str(again).splitlines()[-3:], flush=True)
+                  child = subprocess.run([sys.executable, "-c", "import tkinter; tkinter.Tk().destroy(); print('child ok')"], capture_output=True, text=True)
+                  print("TKDIAG fresh process:", child.returncode, child.stdout.strip(), child.stderr.strip()[-200:], flush=True)
+                  raise
+          tkinter.Tk.__init__ = _init
           '@
-          $code | uv run --no-sync python -u -
+          $dir = Join-Path $env:RUNNER_TEMP "tkdiag"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Set-Content -Path (Join-Path $dir "tkdiag.py") -Value $plugin -Encoding utf8
+          $env:PYTHONPATH = $dir
+          uv run --no-sync pytest -q -s -p tkdiag engine/tests/unit/test_spotcheck.py engine/tests/unit/test_spotcheck_window.py engine/tests/acceptance/test_t_037.py 2>&1 | Select-String -Pattern "TKDIAG|passed|failed"
       - name: Spot-check unit and acceptance tests
         run: >-
           uv run --no-sync pytest -v -rs
