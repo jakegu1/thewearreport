@@ -767,7 +767,8 @@ _TOKEN = re.compile(r"[\x21-\x7e]{1,8192}")
 # key shapes): a word is kept only if it is at most 15 ASCII letters, or one of the service
 # error names below, with at most one trailing punctuation mark. Every other word, which
 # may be an echoed key in any form, becomes "…". Only the first 4 * MAX_ERROR_CHARS
-# characters of a message are examined, so a hostile reply costs linear time at most.
+# characters of a message are examined, so a hostile reply costs linear time at most, and a
+# word split by that cut is dropped.
 _PLAIN_WORD = re.compile(r"([A-Za-z]+)([.,:;!?]?)")
 MAX_WORD_LETTERS = 15
 KNOWN_ERROR_NAMES = frozenset(
@@ -787,6 +788,15 @@ KNOWN_ERROR_NAMES = frozenset(
         "ValidationException",
     }
 )
+
+
+def _cut_words(text: str, limit: int) -> str:
+    """The first `limit` characters of `text`, with a word that the cut splits replaced by
+    "…": its first part could be the first letters of a key and pass as a plain word."""
+    cut = text[:limit]
+    if len(text) > limit and not text[limit].isspace() and not cut[-1:].isspace():
+        cut = cut[: len(cut) - len(cut.split()[-1])] + "…"
+    return cut
 
 
 class RequestLimitReached(JudgeError):
@@ -1161,7 +1171,7 @@ class _HostedClassifier:
         """`text` with every word that is not plain (see _PLAIN_WORD) replaced by one "…", and
         the word after "Bearer" always replaced. The known token is removed first, and a
         word of 8 or more letters found in it is not kept."""
-        text = text[: 4 * MAX_ERROR_CHARS]
+        text = _cut_words(text, 4 * MAX_ERROR_CHARS)
         token = self._token or ""
         if token:
             text = text.replace(token, " ")

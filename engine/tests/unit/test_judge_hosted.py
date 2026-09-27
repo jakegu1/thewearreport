@@ -1066,6 +1066,73 @@ def test_no_generated_hostile_reply_leaks_a_fragment_of_a_key(
     assert checked >= 1000
 
 
+# The input cut: a key split by it ---------------------------------------------------------
+
+
+def _aws_secret(rng: random.Random) -> str:
+    return "".join(rng.choices(string.ascii_letters + string.digits + "+/", k=40))
+
+
+def _alphanumeric_key(rng: random.Random) -> str:
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=32))
+
+
+CUT_KEY_MAKERS = (_aws_secret, _base64_key, _jwt, _alphanumeric_key)
+CUT_FILLERS = ("x1 ", " ", "a-b\t")  # non-plain words, whitespace alone, a mix
+
+
+def test_a_key_split_by_the_input_cut_leaves_no_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classifiers = _classifiers(monkeypatch)
+    limit = 4 * judge.MAX_ERROR_CHARS
+    rng = random.Random(4035)  # noqa: S311  (seeded fake keys, not security)
+    checked = 0
+    for maker in CUT_KEY_MAKERS:
+        for filler in CUT_FILLERS:
+            for before in range(8, 16):  # characters of the key that fall before the cut
+                for mode in ("injected", "deepinfra"):  # no token held
+                    clf = classifiers[mode]
+                    key = maker(rng)
+                    lead = (filler * limit)[: limit - before]
+                    lead = lead[:-1] + " " if lead else lead  # the key starts a word
+                    message = lead + key + " and more"
+                    assert message[limit - before : limit] == key[:before]
+                    raw = json.dumps({"message": message}).encode()
+
+                    def send(body: bytes, raw: bytes = raw) -> Any:
+                        return 422, raw, ""
+
+                    monkeypatch.setattr(clf, "_send", send)
+                    with pytest.raises(judge.JudgeError) as caught:
+                        clf._call(b"")
+                    exc = caught.value
+                    shown = str(exc) + repr(exc) + "".join(traceback.format_exception(exc))
+                    assert _fragments(key, shown) == [], (maker.__name__, filler, before)
+                    checked += 1
+    assert checked == len(CUT_KEY_MAKERS) * len(CUT_FILLERS) * 8 * 2
+
+
+@pytest.mark.parametrize("gap", ["", " "])
+def test_only_the_start_of_a_long_message_is_examined(server: Any, gap: str) -> None:
+    limit = 4 * judge.MAX_ERROR_CHARS
+    lead = ("x1 " * limit)[:limit] + gap  # non-plain words up to the cut
+    fake = server(error(422, lead + "visible words after the cut"))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == "DeepInfra answered HTTP 422: …"
+
+
+def test_a_plain_word_ending_at_the_cut_is_kept(server: Any) -> None:
+    limit = 4 * judge.MAX_ERROR_CHARS
+    message = ("x1 " * limit)[: limit - 5] + " busy later"
+    assert message[limit - 4 : limit] == "busy" and message[limit] == " "
+    fake = server(error(422, message))
+    with pytest.raises(judge.JudgeError) as caught:
+        deepinfra(fake).classify(crop())
+    assert str(caught.value) == "DeepInfra answered HTTP 422: … busy"
+
+
 # Pathological lengths ---------------------------------------------------------------------
 
 
