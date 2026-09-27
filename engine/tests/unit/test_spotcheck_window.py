@@ -247,6 +247,17 @@ def test_window_leaves_no_tk_object_for_another_thread_to_free(last: str) -> Non
         gc.enable()
 
 
+def test_window_review_times_out_at_its_deadline_not_at_the_backstop() -> None:
+    """The review's own timeout ends it at the deadline. The tick's backstop, the
+    deadline plus WINDOW_DEADLINE_GRACE_S, only bounds the wait should that fail."""
+    _need_window()
+    send = _send()  # never answers
+    started = time.monotonic()
+    with pytest.raises(spotcheck.ReviewTimeout):
+        spotcheck.WindowReviewer(driver=send).judge(_crops([1]), "crops", time.monotonic() + 0.5)
+    assert time.monotonic() - started < 0.5 + spotcheck.WINDOW_DEADLINE_GRACE_S / 2
+
+
 def test_window_with_nothing_to_review_opens_nothing() -> None:
     reviewer = spotcheck.WindowReviewer(driver=lambda root: pytest.fail("no window"))
     assert reviewer.judge([], "crops", time.monotonic() + WAIT_S) == {}

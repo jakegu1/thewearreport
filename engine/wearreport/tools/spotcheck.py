@@ -206,6 +206,9 @@ WINDOW_TARGET_HEIGHT = 480  # the window enlarges crops by a whole factor up to 
 WINDOW_MAX_WIDTH = 1200
 MAX_WINDOW_SCALE = 4
 WINDOW_TICK_MS = 100  # Tk hands control back to Python this often, so signals are handled
+# A backstop: the tick ends a window review this long after its deadline, should the
+# review's own timeout callback not have ended it.
+WINDOW_DEADLINE_GRACE_S = 5.0
 WINDOW_TITLE = "Spot-check"
 WINDOW_LEGEND = (
     "Enter or Space: pedestrian   n: not a person   v: person in a vehicle   "
@@ -1327,6 +1330,9 @@ class _ReviewWindow:
         self._finish(ReviewTimeout("the review timed out"))
 
     def _tick(self) -> None:
+        if time.monotonic() >= self.deadline + WINDOW_DEADLINE_GRACE_S:
+            self._timeout()  # the timeout callback never ran: end the review regardless
+            return
         self.root.after(WINDOW_TICK_MS, self._tick)
 
     def _callback_failed(self, kind: object, value: BaseException, tb: object) -> None:
