@@ -151,9 +151,18 @@ jobs:
           WEARREPORT_ENV: production
           METOFFICE_API_KEY: ${{ secrets.METOFFICE_API_KEY }}
           TFL_APP_KEY: ${{ secrets.TFL_APP_KEY }}
-        run: uv run --locked --no-dev wearreport sweep --data-dir "${DATA_DIR}"
+        # A sweep too soon after the last published one prints `sweep skipped:`, writes
+        # nothing and exits 0; the step then outputs skipped=true (T-039).
+        run: |
+          set -euo pipefail
+          uv run --locked --no-dev wearreport sweep --data-dir "${DATA_DIR}" \
+            | tee "${RUNNER_TEMP}/sweep.out"
+          if grep -q '^sweep skipped:' "${RUNNER_TEMP}/sweep.out"; then
+            echo "skipped=true" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Commit and push to the data branch
         id: publish
+        if: steps.sweep.outputs.skipped != 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -179,6 +188,7 @@ jobs:
             push -q origin HEAD:refs/heads/data
       - name: Did the published sweep succeed?
         id: record
+        if: steps.sweep.outputs.skipped != 'true'
         run: |
           PYTHONPATH=engine python3 -m wearreport.schedule outcome \
             --status "${DATA_DIR}/status.json" >> "${GITHUB_OUTPUT}"
@@ -191,6 +201,7 @@ jobs:
           MODELS: ${{ steps.models.outcome }}
           CHECKOUT_DATA: ${{ steps.checkout-data.outcome }}
           SWEEP: ${{ steps.sweep.outcome }}
+          SKIPPED: ${{ steps.sweep.outputs.skipped }}
           PUBLISH: ${{ steps.publish.outcome }}
           RECORD: ${{ steps.record.outcome }}
         run: |
@@ -199,6 +210,7 @@ jobs:
           elif [ "${INSTALL}" != success ] || [ "${MODELS}" != success ]; then stage=setup
           elif [ "${CHECKOUT_DATA}" != success ]; then stage=checkout
           elif [ "${SWEEP}" != success ]; then stage=sweep
+          elif [ "${SKIPPED}" = true ]; then stage=skipped
           elif [ "${PUBLISH}" != success ]; then stage=publish
           elif [ "${RECORD}" != success ]; then stage=record
           else stage=none

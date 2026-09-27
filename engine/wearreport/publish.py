@@ -22,6 +22,11 @@ status.json is computed from the record files alone (see `compute_status`). Reco
 are external data when read back: each is size-capped, parsed and checked with
 `aggregate.check_record`; one that fails is counted in `records_invalid` and left out.
 Nothing here commits or pushes; T-007's workflow does that.
+
+A sweep that would start less than MIN_SWEEP_SPACING after the last published one is
+skipped (`too_soon`): a delayed scheduled run and a manual trigger can otherwise land
+minutes apart and both publish. The last start is status.json's `last_sweep_at`; a
+status.json that is missing or unusable never blocks a sweep.
 """
 
 from __future__ import annotations
@@ -53,6 +58,10 @@ STATUS_FILE: Final = "status.json"
 STATUS_SCHEMA: Final = "status.v1"
 # A record with 2000 cameras is about 110 kB; anything larger is not one of ours.
 MAX_RECORD_BYTES: Final = 1024 * 1024
+# status.json is about 1 kB; a larger one is not ours and is not read.
+MAX_STATUS_BYTES: Final = 64 * 1024
+# The least time between the starts of two published sweeps (the cron runs every 20).
+MIN_SWEEP_SPACING: Final = timedelta(minutes=12)
 WINDOW: Final = timedelta(hours=24)
 # A sweep succeeds when at least 90% of the cameras listed gave a usable frame.
 SUCCESS_NUMERATOR, SUCCESS_DENOMINATOR = 9, 10
@@ -439,3 +448,58 @@ def compute_status(data_dir: Path, *, now: datetime) -> dict[str, Any]:
         "records_invalid": invalid,
         "attribution": list(STATUS_ATTRIBUTION),
     }
+
+
+# Spacing -------------------------------------------------------------------------------
+
+
+def last_sweep_at(data_dir: Path) -> datetime | None:
+    """status.json's `last_sweep_at`: when the newest published sweep started. None when
+    there is no status.json, no sweep in it, or it cannot be used; an unusable one is
+    logged (without its content) and never blocks a sweep."""
+    try:
+        return _read_last_sweep_at(data_dir / STATUS_FILE)
+    except _UnusableStatus as exc:
+        logger.warning("status.json unusable for the sweep spacing", extra={"reason": str(exc)})
+        return None
+
+
+class _UnusableStatus(Exception):
+    """status.json exists but cannot say when the last sweep started."""
+
+
+def _read_last_sweep_at(path: Path) -> datetime | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _UnusableStatus(f"cannot inspect: {exc.strerror}") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise _UnusableStatus("not a regular file")
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(MAX_STATUS_BYTES + 1)
+    except OSError as exc:
+        raise _UnusableStatus(f"cannot read: {exc.strerror}") from None
+    if len(data) > MAX_STATUS_BYTES:
+        raise _UnusableStatus("too large")
+    try:
+        status = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):  # includes UnicodeDecodeError
+        raise _UnusableStatus("not JSON") from None
+    if not isinstance(status, dict):
+        raise _UnusableStatus("not an object")
+    value = status.get("last_sweep_at")
+    if value is None:
+        return None  # nothing published yet
+    try:
+        return aggregate.parse_utc(value)
+    except RecordError:
+        raise _UnusableStatus("last_sweep_at is not a UTC time") from None
+
+
+def too_soon(last: datetime | None, now: datetime) -> bool:
+    """Whether a sweep starting at `now` is within MIN_SWEEP_SPACING after `last`. A
+    `last` in the future (a clock set back) never blocks."""
+    return last is not None and last <= now < last + MIN_SWEEP_SPACING

@@ -900,3 +900,63 @@ def test_worth_a_comment(
 )
 def test_notice_stage(body: Any, stage: str | None) -> None:
     assert schedule._notice_stage(body) == stage
+
+
+# A sweep skipped as too soon after the last one (T-039) --------------------------------
+
+
+def _sweep_job(sweep_step: Any, record_step: Any) -> dict[str, Any]:
+    steps = [
+        {"name": schedule.SWEEP_STEP, "conclusion": sweep_step},
+        {"name": "Commit and push to the data branch", "conclusion": record_step},
+        {"name": schedule.RECORD_STEP, "conclusion": record_step},
+    ]
+    return {"name": "sweep", "conclusion": "success", "steps": steps}
+
+
+@pytest.mark.parametrize(
+    ("sweep", "expected"),
+    [
+        (_sweep_job("success", "skipped"), schedule.Outcome.NONE),  # the skip
+        (_sweep_job("success", "success"), schedule.Outcome.SUCCESS),
+        (_sweep_job("skipped", "skipped"), schedule.Outcome.SUCCESS),  # not a skip
+        ({"name": "sweep", "conclusion": "success"}, schedule.Outcome.SUCCESS),
+        ({"name": "sweep", "conclusion": "success", "steps": "x"}, schedule.Outcome.SUCCESS),
+        ({"name": "sweep", "conclusion": "success", "steps": [7, None]}, schedule.Outcome.SUCCESS),
+    ],
+)
+def test_run_outcome_treats_a_skipped_sweep_as_no_sweep(
+    sweep: dict[str, Any], expected: schedule.Outcome
+) -> None:
+    assert schedule.run_outcome([_job("gate", "success"), sweep]) is expected
+
+
+def test_a_failed_gate_is_a_failure_even_with_a_skip_stage() -> None:
+    assert schedule.current_outcome("failure", "skipped", "skipped") is schedule.Outcome.FAILURE
+
+
+@pytest.mark.parametrize("sweep", ["success", "failure", "cancelled"])
+def test_current_outcome_of_a_skipped_sweep_is_none(sweep: str) -> None:
+    assert schedule.current_outcome("success", sweep, "skipped") is schedule.Outcome.NONE
+    assert schedule.current_outcome("success", sweep, "none") is not schedule.Outcome.NONE
+
+
+def test_skipped_is_a_known_stage() -> None:
+    assert schedule.SKIPPED_STAGE in schedule.STAGES
+
+
+def test_alert_command_does_nothing_for_a_skipped_sweep(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    environ = {
+        "GITHUB_RUN_ID": "7",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "GITHUB_TOKEN": "t0ken",
+        "GITHUB_REF_NAME": "main",
+        # nothing listens here: any request would fail the command
+        "GITHUB_API_URL": "https://127.0.0.1:9",
+    }
+    argv = ["alert", "--gate-result", "success", "--sweep-result", "success"]
+    argv += ["--stage", "skipped", "--record-failures", ""]
+    assert schedule.main(argv, environ) == 0
+    assert "alert: nothing" in capsys.readouterr().out

@@ -21,13 +21,16 @@ dependencies installed, so this module uses the standard library only.
 The alert counts failed sweeps: this run's (from the gate and sweep job results) plus
 the unbroken run of failures before it, read from the workflow's run history. Runs whose
 gate closed, or that were cancelled before they started, neither count nor break the
-run. The count is at least status.json's `consecutive_failures` (failed records), since
-a sweep that exits 1 writes no record and one that publishes a failed record exits 0,
-and the workflow fails its sweep job for both. At ALERT_THRESHOLD failures in a row an
-issue labelled ALERT_LABEL is opened, or the open one gets a comment; the next success
-comments and closes it. While the issue is open, a failure adds a comment only when its
-failed stage differs from the newest notice's, or when there has been no notice for
-QUIET_PERIOD; each notice carries a hidden marker naming its stage.
+run; nor do runs whose sweep was skipped as too soon after the previous one (the Sweep
+step succeeded and the record step did not run; this run's stage is `skipped`), and a
+skip never closes the issue. The count is at least status.json's `consecutive_failures`
+(failed records), since a sweep that exits 1 writes no record and one that publishes a
+failed record exits 0, and the workflow fails its sweep job for both. At ALERT_THRESHOLD
+failures in a row an issue labelled ALERT_LABEL is opened, or the open one gets a
+comment; the next success comments and closes it. While the issue is open, a failure
+adds a comment only when its failed stage differs from the newest notice's, or when
+there has been no notice for QUIET_PERIOD; each notice carries a hidden marker naming
+its stage.
 
 The GitHub API is external data: responses are size-capped and every malformed one
 raises GitHubError. Each request has a timeout and a bounded number of retries.
@@ -65,8 +68,23 @@ ALERT_THRESHOLD: Final = 3
 WORKFLOW_FILE: Final = "sweep.yml"
 GATE_JOB, SWEEP_JOB = "gate", "sweep"
 STAGES: Final = frozenset(
-    {"gate", "forced", "setup", "checkout", "sweep", "publish", "record", "none", "unknown"}
+    {
+        "gate",
+        "forced",
+        "setup",
+        "checkout",
+        "sweep",
+        "skipped",
+        "publish",
+        "record",
+        "none",
+        "unknown",
+    }
 )
+# The stage of a run whose sweep was skipped as too soon after the last one.
+SKIPPED_STAGE: Final = "skipped"
+# sweep.yml's step names: a skip is a successful Sweep step and a skipped record step.
+SWEEP_STEP, RECORD_STEP = "Sweep", "Did the published sweep succeed?"
 # Previous runs read when counting failures; more than the threshold needs.
 LOOKBACK_RUNS: Final = 20
 # While the issue is open, a failure in the same stage as the newest notice is noted at
@@ -139,7 +157,8 @@ def _parse_now(text: str) -> datetime:
 class Outcome(enum.StrEnum):
     SUCCESS = "success"
     FAILURE = "failure"
-    NONE = "none"  # no sweep ran: gate closed, or cancelled before starting
+    # no sweep ran: gate closed, skipped as too soon, or cancelled before starting
+    NONE = "none"
 
 
 class Action(enum.StrEnum):
@@ -170,10 +189,13 @@ def status_failures(path: Path) -> int:
     return value
 
 
-def current_outcome(gate_result: str, sweep_result: str) -> Outcome:
-    """This run's outcome from the `needs.<job>.result` of the gate and sweep jobs."""
+def current_outcome(gate_result: str, sweep_result: str, stage: str = "") -> Outcome:
+    """This run's outcome from the `needs.<job>.result` of the gate and sweep jobs, and
+    the sweep job's stage (`skipped`: the sweep was too soon after the last one)."""
     if gate_result == "failure":
         return Outcome.FAILURE
+    if stage == SKIPPED_STAGE:
+        return Outcome.NONE
     if sweep_result == "success":
         return Outcome.SUCCESS
     if sweep_result in ("failure", "cancelled"):  # cancelled: the job timed out
@@ -194,12 +216,23 @@ def run_outcome(jobs: Sequence[Mapping[str, Any]]) -> Outcome:
         return Outcome.NONE
     conclusion = sweep.get("conclusion")
     if conclusion == "success":
-        return Outcome.SUCCESS
+        return Outcome.NONE if _skipped(sweep.get("steps")) else Outcome.SUCCESS
     if conclusion in ("failure", "timed_out"):
         return Outcome.FAILURE
     if conclusion == "cancelled" and sweep.get("steps"):  # it had started: a timeout
         return Outcome.FAILURE
     return Outcome.NONE
+
+
+def _skipped(steps: Any) -> bool:
+    """Whether a sweep job's steps (as the jobs API lists them) show a skipped sweep: the
+    Sweep step succeeded and the record step was skipped. Anything malformed is not."""
+    if not isinstance(steps, list):
+        return False
+    conclusions = {
+        step.get("name"): step.get("conclusion") for step in steps if isinstance(step, dict)
+    }
+    return conclusions.get(SWEEP_STEP) == "success" and conclusions.get(RECORD_STEP) == "skipped"
 
 
 def consecutive_failures(outcomes: Iterable[Outcome]) -> int:
@@ -711,7 +744,7 @@ def _env(environ: Mapping[str, str], name: str) -> str:
 
 
 def _alert_command(args: argparse.Namespace, environ: Mapping[str, str]) -> int:
-    current = current_outcome(args.gate_result, args.sweep_result)
+    current = current_outcome(args.gate_result, args.sweep_result, args.stage)
     record_failures = int(args.record_failures) if args.record_failures.isdigit() else None
     run_id = _env(environ, "GITHUB_RUN_ID")
     if not run_id.isdigit():

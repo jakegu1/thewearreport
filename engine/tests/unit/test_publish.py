@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -655,11 +656,16 @@ def test_cli_reports_a_conflicting_sweep_id(
     argv = ["sweep", "--data-dir", str(tmp_path), "--model", "yolox_s.onnx"]
     monkeypatch.setattr(aggregate, "_utc_now", lambda: T0)
     assert cli.main(argv) == 0
+    # A rerun in the same minute is skipped by the spacing (T-039) while status.json
+    # names the sweep; without it, the publisher's own checks are what stop a rerun.
+    status = tmp_path / publish.STATUS_FILE
+    status.unlink()
     assert cli.main(argv) == 0  # the same sweep again: nothing changes
     assert "(already published)" in capsys.readouterr().out
     (record_file,) = (tmp_path / "sweeps").rglob("*.json")
     stored = record_file.read_bytes()
     monkeypatch.setattr(aggregate, "engine_version", lambda: "0.0.1")  # other content
+    status.unlink()
     assert cli.main(argv) == 1
     assert "already published" in capsys.readouterr().err
     assert record_file.read_bytes() == stored
@@ -717,3 +723,53 @@ def test_cli_reports_a_record_that_cannot_be_built(
     assert cli.main(["sweep", "--data-dir", str(tmp_path), "--model", "yolox_s.onnx"]) == 1
     assert "engine_version is malformed" in capsys.readouterr().err
     assert list(tmp_path.iterdir()) == []
+
+
+# Spacing (T-039) -------------------------------------------------------------------------
+
+
+def test_too_soon_boundaries() -> None:
+    spacing = publish.MIN_SWEEP_SPACING
+    assert not publish.too_soon(None, T0)
+    assert publish.too_soon(T0, T0)
+    assert publish.too_soon(T0, T0 + spacing - timedelta(seconds=1))
+    assert not publish.too_soon(T0, T0 + spacing)
+    assert not publish.too_soon(T0 + timedelta(seconds=1), T0)  # a clock set back
+
+
+def test_last_sweep_at_of_a_status_with_no_sweep_is_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / publish.STATUS_FILE).write_text('{"last_sweep_at": null}')
+    with caplog.at_level(logging.WARNING):
+        assert publish.last_sweep_at(tmp_path) is None
+    assert caplog.records == []  # nothing published yet is not a problem
+
+
+def test_last_sweep_at_refuses_a_status_that_is_not_a_regular_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    target = tmp_path / "elsewhere.json"
+    target.write_text('{"last_sweep_at": "2026-07-15T12:00:05Z"}')
+    (tmp_path / publish.STATUS_FILE).symlink_to(target)
+    with caplog.at_level(logging.WARNING):
+        assert publish.last_sweep_at(tmp_path) is None
+    (tmp_path / publish.STATUS_FILE).unlink()
+    (tmp_path / publish.STATUS_FILE).mkdir()
+    with caplog.at_level(logging.WARNING):
+        assert publish.last_sweep_at(tmp_path) is None
+    assert len(caplog.records) == 2
+
+
+def test_last_sweep_at_reads_what_the_publisher_wrote(tmp_path: Path) -> None:
+    record = _record(T0)
+    publish.publish(tmp_path, record, now=T0 + timedelta(minutes=4))
+    assert publish.last_sweep_at(tmp_path) == aggregate.parse_utc(record["started_at"])
+
+
+@pytest.mark.parametrize("text", ["9999-12-31T23:59:59Z", "0001-01-01T00:00:00Z"])
+def test_last_sweep_at_the_edges_of_time_lets_the_sweep_run(tmp_path: Path, text: str) -> None:
+    (tmp_path / publish.STATUS_FILE).write_text(json.dumps({"last_sweep_at": text}))
+    last = publish.last_sweep_at(tmp_path)
+    assert last is not None
+    assert not publish.too_soon(last, T0)
