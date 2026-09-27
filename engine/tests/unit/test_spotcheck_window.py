@@ -99,26 +99,35 @@ WINDOWS_KP_ENTER = ("<KeyPress>", {"keycode": 0x0D, "state": 1 << 16})
 KP_ENTER = WINDOWS_KP_ENTER if sys.platform == "win32" else "<KP_Enter>"
 
 
-def _send(*keys: str | tuple[str, dict[str, int]], extra: Any = None) -> Any:
+class _Send:
     """A driver that sends `keys` (a sequence, or a sequence and its event fields), 20 ms
-    apart, then calls `extra(root)` if given."""
+    apart, then calls `extra(root)` if given. A class, not a closure that schedules
+    itself: that would be a reference cycle holding the window until the garbage
+    collector runs, in whatever thread that is."""
 
-    def drive(root: Any) -> None:
-        pending = list(keys)
+    def __init__(self, keys: Sequence[str | tuple[str, dict[str, int]]], extra: Any) -> None:
+        self.pending = list(keys)
+        self.then = extra
+        self.root: Any = None
 
-        def step() -> None:
-            if pending:
-                root.focus_force()
-                key = pending.pop(0)
-                sequence, fields = (key, {}) if isinstance(key, str) else key
-                root.event_generate(sequence, **fields)
-                root.after(20, step)
-            elif extra is not None:
-                extra(root)
+    def __call__(self, root: Any) -> None:
+        self.root = root
+        root.after(20, self._step)
 
-        root.after(20, step)
+    def _step(self) -> None:
+        root = self.root
+        if self.pending:
+            root.focus_force()
+            key = self.pending.pop(0)
+            sequence, fields = (key, {}) if isinstance(key, str) else key
+            root.event_generate(sequence, **fields)
+            root.after(20, self._step)
+        elif self.then is not None:
+            self.then(root)
 
-    return drive
+
+def _send(*keys: str | tuple[str, dict[str, int]], extra: Any = None) -> _Send:
+    return _Send(keys, extra)
 
 
 # The view -----------------------------------------------------------------------------
@@ -223,20 +232,16 @@ def test_window_leaves_no_tk_object_for_another_thread_to_free(last: str) -> Non
     the one that made it; the garbage collector can run in any thread. So nothing of the
     window may outlive the review in a reference cycle."""
     _need_window()
-    roots: list[weakref.ref[Any]] = []
     send = _send("<Return>", last)
-
-    def drive(root: Any) -> None:
-        roots.append(weakref.ref(root))
-        send(root)
-
     gc.disable()  # only the review's own clean-up may free it
     try:
         with contextlib.suppress(spotcheck.ReviewAborted):
-            spotcheck.WindowReviewer(driver=drive).judge(
+            spotcheck.WindowReviewer(driver=send).judge(
                 _crops([1, 2]), "crops", time.monotonic() + WAIT_S
             )
-        assert roots and roots[0]() is None
+        root = weakref.ref(send.root)
+        del send  # this test's own reference to the window
+        assert root() is None
     finally:
         gc.enable()
 
@@ -250,12 +255,19 @@ def test_a_signal_while_the_window_waits_stops_the_tool(env: Path, tmp_path: Pat
     _need_window()
     before = signal.getsignal(signal.SIGTERM)
     raise_term = _send("<Return>", extra=lambda root: signal.raise_signal(signal.SIGTERM))
-    code = _run(
-        ["--n", "2", "--min-persons", "1", "--view", "window"],
-        tmp_path / "out",
-        pipeline=_pipeline([2, 1]),
-        reviewer=spotcheck.WindowReviewer(driver=raise_term),
-    )
+    gc.disable()  # the interrupted window must not wait for the garbage collector
+    try:
+        code = _run(
+            ["--n", "2", "--min-persons", "1", "--view", "window"],
+            tmp_path / "out",
+            pipeline=_pipeline([2, 1]),
+            reviewer=spotcheck.WindowReviewer(driver=raise_term),
+        )
+        root = weakref.ref(raise_term.root)
+        del raise_term
+        assert root() is None
+    finally:
+        gc.enable()
     assert code == 128 + signal.SIGTERM
     assert not (tmp_path / "out").exists()
     assert signal.getsignal(signal.SIGTERM) == before

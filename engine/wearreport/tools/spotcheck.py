@@ -559,7 +559,13 @@ class _SignalGuard:
                 self._pending = exc
             return
         self._stopping = True  # before raising: no later signal may interrupt clean-up
-        raise exc
+        try:
+            raise exc
+        finally:
+            # A local holding the exception, whose traceback holds this frame, is a
+            # reference cycle: everything the traceback reaches (a Tk window, for one)
+            # would wait for the garbage collector, which may run in another thread.
+            del exc
 
     @contextlib.contextmanager
     def critical(self) -> Iterator[None]:
@@ -572,7 +578,10 @@ class _SignalGuard:
                 exc, self._pending = self._pending, None
                 if not self._stopping:
                     self._stopping = True
-                    raise exc
+                    try:
+                        raise exc
+                    finally:
+                        del exc  # no reference cycle through this frame (see _handle)
 
 
 def _lock(path: str | Path) -> int | None:
