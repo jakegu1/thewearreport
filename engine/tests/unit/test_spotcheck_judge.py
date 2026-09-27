@@ -266,3 +266,37 @@ def test_a_failed_request_is_reported_by_its_status_only(
     assert (
         "spotcheck: the judge stopped: DeepInfra answered HTTP 400; its statistics are incomplete\n"
     ) in out.err
+
+
+# Cheap pins -----------------------------------------------------------------------------
+
+
+def test_only_judge_hosted_calls_the_unchecked_ask() -> None:
+    """`_ask` skips the gold-set check: only the two entry points in judge_hosted.py may
+    call it."""
+    engine = Path(__file__).resolve().parents[2] / "wearreport"
+    needle = "._ask" + "("
+    callers = sorted(
+        path.relative_to(engine).as_posix()
+        for path in engine.rglob("*.py")
+        if needle in path.read_text(encoding="utf-8")
+    )
+    assert callers == ["tools/judge_hosted.py"]
+
+
+def test_a_failure_other_than_a_judge_error_keeps_the_reviewer_statistics(
+    env: Path,
+    serve: Callable[..., Fake],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # One box as wide as a 2200-pixel frame: its crop is wider than the judge accepts, so
+    # the judge raises ValueError, not JudgeError, before any request.
+    wide = _pipeline([[(0.0, 50.0, 2200.0, 110.0)]], size=(300, 2200))
+    judge = serve()
+    assert _run(judge, env, pipeline=wide) == 0
+    assert judge.requests == []
+    stats = json.loads(_stats_text(env))
+    assert stats["boxes_shown"] == 1 and stats["precision_person"] == 1.0
+    assert stats["judge"]["status"] == "incomplete"
+    assert stats["judge"]["requests"] == 0
+    assert "the judge stopped: failed (ValueError)" in capsys.readouterr().err
