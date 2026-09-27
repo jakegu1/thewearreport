@@ -259,13 +259,36 @@ class FakeGitHub:
     issues: dict[int, dict[str, Any]] = field(default_factory=dict)
     token_seen: set[str] = field(default_factory=set)
 
-    def add_run(self, run_id: int, sweep: str | None, *, gate: str | None = "success") -> None:
+    def add_run(
+        self,
+        run_id: int,
+        sweep: str | None,
+        *,
+        gate: str | None = "success",
+        publish: str | None = None,
+    ) -> None:
         jobs = []
         if gate is not None:
             jobs.append({"name": "gate", "conclusion": gate, "steps": [{"name": "x"}]})
         if sweep is not None:
             jobs.append({"name": "sweep", "conclusion": sweep, "steps": [{"name": "x"}]})
-        self.runs.insert(0, {"id": run_id, "status": "completed", "jobs": jobs})
+            # T-034: publish runs after a successful sweep job and is skipped otherwise
+            if publish is None:
+                publish = "success" if sweep == "success" else "skipped"
+            steps = [] if publish == "skipped" else [{"name": "x"}]
+            jobs.append({"name": "publish", "conclusion": publish, "steps": steps})
+        # T-034: every run has created_at and updated_at, 20 minutes after the last run
+        created = datetime(2026, 7, 15, 6, 7, tzinfo=UTC) + timedelta(minutes=20 * len(self.runs))
+        self.runs.insert(
+            0,
+            {
+                "id": run_id,
+                "status": "completed",
+                "jobs": jobs,
+                "created_at": f"{created:%Y-%m-%dT%H:%M:%SZ}",
+                "updated_at": f"{created + timedelta(minutes=5):%Y-%m-%dT%H:%M:%SZ}",
+            },
+        )
 
     def open_issues(self) -> list[dict[str, Any]]:
         return [i for i in self.issues.values() if i["state"] == "open"]
@@ -280,7 +303,8 @@ class FakeGitHub:
         base = f"/repos/{REPO}"
         if method == "GET" and path == f"{base}/actions/workflows/sweep.yml/runs":
             assert query.get("branch") == ["main"]
-            runs = [{"id": r["id"], "status": r["status"]} for r in self.runs]
+            keys = ("id", "status", "created_at", "updated_at")
+            runs = [{k: r[k] for k in keys} for r in self.runs]
             return 200, json.dumps({"total_count": len(runs), "workflow_runs": runs}).encode()
         m = re.fullmatch(rf"{base}/actions/runs/(\d+)/jobs", path)
         if method == "GET" and m:
@@ -489,9 +513,10 @@ def test_ac7_least_privilege_permissions(
     top: dict[str, list[str]], jobs: dict[str, list[str]]
 ) -> None:
     assert _scalar(top["permissions"]) == "{}"
-    assert set(jobs) == {"gate", "sweep", "alert"}
+    assert set(jobs) == {"gate", "sweep", "publish", "alert"}
     assert _permissions(jobs["gate"]) == {"contents": "read"}
-    assert _permissions(jobs["sweep"]) == {"contents": "write"}
+    assert _permissions(jobs["sweep"]) == {"contents": "read"}
+    assert _permissions(jobs["publish"]) == {"contents": "write"}
     assert _permissions(jobs["alert"]) == {"actions": "read", "contents": "read", "issues": "write"}
 
 
@@ -527,7 +552,7 @@ def test_ac7_secrets_only_reach_the_sweep_step(jobs: dict[str, list[str]], text:
 
 def test_ac7_only_explicit_paths_are_staged(jobs: dict[str, list[str]], text: str) -> None:
     assert not re.search(r"git add\s+(-A|--all|\.(\s|$)|-u)", text)
-    run = _step(jobs, "sweep", "Commit and push")["run"]
+    run = _step(jobs, "publish", "Commit and push")["run"]
     adds = re.findall(r"git add(.*)", run)
     assert adds == [" --", " -- status.json"]
     assert "':(glob)sweeps/**/*.json'" in run
@@ -647,7 +672,7 @@ def test_ac8_data_branch_is_created_as_an_orphan_then_checked_out_shallow_and_sp
     tmp_path: Path, jobs: dict[str, list[str]]
 ) -> None:
     checkout = _step(jobs, "sweep", "Check out the data branch")["run"]
-    commit = _step(jobs, "sweep", "Commit and push")["run"]
+    commit = _step(jobs, "publish", "Commit and push")["run"]
     remote = tmp_path / "remote.git"
     subprocess.run([_tool("git"), "init", "-q", "--bare", str(remote)], check=True, env=_env())
     now = datetime.now(UTC).replace(microsecond=0)
@@ -695,7 +720,7 @@ def test_ac8_only_the_publishing_job_writes_contents_and_only_alert_writes_issue
 ) -> None:
     writers = {name for name, job in jobs.items() if _permissions(job).get("contents") == "write"}
     issues = {name for name, job in jobs.items() if _permissions(job).get("issues") == "write"}
-    assert writers == {"sweep"}
+    assert writers == {"publish"}
     assert issues == {"alert"}
-    run = _step(jobs, "sweep", "Commit and push")["run"]
+    run = _step(jobs, "publish", "Commit and push")["run"]
     assert re.findall(r"\bpush\b[^\n]*", run) == ["push -q origin HEAD:refs/heads/data"]
