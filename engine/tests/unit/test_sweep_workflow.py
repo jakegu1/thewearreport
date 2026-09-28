@@ -420,6 +420,13 @@ GIT_PROGRAM_OPTIONS = ("--upload-pack", "--receive-pack", "--exec")
 # A sed script may only be one s command with these flags: never e (run the pattern
 # space), w (write a file), or any other command.
 SED_FLAGS = re.compile(r"[gpI0-9]*")
+# The only option words sed, mapfile and xargs may take in a write job, each a word of
+# its own. Anything else (a bundle such as -ne, a long-option prefix such as --exp, -C,
+# -I, ...) is a problem: deny by default rather than model each command's parser.
+SED_OPTIONS = {"-n", "-E"}  # and -e <script>, --expression=<script>
+MAPFILE_OPTIONS = {"-t"}  # and -d <delimiter>
+XARGS_OPTIONS = {"-0", "-r"}
+PLAIN_NAME = re.compile(r"[A-Za-z_]\w*")
 # The only line a write job may hold at its key indent: a plain, unquoted key.
 JOB_KEY_LINE = re.compile(r"^    [\w-]+:( |$)")
 # python3 runs only the engine's standard-library helpers from the checked-out engine,
@@ -587,22 +594,22 @@ def shell_commands(script: str) -> list[list[str]]:
 def _command_problems(words: list[str]) -> list[str]:
     found: list[str] = []
     plain: list[str] = []
+    skip = False
     for word, target in zip(words, [*words[1:], ""], strict=True):
-        if plain and plain[-1] == "\0":  # the target of the previous redirection
-            plain[-1] = ""
+        if skip:  # the target of the previous redirection
+            skip = False
             continue
         m = REDIRECTION.fullmatch(word) if word and word[0] in "<>&" else None
         if not m:
-            plain.append(word)
+            plain.append(word)  # an empty word ('') stays: it is an argument
             continue
         if ">" in m.group(1) and not m.group(2):
             if target == "${GITHUB_ENV}":
                 found += _github_env_problems(words)
             elif not WRITE_TARGETS.fullmatch(target):
                 found.append(f"writes to {target}")
-        if not m.group(2):
-            plain.append("\0")
-    words = [w for w in plain if w]
+        skip = not m.group(2)
+    words = plain
     while words and words[0] in SHELL_KEYWORDS:
         words = words[1:]
     assigned = {}
@@ -621,10 +628,7 @@ def _command_problems(words: list[str]) -> list[str]:
         return found + _python_problems(assigned, args)
     found += [f"sets {k} for {command}" for k in assigned if LOADER_ENV.fullmatch(k)]
     if command == "xargs":
-        rest = [a for a in args if not a.startswith("-")]
-        if rest[:1] != ["git"]:
-            found.append("xargs runs something other than git")
-        found += _command_problems(rest)
+        found += _xargs_problems(args)
     elif command == "git":
         found += _git_problems(args)
     elif command == "sed":
@@ -642,39 +646,51 @@ def _loader_target_problems(command: str, target: str) -> list[str]:
     return [f"{command} sets {name}"] if LOADER_ENV.fullmatch(name) else []
 
 
-def _mapfile_problems(args: list[str]) -> list[str]:
-    """mapfile's target is its first word after the options (MAPFILE by default); -C
-    runs a callback."""
+def _xargs_problems(args: list[str]) -> list[str]:
+    """xargs takes only the options in XARGS_OPTIONS, and runs git: everything from its
+    first non-option word on is checked, options included, as a command of its own."""
     i = 0
-    while i < len(args) and args[i].startswith("-") and args[i] != "--":
-        if args[i].startswith("-C"):
-            return ["mapfile runs a callback"]
-        takes_value = args[i] in ("-d", "-n", "-O", "-s", "-u", "-c")
-        i += 2 if takes_value else 1
-    rest = args[i + (args[i : i + 1] == ["--"]) :]
-    return _loader_target_problems("mapfile", rest[0] if rest else "MAPFILE")
+    while i < len(args) and args[i].startswith("-"):
+        i += 1
+    found = [f"xargs option {a!r}" for a in args[:i] if a not in XARGS_OPTIONS]
+    if args[i : i + 1] != ["git"]:
+        found.append("xargs runs something other than git")
+    return found + _command_problems(args[i:])
+
+
+def _mapfile_problems(args: list[str]) -> list[str]:
+    """mapfile takes only -t and -d <delimiter>, and exactly one plain target name that
+    is not a loader variable."""
+    found, i = [], 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "-d":
+            i += 1  # the delimiter, even an empty word
+        elif args[i] not in MAPFILE_OPTIONS:
+            found.append(f"mapfile option {args[i]!r}")
+        i += 1
+    targets = args[i:]
+    if len(targets) != 1 or not PLAIN_NAME.fullmatch(targets[0]):
+        return [*found, f"mapfile targets {targets}"]
+    return found + _loader_target_problems("mapfile", targets[0])
 
 
 def _sed_problems(args: list[str]) -> list[str]:
-    """sed runs only one s command per script, with flags from SED_FLAGS (never e or w),
-    from its arguments (never -f), and never edits a file in place."""
+    """sed takes only -n, -E, -e <script> and --expression=<script>, anywhere in its
+    arguments (GNU sed reads options after operands too); each script is one s command
+    with flags from SED_FLAGS (never e or w)."""
     found, scripts, operands = [], [], []
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg.startswith(("-i", "--in-place")):
-            found.append("sed edits a file in place")
-        elif arg.startswith(("-f", "--file")):
-            found.append("sed reads its script from a file")
-        elif arg == "-e" or arg == "--expression":
+        if arg == "-e":
             scripts.append("".join(args[i + 1 : i + 2]))
             i += 1
         elif arg.startswith("--expression="):
             scripts.append(arg.partition("=")[2])
-        elif arg.startswith("-e"):
-            scripts.append(arg[2:])
         elif not arg.startswith("-"):
             operands.append(arg)
+        elif arg not in SED_OPTIONS:
+            found.append(f"sed option {arg!r}")
         i += 1
     if not scripts:
         scripts = operands[:1]
@@ -878,6 +894,63 @@ def test_the_write_job_check_catches_an_unread_spelling(where: str, mutant: str)
 def test_the_write_job_check_catches_an_allowed_command_running_code(mutant: str) -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert write_job_problems(_into_publish(text, "    steps:\n", mutant)) != []
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # option spellings that sed, mapfile or xargs read but a flag parser can miss
+        "      - run: sed -e 's/a/b/' -se 'e echo PWNED' f\n",
+        "      - run: sed -e 's/a/b/' -ne 'e echo PWNED' f\n",
+        "      - run: sed -n -e 's/a/b/' -Ee 'e echo PWNED' f\n",
+        "      - run: sed --exp 's/a/b/' --exp 'e echo PWNED' f\n",
+        "      - run: sed --e 's/a/b/' --e 'e echo PWNED' f\n",
+        "      - run: sed -e 's/a/b/' --expr='e echo PWNED' f\n",
+        "      - run: mapfile -tu 0 PATH < f\n",
+        "      - run: mapfile -tC id x < f\n",
+        "      - run: mapfile -d '' PATH < f\n",
+        "      - run: xargs git fetch --upload-pack=/x < f\n",
+        "      - run: xargs git ls-remote --upload-pack /x < f\n",
+        "      - run: xargs git push --receive-pack=/x < f\n",
+    ],
+)
+def test_the_write_job_check_catches_an_option_spelling(mutant: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert write_job_problems(_into_publish(text, "    steps:\n", mutant)) != []
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        *("-s", "-ne", "-Ee", "-i", "-f", "-z", "--posix", "--", "-"),
+        *("--e", "--exp", "--expr=s/a/b/", "--expression"),
+    ],
+)
+def test_sed_takes_no_other_option(option: str) -> None:
+    assert f"sed option {option!r}" in run_problems(f"sed -n {option} 's/a/b/p' f")
+    assert f"sed option {option!r}" in run_problems(f"sed -n 's/a/b/p' f {option}")
+
+
+@pytest.mark.parametrize(
+    "option", ["-tu", "-tC", "-u", "-C", "-c", "-n", "-O", "-s", "-td", "--t", "--"]
+)
+def test_mapfile_takes_no_other_option(option: str) -> None:
+    assert f"mapfile option {option!r}" in run_problems(f"mapfile -t {option} days < f")
+
+
+@pytest.mark.parametrize(
+    "option", ["-0r", "-i", "-I{}", "-a", "-n", "-P", "-e", "-x", "--nu", "--null", "--"]
+)
+def test_xargs_takes_no_other_option(option: str) -> None:
+    assert f"xargs option {option!r}" in run_problems(f"xargs -0 {option} git add -- < f")
+
+
+def test_mapfile_takes_exactly_one_plain_target() -> None:
+    for script in ("mapfile -t < f", "mapfile -t a b < f", "mapfile -t 'a[0]' < f"):
+        assert any(p.startswith("mapfile targets") for p in run_problems(script)), script
+    # -d consumes its delimiter even when it is an empty word, never the target after it
+    assert run_problems("mapfile -d '' days < f") == []
+    assert run_problems("mapfile -d '' PATH < f") == ["mapfile sets PATH"]
 
 
 def test_the_write_job_check_allows_plain_uses_of_those_commands() -> None:
