@@ -5,11 +5,14 @@ name: sweep
 # Cron and workflow_dispatch run from the default branch only. See README.md § Operations.
 #
 # Jobs:
-#   gate   is it 07:00-21:00 Europe/London? (the cron is UTC; this job alone decides)
-#   sweep  run one sweep and push its record and status.json; the only job that writes
-#          contents, and only to the `data` branch
-#   alert  after three consecutive failed sweeps open (or comment on) the `ops-alert`
-#          issue; close it after a success. The only job that writes issues.
+#   gate     is it 07:00-21:00 Europe/London? (the cron is UTC; this job alone decides)
+#   sweep    run one sweep against a read-only checkout of the `data` branch and upload
+#            the new record and status.json as an artifact (contents: read)
+#   publish  check that artifact and push it to the `data` branch; the only job that
+#            writes contents. It runs no third-party code: first-party actions, git and
+#            the runner's python3 with the engine's standard-library helpers only (T-034)
+#   alert    after three consecutive failed sweeps open (or comment on) the `ops-alert`
+#            issue; close it after a success. The only job that writes issues.
 #
 # Nothing here runs on pull requests, so repository secrets never reach fork code.
 
@@ -64,10 +67,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: read
     outputs:
       stage: ${{ steps.result.outputs.stage }}
-      consecutive_failures: ${{ steps.record.outputs.consecutive_failures }}
+      skipped: ${{ steps.sweep.outputs.skipped }}
     env:
       DATA_REMOTE: https://github.com/${{ github.repository }}.git
     steps:
@@ -123,21 +126,19 @@ jobs:
               "/sweeps/$(date -u +%Y/%m/%d)/"
             git fetch -q --depth=1 --no-tags origin refs/heads/data
             git checkout -q -b data FETCH_HEAD
-            # consecutive_failures counts back to the newest success, however old. While
-            # the checked-out days do not show it, add older days, newest first, until
-            # they do or the history ends. The fetched tip already holds every record,
-            # so no deeper fetch is needed.
-            oldest="sweeps/$(date -u -d '2 days ago' +%Y/%m/%d)"
-            while read -r day; do
-              [[ "${day}" < "${oldest}" ]] || continue
-              if PYTHONPATH="${GITHUB_WORKSPACE}/engine" \
-                python3 -m wearreport.schedule streak-closed --data-dir .; then
-                break
-              fi
-              git sparse-checkout add "/${day}/"
-            done < <(git ls-tree -r --name-only HEAD -- sweeps \
-              | sed -n 's#^\(sweeps/[0-9]\{4\}/[0-9]\{2\}/[0-9]\{2\}\)/[^/]*$#\1#p' \
-              | sort -ru)
+            # consecutive_failures counts back to the newest success, however old. When the
+            # checked-out days do not show it, streak-days lists the older days to add,
+            # newest first: it reads each day's records once from the fetched tip (which
+            # holds every record, so no deeper fetch is needed) and stops at the first day
+            # with a success, at the end of the history, or after its cap of days. The
+            # records are checked as the publisher checks them, with the engine's venv.
+            days="$(PYTHONPATH="${GITHUB_WORKSPACE}/engine" \
+              "${GITHUB_WORKSPACE}/.venv/bin/python" -m wearreport.schedule streak-days \
+              --data-dir . --before "sweeps/$(date -u -d '2 days ago' +%Y/%m/%d)")"
+            if [ -n "${days}" ]; then
+              mapfile -t add <<< "${days}"
+              git sparse-checkout add "${add[@]}"
+            fi
           elif [ "${rc}" -eq 2 ]; then
             echo "the data branch does not exist yet: starting it as an orphan"
             git checkout -q --orphan data
@@ -160,9 +161,133 @@ jobs:
           if grep -q '^sweep skipped:' "${RUNNER_TEMP}/sweep.out"; then
             echo "skipped=true" >> "${GITHUB_OUTPUT}"
           fi
+      # The new record (untracked: records are immutable) and status.json, as the publish
+      # job will stage them; nothing else leaves this job.
+      - name: Collect the new record and status.json
+        id: collect
+        if: steps.sweep.outputs.skipped != 'true'
+        run: |
+          set -euo pipefail
+          mkdir "${RUNNER_TEMP}/outbox"
+          cd "${DATA_DIR}"
+          git ls-files -z --others --exclude-standard -- ':(glob)sweeps/**/*.json' \
+            | xargs -0 -r cp --parents -t "${RUNNER_TEMP}/outbox" --
+          cp -- status.json "${RUNNER_TEMP}/outbox/status.json"
+          find "${RUNNER_TEMP}/outbox" -type f
+      - name: Upload the new record and status.json for the publish job
+        id: upload
+        if: steps.sweep.outputs.skipped != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sweep-records
+          path: |
+            ${{ runner.temp }}/outbox/sweeps/**/*.json
+            ${{ runner.temp }}/outbox/status.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Result
+        id: result
+        if: always()
+        env:
+          FORCED: ${{ steps.forced.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          MODELS: ${{ steps.models.outcome }}
+          CHECKOUT_DATA: ${{ steps.checkout-data.outcome }}
+          SWEEP: ${{ steps.sweep.outcome }}
+          SKIPPED: ${{ steps.sweep.outputs.skipped }}
+          COLLECT: ${{ steps.collect.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+        run: |
+          stage=unknown
+          if [ "${FORCED}" = failure ]; then stage=forced
+          elif [ "${INSTALL}" != success ] || [ "${MODELS}" != success ]; then stage=setup
+          elif [ "${CHECKOUT_DATA}" != success ]; then stage=checkout
+          elif [ "${SWEEP}" != success ]; then stage=sweep
+          elif [ "${SKIPPED}" = true ]; then stage=skipped
+          elif [ "${COLLECT}" != success ] || [ "${UPLOAD}" != success ]; then stage=publish
+          else stage=none
+          fi
+          echo "stage=${stage}" >> "${GITHUB_OUTPUT}"
+          echo "stage=${stage}"
+
+
+  publish:
+    needs: sweep
+    # Not after a skip: the sweep wrote nothing, so there is nothing to push.
+    if: needs.sweep.outputs.skipped != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      stage: ${{ steps.result.outputs.stage }}
+      consecutive_failures: ${{ steps.record.outputs.consecutive_failures }}
+    env:
+      DATA_REMOTE: https://github.com/${{ github.repository }}.git
+    # The write token never meets third-party code: no setup-uv, no dependency, no make.
+    # The helpers below are engine/wearreport/schedule.py (standard library only) from
+    # the checked-out default branch; the downloaded files are data, never run.
+    # PYTHONSAFEPATH=1 is python3 -P: the working directory (the data checkout, in the
+    # commit step) is never on sys.path. test_sweep_workflow.py allowlists this job.
+    steps:
+      - name: Set DATA_DIR
+        run: echo "DATA_DIR=${RUNNER_TEMP}/data" >> "${GITHUB_ENV}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: engine/wearreport
+      - name: Download the new record and status.json
+        id: download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sweep-records
+          path: ${{ runner.temp }}/artifact
+      # Only regular files; status.json and records the staged-path check accepts, each
+      # JSON, at most 1 MiB and stored under its own sweep_id.
+      - name: Check the downloaded files
+        id: check
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/artifact
+        run: |
+          set -euo pipefail
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule check-artifact \
+            --dir "${ARTIFACT_DIR}" > "${RUNNER_TEMP}/paths-to-publish"
+          cat "${RUNNER_TEMP}/paths-to-publish"
+      - name: Check out the data branch (shallow, sparse; orphan on first publish)
+        id: checkout-data
+        run: |
+          set -euo pipefail
+          git init -q "${DATA_DIR}"
+          cd "${DATA_DIR}"
+          git remote add origin "${DATA_REMOTE}"
+          rc=0
+          git ls-remote --exit-code --heads origin refs/heads/data > /dev/null || rc=$?
+          if [ "${rc}" -eq 0 ]; then
+            # status.json and the days of the new records: the files this job writes
+            mapfile -t days < <(sed -n \
+              's#^\(sweeps/[0-9]\{4\}/[0-9]\{2\}/[0-9]\{2\}\)/[^/]*$#/\1/#p' \
+              "${RUNNER_TEMP}/paths-to-publish" | sort -u)
+            git sparse-checkout set --no-cone /status.json "${days[@]}"
+            git fetch -q --depth=1 --no-tags origin refs/heads/data
+            git checkout -q -b data FETCH_HEAD
+          elif [ "${rc}" -eq 2 ]; then
+            echo "the data branch does not exist yet: starting it as an orphan"
+            git checkout -q --orphan data
+          else
+            echo "cannot list the remote branches (git exit ${rc})" >&2
+            exit 1
+          fi
+      # An existing record must be identical (records are immutable); status.json is
+      # replaced.
+      - name: Copy the checked files into the data branch
+        id: copy
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/artifact
+        run: |
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule copy-artifact \
+            --artifact "${ARTIFACT_DIR}" --data-dir "${DATA_DIR}"
       - name: Commit and push to the data branch
         id: publish
-        if: steps.sweep.outputs.skipped != 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -173,8 +298,8 @@ jobs:
           git ls-files -z --others --exclude-standard -- ':(glob)sweeps/**/*.json' \
             | xargs -0 -r git add --
           git add -- status.json
-          git diff --cached --name-status \
-            | PYTHONPATH="${GITHUB_WORKSPACE}/engine" python3 -m wearreport.schedule check-staged
+          git diff --cached --name-status | PYTHONSAFEPATH=1 \
+            PYTHONPATH="${GITHUB_WORKSPACE}/engine" python3 -m wearreport.schedule check-staged
           if git diff --cached --quiet; then
             echo "nothing new to publish (the record was already there)"
             exit 0
@@ -188,38 +313,30 @@ jobs:
             push -q origin HEAD:refs/heads/data
       - name: Did the published sweep succeed?
         id: record
-        if: steps.sweep.outputs.skipped != 'true'
         run: |
-          PYTHONPATH=engine python3 -m wearreport.schedule outcome \
+          PYTHONSAFEPATH=1 PYTHONPATH=engine python3 -m wearreport.schedule outcome \
             --status "${DATA_DIR}/status.json" >> "${GITHUB_OUTPUT}"
       - name: Result
         id: result
         if: always()
         env:
-          FORCED: ${{ steps.forced.outcome }}
-          INSTALL: ${{ steps.install.outcome }}
-          MODELS: ${{ steps.models.outcome }}
+          DOWNLOAD: ${{ steps.download.outcome }}
+          CHECK: ${{ steps.check.outcome }}
           CHECKOUT_DATA: ${{ steps.checkout-data.outcome }}
-          SWEEP: ${{ steps.sweep.outcome }}
-          SKIPPED: ${{ steps.sweep.outputs.skipped }}
+          COPY: ${{ steps.copy.outcome }}
           PUBLISH: ${{ steps.publish.outcome }}
           RECORD: ${{ steps.record.outcome }}
         run: |
-          stage=unknown
-          if [ "${FORCED}" = failure ]; then stage=forced
-          elif [ "${INSTALL}" != success ] || [ "${MODELS}" != success ]; then stage=setup
-          elif [ "${CHECKOUT_DATA}" != success ]; then stage=checkout
-          elif [ "${SWEEP}" != success ]; then stage=sweep
-          elif [ "${SKIPPED}" = true ]; then stage=skipped
-          elif [ "${PUBLISH}" != success ]; then stage=publish
-          elif [ "${RECORD}" != success ]; then stage=record
-          else stage=none
-          fi
+          stage=none
+          for outcome in "${DOWNLOAD}" "${CHECK}" "${CHECKOUT_DATA}" "${COPY}" "${PUBLISH}"; do
+            if [ "${outcome}" != success ]; then stage=publish; fi
+          done
+          if [ "${stage}" = none ] && [ "${RECORD}" != success ]; then stage=record; fi
           echo "stage=${stage}" >> "${GITHUB_OUTPUT}"
           echo "stage=${stage}"
 
   alert:
-    needs: [gate, sweep]
+    needs: [gate, sweep, publish]
     # Also after a failed gate, so a broken gate cannot silence every sweep unnoticed.
     if: ${{ !cancelled() && (needs.gate.outputs.open == 'true' || needs.gate.result == 'failure') }}
     runs-on: ubuntu-24.04
@@ -239,9 +356,12 @@ jobs:
           GATE_RESULT: ${{ needs.gate.result }}
           SWEEP_RESULT: ${{ needs.sweep.result }}
           SWEEP_STAGE: ${{ needs.sweep.outputs.stage }}
-          RECORD_FAILURES: ${{ needs.sweep.outputs.consecutive_failures }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PUBLISH_STAGE: ${{ needs.publish.outputs.stage }}
+          RECORD_FAILURES: ${{ needs.publish.outputs.consecutive_failures }}
         run: |
           PYTHONPATH=engine python3 -m wearreport.schedule alert \
             --gate-result "${GATE_RESULT}" --sweep-result "${SWEEP_RESULT}" \
-            --stage "${SWEEP_STAGE}" \
+            --publish-result "${PUBLISH_RESULT}" \
+            --stage "${SWEEP_STAGE}" --publish-stage "${PUBLISH_STAGE}" \
             --record-failures "${RECORD_FAILURES}"

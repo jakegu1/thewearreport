@@ -8,6 +8,7 @@ import http.server
 import io
 import json
 import socketserver
+import sys
 import threading
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs
 
 import pytest
 
+import wearreport
 from wearreport import aggregate, publish, schedule
 
 REPO = "owner/repo"
@@ -49,11 +51,17 @@ def _ok(value: Any) -> tuple[int, bytes]:
     return 200, json.dumps(value).encode()
 
 
+def _created(run_id: int) -> str:
+    """A run's created_at: runs with larger ids were created later."""
+    return f"{datetime(2026, 7, 1, tzinfo=UTC) + timedelta(minutes=20 * run_id):%Y-%m-%dT%H:%M:%SZ}"
+
+
 # Shared definitions --------------------------------------------------------------------
 
 
 def test_sweep_id_and_daytime_match_the_engine() -> None:
     assert schedule.SWEEP_ID.pattern == aggregate.SWEEP_ID.pattern
+    assert schedule.UTC_TIME.pattern == aggregate.UTC_TIME.pattern
     assert (schedule.DAY_START, schedule.DAY_END) == (publish.DAY_START, publish.DAY_END)
     assert schedule.LONDON_TZ == publish.LONDON_TZ
 
@@ -184,12 +192,18 @@ def _sweep(started: datetime, usable: int) -> Any:
     )
 
 
+NOON = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+
+def _relative(record: Any) -> str:
+    return publish.record_path(Path(), record["sweep_id"]).as_posix()
+
+
 @pytest.mark.parametrize("usable", [0, 5, 8, 9, 10])
-def test_record_succeeded_agrees_with_the_publisher(tmp_path: Path, usable: int) -> None:
-    record = _sweep(datetime(2026, 7, 15, 12, 0, tzinfo=UTC), usable)
-    path = tmp_path / "r.json"
-    path.write_bytes(publish.serialize(record))
-    assert schedule.record_succeeded(path) is publish.is_success(record)
+def test_successful_record_agrees_with_the_publisher(usable: int) -> None:
+    record = _sweep(NOON, usable)
+    data = publish.serialize(record)
+    assert schedule._successful_record(data, _relative(record), NOON) is publish.is_success(record)
 
 
 @pytest.mark.parametrize(
@@ -205,18 +219,50 @@ def test_record_succeeded_agrees_with_the_publisher(tmp_path: Path, usable: int)
         b'{"cameras_listed": 10.0, "frames_ok": 10}',
         b'{"cameras_listed": "10", "frames_ok": 10}',
         b'{"frames_ok": 10}',
+        b'{"cameras_listed": 10, "frames_ok": 10}',  # counts alone are not a record
         b'{"cameras_listed": 10, "frames_ok": 10}' + b" " * schedule.MAX_RECORD_BYTES,
+        b'{"started_at": "2026-02-30T12:00:00Z"}',
+        b'{"cameras_listed": 1' + b"0" * 5000 + b', "frames_ok": 10}',
     ],
 )
-def test_record_succeeded_is_false_for_malformed_files(tmp_path: Path, data: bytes) -> None:
-    path = tmp_path / "r.json"
-    path.write_bytes(data)
-    assert schedule.record_succeeded(path) is False
+def test_successful_record_is_false_for_malformed_data(data: bytes) -> None:
+    assert schedule._successful_record(data, _relative(_sweep(NOON, 10)), NOON) is False
 
 
-def test_record_succeeded_is_false_for_a_missing_file_or_a_directory(tmp_path: Path) -> None:
-    assert schedule.record_succeeded(tmp_path / "absent.json") is False
-    assert schedule.record_succeeded(tmp_path) is False
+def test_successful_record_is_false_over_the_size_cap() -> None:
+    record = _sweep(NOON, 10)
+    data = publish.serialize(record)
+    padded = data.rstrip(b"\n") + b" " * (schedule.MAX_RECORD_BYTES - len(data) + 2)
+    assert len(padded) == schedule.MAX_RECORD_BYTES + 1
+    assert schedule._successful_record(padded, _relative(record), NOON) is False
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "sweeps/2026/07/15/20260715T1201Z.json",  # another sweep_id
+        "sweeps/2026/07/16/20260715T1200Z.json",  # another date
+        "sweeps/2026/07/15/20260715T1200Z.json.bak",
+        "20260715T1200Z.json",
+    ],
+)
+def test_successful_record_must_be_stored_under_its_sweep_id(relative: str) -> None:
+    data = publish.serialize(_sweep(NOON, 10))
+    assert schedule._successful_record(data, relative, NOON) is False
+
+
+def test_successful_record_ignores_a_record_that_starts_after_now() -> None:
+    record = _sweep(NOON, 10)
+    data = publish.serialize(record)
+    assert schedule._successful_record(data, _relative(record), NOON) is True
+    before = NOON - timedelta(seconds=1)
+    assert schedule._successful_record(data, _relative(record), before) is False
+
+
+def test_streak_closed_is_false_for_a_missing_file_or_a_directory(tmp_path: Path) -> None:
+    (tmp_path / "sweeps" / "2026" / "07" / "15" / "20260715T1200Z.json").mkdir(parents=True)
+    assert schedule.streak_closed(tmp_path, NOON) is False
+    assert schedule.streak_closed(tmp_path / "absent", NOON) is False
 
 
 def _put(data_dir: Path, record: Any) -> Path:
@@ -580,7 +626,7 @@ def test_run_outcome_rejects_a_job_name_that_is_not_a_string(name: Any) -> None:
 @pytest.mark.parametrize("name", [["x"], {"a": 1}, None, 7])
 def test_previous_outcomes_rejects_hostile_job_names(name: Any) -> None:
     script = Script(
-        _ok({"workflow_runs": [{"id": 7, "status": "completed"}]}),
+        _ok({"workflow_runs": [{"id": 7, "status": "completed", "created_at": _created(7)}]}),
         _ok({"jobs": [{"name": name, "conclusion": "failure", "steps": []}]}),
     )
     with pytest.raises(schedule.GitHubError):
@@ -606,9 +652,9 @@ def test_previous_outcomes_rejects_malformed_listings(listing: Any) -> None:
 def test_previous_outcomes_skips_this_run_and_unfinished_runs() -> None:
     listing = {
         "workflow_runs": [
-            {"id": 9, "status": "completed"},
-            {"id": 8, "status": "in_progress"},
-            {"id": 7, "status": "completed"},
+            {"id": 9, "status": "completed", "created_at": _created(9)},
+            {"id": 8, "status": "in_progress", "created_at": _created(8)},
+            {"id": 7, "status": "completed", "created_at": _created(7)},
         ]
     }
     script = Script(_ok(listing), _ok({"jobs": [_job("sweep", "failure")]}))
@@ -618,7 +664,7 @@ def test_previous_outcomes_skips_this_run_and_unfinished_runs() -> None:
 
 
 def test_previous_outcomes_reads_at_most_the_lookback() -> None:
-    runs = [{"id": i, "status": "completed"} for i in range(100, 0, -1)]
+    runs = [{"id": i, "status": "completed", "created_at": _created(i)} for i in range(100, 0, -1)]
     jobs = [_ok({"jobs": [_job("sweep", "failure")]})] * schedule.LOOKBACK_RUNS
     script = Script(_ok({"workflow_runs": runs}), *jobs)
     found = list(schedule.previous_outcomes(_gh(script), run_id=1000, branch="main"))
@@ -659,7 +705,7 @@ def test_alert_makes_no_request_when_no_sweep_ran() -> None:
 
 
 def test_alert_opens_an_issue_creating_the_label_and_tolerating_a_race() -> None:
-    history = {"workflow_runs": [{"id": 49, "status": "completed"}]}
+    history = {"workflow_runs": [{"id": 49, "status": "completed", "created_at": _created(49)}]}
     script = Script(
         _ok([]),  # no open issue
         _ok(history),
@@ -736,7 +782,9 @@ class Tracker:
         if method == "GET" and path == "/issues":
             return _ok([] if self.issue is None else [self.issue])
         if method == "GET" and path.startswith("/actions/workflows/"):
-            return _ok({"workflow_runs": [{"id": 1, "status": "completed"}]})
+            return _ok(
+                {"workflow_runs": [{"id": 1, "status": "completed", "created_at": _created(1)}]}
+            )
         if method == "GET" and path == "/actions/runs/1/jobs":
             return _ok({"jobs": [_job("gate", "success"), _job("sweep", "failure")]})
         if method == "GET" and path.startswith("/labels/"):
@@ -960,3 +1008,311 @@ def test_alert_command_does_nothing_for_a_skipped_sweep(
     argv += ["--stage", "skipped", "--record-failures", ""]
     assert schedule.main(argv, environ) == 0
     assert "alert: nothing" in capsys.readouterr().out
+
+
+# The publish job (T-034) ---------------------------------------------------------------
+
+
+def _artifact(root: Path, record: Any, status: bytes = b'{"consecutive_failures": 0}\n') -> Path:
+    _put(root, record)
+    (root / "status.json").write_bytes(status)
+    return root
+
+
+def test_copy_artifact_creates_the_record_and_replaces_status(tmp_path: Path) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "status.json").write_bytes(b'{"consecutive_failures": 4}\n')
+    assert (
+        schedule.main(["copy-artifact", "--artifact", str(artifact), "--data-dir", str(data)]) == 0
+    )
+    assert publish.record_path(data, record["sweep_id"]).read_bytes() == publish.serialize(record)
+    assert (data / "status.json").read_bytes() == b'{"consecutive_failures": 0}\n'
+    assert sorted(p.name for p in data.iterdir()) == ["status.json", "sweeps"]  # no temporaries
+
+
+def test_copy_artifact_leaves_an_identical_record_and_refuses_a_different_one(
+    tmp_path: Path,
+) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record)
+    data = tmp_path / "data"
+    _put(data, record)
+    assert schedule.copy_artifact(artifact, data) == sorted(["status.json", _relative(record)])
+    other = dict(record, engine_version="9.9.9")
+    publish.record_path(data, record["sweep_id"]).write_bytes(publish.serialize(other))
+    with pytest.raises(schedule.ScheduleError, match="already published"):
+        schedule.copy_artifact(artifact, data)
+    assert publish.record_path(data, record["sweep_id"]).read_bytes() == publish.serialize(other)
+
+
+def test_copy_artifact_refuses_a_symlink_in_the_data_checkout(tmp_path: Path) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    data = tmp_path / "data"
+    (data / "sweeps").mkdir(parents=True)
+    (data / "sweeps" / "2026").symlink_to(elsewhere)
+    with pytest.raises(schedule.ScheduleError, match="not a plain directory"):
+        schedule.copy_artifact(artifact, data)
+    assert list(elsewhere.iterdir()) == []
+    # a symlinked record path is not written through either
+    data2 = tmp_path / "data2"
+    target = publish.record_path(data2, record["sweep_id"])
+    target.parent.mkdir(parents=True)
+    target.symlink_to(elsewhere / "x.json")
+    with pytest.raises(schedule.ScheduleError):
+        schedule.copy_artifact(artifact, data2)
+    assert not (elsewhere / "x.json").exists()
+
+
+def _status_at(last_sweep_at: str | None, failures: int = 0) -> bytes:
+    return (
+        json.dumps({"consecutive_failures": failures, "last_sweep_at": last_sweep_at}).encode()
+        + b"\n"
+    )
+
+
+def test_copy_artifact_refuses_an_older_status_and_writes_nothing(tmp_path: Path) -> None:
+    # A re-run of an old run's publish job after later runs published: its status would
+    # roll the published one back (and read as a success, closing an open alert).
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at("2026-07-15T09:07:00Z"))
+    data = tmp_path / "data"
+    data.mkdir()
+    newer = _status_at("2026-07-15T10:07:00Z", failures=3)
+    (data / "status.json").write_bytes(newer)
+    argv = ["copy-artifact", "--artifact", str(artifact), "--data-dir", str(data)]
+    with pytest.raises(schedule.ScheduleError, match="older than the published"):
+        schedule.copy_artifact(artifact, data)
+    assert schedule.main(argv) == 1
+    assert (data / "status.json").read_bytes() == newer
+    assert sorted(p.name for p in data.iterdir()) == ["status.json"]  # no record either
+
+
+@pytest.mark.parametrize(
+    "artifact_status",
+    [
+        _status_at(None),  # no sweep in it
+        b'{"consecutive_failures": 0}\n',  # no last_sweep_at at all
+        _status_at("2026-07-15T10:07:00"),  # not the UTC format
+        _status_at("2026-02-30T10:07:00Z"),  # not a calendar date
+    ],
+)
+def test_copy_artifact_refuses_a_status_without_a_usable_time_over_a_published_one(
+    tmp_path: Path, artifact_status: bytes
+) -> None:
+    artifact = _artifact(tmp_path / "a", _sweep(NOON, 10), artifact_status)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "status.json").write_bytes(_status_at("2026-07-15T10:07:00Z"))
+    with pytest.raises(schedule.ScheduleError):
+        schedule.copy_artifact(artifact, data)
+    assert sorted(p.name for p in data.iterdir()) == ["status.json"]
+
+
+@pytest.mark.parametrize("new", ["2026-07-15T10:07:00Z", "2026-07-15T12:00:00Z"])
+def test_copy_artifact_copies_an_equal_or_newer_status_at(tmp_path: Path, new: str) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at(new))
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "status.json").write_bytes(_status_at("2026-07-15T10:07:00Z", failures=3))
+    assert schedule.copy_artifact(artifact, data) == sorted(["status.json", _relative(record)])
+    assert (data / "status.json").read_bytes() == _status_at(new)
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        None,  # the first publish: no status.json yet
+        _status_at(None),  # nothing published yet
+        b"not json",
+        b"[" * 100_000 + b"]" * 100_000,
+        _status_at("yesterday"),
+        b" " * (schedule.MAX_STATUS_BYTES + 1),
+    ],
+)
+def test_copy_artifact_allows_any_status_over_a_missing_or_unusable_one(
+    tmp_path: Path, published: bytes | None
+) -> None:
+    record = _sweep(NOON, 10)
+    artifact = _artifact(tmp_path / "a", record, _status_at("2026-07-15T09:07:00Z"))
+    data = tmp_path / "data"
+    data.mkdir()
+    if published is not None:
+        (data / "status.json").write_bytes(published)
+    schedule.copy_artifact(artifact, data)
+    assert (data / "status.json").read_bytes() == _status_at("2026-07-15T09:07:00Z")
+
+
+def test_check_artifact_refuses_a_symlink_to_a_valid_file_outside(tmp_path: Path) -> None:
+    # The targets are valid status and record files, so only the symlink check itself
+    # can refuse them (a link to the record would fail the status check instead).
+    record = _sweep(NOON, 10)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "status.json").write_bytes(b'{"consecutive_failures": 0}\n')
+    (outside / "record.json").write_bytes(publish.serialize(record))
+    artifact = _artifact(tmp_path / "a", record)
+    (artifact / "status.json").unlink()
+    (artifact / "status.json").symlink_to(outside / "status.json")
+    with pytest.raises(schedule.ScheduleError, match=r"'status\.json' is not a regular file"):
+        schedule.check_artifact(artifact)
+    artifact = _artifact(tmp_path / "b", record)
+    path = publish.record_path(artifact, record["sweep_id"])
+    path.unlink()
+    path.symlink_to(outside / "record.json")
+    with pytest.raises(schedule.ScheduleError, match="is not a regular file"):
+        schedule.check_artifact(artifact)
+
+
+def test_copy_artifact_checks_before_copying(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path / "a", _sweep(NOON, 10))
+    (artifact / "notes.txt").write_text("x")
+    data = tmp_path / "data"
+    data.mkdir()
+    with pytest.raises(schedule.ScheduleError, match="refusing"):
+        schedule.copy_artifact(artifact, data)
+    assert list(data.iterdir()) == []
+
+
+def test_check_artifact_caps_the_number_of_files(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path / "a", _sweep(NOON, 10))
+    for i in range(schedule.MAX_ARTIFACT_ENTRIES):
+        (artifact / "sweeps" / f"d{i}").mkdir()
+    with pytest.raises(schedule.ScheduleError, match="too many"):
+        schedule.check_artifact(artifact)
+
+
+def test_check_artifact_rejects_a_bad_status_at(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path / "a", _sweep(NOON, 10), status=b"[]")
+    with pytest.raises(schedule.ScheduleError):
+        schedule.check_artifact(artifact)
+    with pytest.raises(schedule.ScheduleError, match="cannot list"):
+        schedule.check_artifact(tmp_path / "absent")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--before", "sweeps/2026/07"],
+        ["--before", "/sweeps/2026/07/15/"],
+        ["--before", "sweeps/2026/07/15", "--max-days", "0"],
+        ["--before", "sweeps/2026/07/15", "--now", "yesterday"],
+    ],
+)
+def test_streak_days_command_rejects_bad_arguments(
+    tmp_path: Path, argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert schedule.main(["streak-days", "--data-dir", str(tmp_path), *argv]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_streak_days_outside_a_git_checkout_is_a_typed_error(tmp_path: Path) -> None:
+    with pytest.raises(schedule.ScheduleError, match="git ls-tree failed"):
+        schedule.streak_days(tmp_path, before="sweeps/2026/07/15", now=NOON)
+
+
+def test_streak_days_adds_nothing_when_the_checkout_shows_the_success(tmp_path: Path) -> None:
+    _put(tmp_path, _sweep(NOON, 10))  # not even a git checkout: no git needed
+    assert schedule.streak_days(tmp_path, before="sweeps/2026/07/13", now=NOON) == (
+        schedule.Widening((), capped=False)
+    )
+
+
+def test_checking_records_without_the_engine_is_a_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _put(tmp_path, _sweep(NOON, 10))
+    monkeypatch.setitem(sys.modules, "wearreport.publish", None)  # import fails
+    monkeypatch.delattr(wearreport, "publish")
+    with pytest.raises(schedule.ScheduleError, match="dependencies"):
+        schedule.streak_closed(tmp_path, NOON)
+    assert schedule.main(["streak-closed", "--data-dir", str(tmp_path)]) == 1
+    assert "virtual environment" in capsys.readouterr().err
+
+
+def test_blobs_rejects_an_unexpected_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    oid = "a" * 40
+    for answer in (b"", f"{oid} missing\n".encode(), b"b" * 40 + b" blob 2\n{}\n"):
+        monkeypatch.setattr(schedule, "_git", lambda *a, answer=answer, **k: answer)
+        with pytest.raises(schedule.ScheduleError, match="unexpected answer"):
+            schedule._blobs(Path(), [oid])
+
+
+@pytest.mark.parametrize(
+    ("sweep", "stage", "publish_result", "expected"),
+    [
+        ("success", "none", "skipped", schedule.Outcome.FAILURE),  # ran, published nothing
+        ("success", "none", "", schedule.Outcome.SUCCESS),  # no publish job given
+        ("success", "none", "cancelled", schedule.Outcome.FAILURE),
+        ("skipped", "", "skipped", schedule.Outcome.NONE),
+    ],
+)
+def test_current_outcome_with_a_publish_job(
+    sweep: str, stage: str, publish_result: str, expected: schedule.Outcome
+) -> None:
+    assert schedule.current_outcome("success", sweep, stage, publish_result) is expected
+
+
+@pytest.mark.parametrize(
+    ("publish_job", "expected"),
+    [
+        (_job("publish", "cancelled"), schedule.Outcome.FAILURE),  # its 5 minute timeout
+        (_job("publish", "cancelled", False), schedule.Outcome.NONE),
+        (_job("publish", None), schedule.Outcome.NONE),
+        ({"name": "publish", "conclusion": ["x"]}, schedule.Outcome.NONE),
+    ],
+)
+def test_run_outcome_of_the_publish_job(
+    publish_job: dict[str, Any], expected: schedule.Outcome
+) -> None:
+    jobs = [_job("gate", "success"), _job("sweep", "success"), publish_job]
+    assert schedule.run_outcome(jobs) is expected
+
+
+def test_alert_command_names_the_publish_stage(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_alert(gh: schedule.GitHub, **kw: Any) -> schedule.Action:
+        seen.update(kw)
+        return schedule.Action.NOTHING
+
+    monkeypatch.setattr(schedule, "alert", fake_alert)
+    argv = [
+        "alert",
+        "--gate-result",
+        "success",
+        "--sweep-result",
+        "success",
+        "--publish-result",
+        "failure",
+        "--stage",
+        "none",
+        "--publish-stage",
+        "record",
+        "--record-failures",
+        "3",
+    ]
+    env = {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": "5", "GITHUB_REF_NAME": "main"}
+    assert schedule.main(argv, {**env, "GITHUB_TOKEN": "t"}) == 0
+    assert seen["current"] is schedule.Outcome.FAILURE
+    assert seen["stage"] == "record"
+    assert seen["record_failures"] == 3
+
+
+def test_copy_artifact_refuses_a_file_the_publisher_would_not_write(tmp_path: Path) -> None:
+    artifact = _artifact(
+        tmp_path / "a", _sweep(NOON, 10), status=b'{"consecutive_failures": 0, "x": "\xc3\xa9"}'
+    )
+    data = tmp_path / "data"
+    data.mkdir()
+    with pytest.raises(schedule.ScheduleError, match="not ASCII"):
+        schedule.copy_artifact(artifact, data)
+    assert not (data / "status.json").exists()
