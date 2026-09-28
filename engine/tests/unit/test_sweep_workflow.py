@@ -440,6 +440,13 @@ STATUS_FUNCTION = re.compile(r"\b(always|success|failure|cancelled)\s*\(")
 ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)=(.*)", re.DOTALL)
 REDIRECTION = re.compile(r"[0-9]*(<<<|<<|<|>>|>|&>)(&[0-9-]+)?")
 SUBSTITUTION = "$()"  # stands for a command or process substitution inside a word
+# The only expansions a write job's script may hold, inside double quotes: ${NAME} and
+# ${NAME[@]} (no operator), and $( opening a command substitution. Unquoted, only $? as
+# the whole value of NAME=$?. Any other $ or an unquoted { could expand into a word this
+# reader never sees (an option such as -ne, --upload-pack=...), so each is a problem.
+QUOTED_EXPANSION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(\[@\])?\}")
+STATUS_TARGET = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+WORD_ENDS = " \t\n;&|"
 
 
 def write_job_problems(text: str) -> list[str]:
@@ -504,19 +511,27 @@ def _step_problems(step: dict[str, str]) -> list[str]:
 def run_problems(script: str) -> list[str]:
     """Commands in the shell `script` outside the allowlist, including every command in
     a command or process substitution and after a shell keyword; xargs may run only git.
-    A script this cannot read (backquotes, unbalanced quotes) is a problem, never a pass."""
+    A script this cannot read (backquotes, unbalanced quotes) is a problem, never a pass,
+    and so is any expansion outside QUOTED_EXPANSION, $( and NAME=$?."""
     try:
-        commands = shell_commands(script)
+        commands, found = read_script(script)
     except ValueError as exc:
         return [f"unreadable script: {exc}"]
-    return [problem for words in commands for problem in _command_problems(words)]
+    return found + [problem for words in commands for problem in _command_problems(words)]
 
 
 def shell_commands(script: str) -> list[list[str]]:
     """The simple commands in `script`, each as its words with the quotes removed. A
     command or process substitution is its own command and stands as SUBSTITUTION in
     the word that holds it. Raises ValueError for what this reader does not handle."""
+    return read_script(script)[0]
+
+
+def read_script(script: str) -> tuple[list[list[str]], list[str]]:
+    """shell_commands(script), and the expansions in it that are problems: this reader
+    removes quotes but never expands, so what an expansion produces is never checked."""
     done: list[list[str]] = []
+    found: list[str] = []
     # one level per substitution: [words, current word or None, inside double quotes]
     levels: list[list[Any]] = [[[], None, False]]
 
@@ -540,11 +555,19 @@ def shell_commands(script: str) -> list[list[str]]:
         if c == "`":
             raise ValueError("backquotes")
         if script.startswith(("$(", "<(", ">("), i) and not script.startswith("$((", i):
+            if c == "$" and not level[2]:
+                found.append(f"shell expansion {script[i : i + 12]!r}")
             levels.append([[], None, False])
             i += 2
         elif level[2]:  # inside double quotes
             if c == '"':
                 level[2] = False
+            elif m := QUOTED_EXPANSION.match(script, i):
+                add(m.group(0))
+                i = m.end() - 1
+            elif c == "$":
+                found.append(f"shell expansion {script[i : i + 12]!r}")
+                add(c)
             elif c == "\\":
                 add(script[i : i + 2])
                 i += 1
@@ -582,13 +605,24 @@ def shell_commands(script: str) -> list[list[str]]:
         elif c in "\n;&|":
             end_command()
             i += 1
+        elif c == "$":
+            status = script.startswith("$?", i) and script[i + 2 : i + 3] in ("", *WORD_ENDS)
+            if not (status and STATUS_TARGET.fullmatch(level[1] or "")):
+                found.append(f"shell expansion {script[i : i + 12]!r}")
+            add(c)
+            i += 1
+        elif c == "{":
+            if level[1] is not None or script[i + 1 : i + 2] not in ("", " ", "\t", "\n"):
+                found.append(f"brace expansion {(level[1] or '') + script[i : i + 12]!r}")
+            add(c)
+            i += 1
         else:
             add(c)
             i += 1
     if len(levels) > 1 or levels[0][2]:
         raise ValueError("unbalanced quotes or parentheses")
     end_command()
-    return done
+    return done, found
 
 
 def _command_problems(words: list[str]) -> list[str]:
@@ -945,6 +979,43 @@ def test_xargs_takes_no_other_option(option: str) -> None:
     assert f"xargs option {option!r}" in run_problems(f"xargs -0 {option} git add -- < f")
 
 
+@pytest.mark.parametrize(
+    ("mutant", "kind"),
+    [
+        # an expansion the reader does not expand, producing an option word or program
+        ("      - run: sed -e 's/a/b/' {-n,-e} 'e echo PWNED' f\n", "brace expansion"),
+        ("      - run: sed -e 's/a/b/' $'-ne' 'e echo PWNED' f\n", "shell expansion"),
+        ("      - run: sed -e 's/a/b/' $\"-ne\" 'e echo PWNED' f\n", "shell expansion"),
+        ("      - run: o=-ne; sed -e 's/a/b/' $o 'e echo PWNED' f\n", "shell expansion"),
+        ("      - run: xargs -0 -r git fetch {--upload-pack=/x,} < f\n", "brace expansion"),
+        ("      - run: git fetch {--upload-pack=/x,} origin\n", "brace expansion"),
+    ],
+)
+def test_the_write_job_check_catches_an_expansion(mutant: str, kind: str) -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    problems = write_job_problems(_into_publish(text, "    steps:\n", mutant))
+    assert any(p.startswith(f"publish: {kind}") for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "word",
+    [
+        *("$HOME", "${HOME}", "$'-ne'", '$"-ne"', '"$((1+1))"', '"$@"', '"$*"', '"$1"'),
+        *('"${!x}"', '"${x:-y}"', '"${x#y}"', '"${x%y}"', '"${x/a/b}"', '"${x^}"'),
+        *('"$HOME"', '"$?"', '"${#x}"', '"${x[0]}"', "$(id)", "$?"),
+    ],
+)
+def test_a_write_job_script_takes_no_other_shell_expansion(word: str) -> None:
+    problems = run_problems(f"echo {word} x")
+    assert any(p.startswith("shell expansion") for p in problems), problems
+
+
+@pytest.mark.parametrize("word", ["{a,b}", "x{1..3}", "{-n,-e}", '"a"{b,c}', "{,}"])
+def test_a_write_job_script_takes_no_brace_expansion(word: str) -> None:
+    problems = run_problems(f"echo {word} x")
+    assert any(p.startswith("brace expansion") for p in problems), problems
+
+
 def test_mapfile_takes_exactly_one_plain_target() -> None:
     for script in ("mapfile -t < f", "mapfile -t a b < f", "mapfile -t 'a[0]' < f"):
         assert any(p.startswith("mapfile targets") for p in run_problems(script)), script
@@ -964,6 +1035,7 @@ def test_the_write_job_check_allows_plain_uses_of_those_commands() -> None:
         "printf '%s' x",
         "mapfile -t days < f",
         "mapfile -t -d x days < f",
+        'rc=0; a="$(printf \'%s\' "${GITHUB_WORKSPACE}/x" "${days[@]}")" || rc=$?',
     ):
         assert run_problems(script) == [], script
 
