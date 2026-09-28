@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-29",
+  "reviewer": "Jake",
+  "mode": "crops",
+  "frames_reviewed": 100,
+  "boxes_shown": 238,
+  "boxes_not_person": 2,
+  "boxes_in_vehicle": 0,
+  "persons_missed": null,
+  "precision_person": 0.9916,
+  "precision_pedestrian": 0.9916,
+  "recall_estimate": null,
+  "detector": {
+    "model": "yolox_m",
+    "sha256": "21ff6cfdeb53b013bac2249599e55f00bff3cfdfdab37ed7a4620818c1d15b3f",
+    "conf": 0.35
+  }
+}
