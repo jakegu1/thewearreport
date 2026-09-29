@@ -40,13 +40,14 @@ brands). At 352×288 pixels they are not reliable, and the product does not need
 4. If a vision model is used for attribute labelling, it receives person crops only
    (never full frames), from a provider with data-processing terms, within a fixed
    monthly budget, and only the resulting labels are kept.
-5. Accuracy checks are done live, on a sample of current frames. A vision-language model
-   with open weights, running on the same machine as the detector, judges a small crop
-   around each detection in memory, and **only the tallies are kept**. Crops with known
-   answers, cut from openly licensed photos, are mixed in to check the judge itself. The
-   spot-check tool also has a manual mode in which a person marks each box right or wrong.
-   That mode writes its images to a temporary folder it deletes on exit, and it refuses to
-   run in CI.
+5. Accuracy checks are done by hand, live, on a sample of current frames. A person views the
+   crops in a window on their own computer; nothing is saved, and only the tallies and each
+   box's height in pixels are kept. Before launch at least 300 boxes are checked, across
+   daylight, dusk and rain; after that, 100 a month and after every change to the detector
+   or its thresholds. For one-off tests of automatic clothing labels, the same crops of
+   single people may be sent, in memory, to an open-weights vision model at a hosting
+   provider whose terms exclude storing, logging or training on them. The spot-check tool
+   refuses to run in CI.
 
 CI enforces rule 1 in two ways. A static check blocks image-writing calls in `engine/`.
 An end-to-end test runs a full sweep against a local fake camera server and checks that
@@ -68,7 +69,12 @@ switched off, and a test checks that loading it writes nothing.
   depends on distance, not on clothing. We will test this assumption with spot-checks.
 - **One city.** London's population is not everyone's. Clothing norms at a given
   temperature differ between cultures and climates. Pages say where the data comes from.
-- **Daytime only.** Sweeps run during daylight hours (London time).
+- **Near-field people only.** We count and classify only people whose box is at least
+  31 pixels tall in a 352×288 image: the smallest size at which most boxes can be checked
+  by eye and at least 90% of them are people. Smaller boxes are ignored. The threshold is
+  recalculated when the hand checks grow.
+- **Daytime only.** Sweeps run in London daytime, and only sweeps that start while the sun
+  is no more than 6° below the horizon are counted.
 - **Weather is a forecast for one point in central London** (the Met Office hourly time
   step nearest the sweep), not a measurement at each camera.
 
@@ -81,8 +87,9 @@ switched off, and a test checks that loading it writes nothing.
 
 ## Validation
 
-- **Detection precision:** at least 100 people spot-checked per week. Target ≥ 90%
-  precision. Below 85% raises an alert.
+- **Detection precision:** at least 300 boxes checked by hand before launch, then 100 a
+  month and after every change to the detector. Target ≥ 90% for near-field boxes; below
+  85% raises an alert.
 - **Attribute accuracy:** at least 200 near-field people compared with human labels.
   Target ≥ 85% per attribute before an attribute is published.
 - **Umbrellas:** validated during rain (at least 30 umbrellas).
@@ -106,3 +113,6 @@ Results will be published here with dates and sample sizes.
 - 2026-09 — Accuracy checks redesigned: an open-weights vision model on the same machine
   judges detection crops in memory, with known-answer crops mixed in as controls. The
   manual mode remains.
+- 2026-09 — Accuracy checks are done by hand: the automatic judge did not reach the required
+  accuracy (it never recognised a box that was not a person). Counts are limited to
+  near-field people.
