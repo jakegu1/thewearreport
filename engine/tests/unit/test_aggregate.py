@@ -272,6 +272,87 @@ def test_sample_record_passes_check_record() -> None:
     aggregate.check_record(json.loads(sample.read_text()))
 
 
+# persons_by_height ---------------------------------------------------------------------
+
+
+def _heights(cam: str, *heights: int, u: int = 0) -> aggregate.Observation:
+    return aggregate.Observation(cam, None, len(heights), u, heights)
+
+
+def test_build_record_sorts_the_histogram_by_height() -> None:
+    record = _build(
+        [_heights("A", 300, 7, 119, 0, u=2), _heights("B", 12, 7), _obs("C", "timeout")]
+    )
+    VALIDATOR.validate(record)
+    assert list(record["persons_by_height"].items()) == [
+        ("0", 1),
+        ("7", 2),
+        ("12", 1),
+        ("119", 1),
+        ("120+", 1),
+    ]
+
+
+def test_build_record_without_heights_has_no_histogram() -> None:
+    assert "persons_by_height" not in _valid()
+
+
+def test_build_record_ignores_heights_of_failed_frames() -> None:
+    failed = aggregate.Observation("B", "detect", 0, 0, None)
+    assert _build([_heights("A", 50), failed])["persons_by_height"] == {"50": 1}
+
+
+@pytest.mark.parametrize(
+    "observations",
+    [
+        [_heights("A", 50), _obs("B", p=1)],  # heights for some frames only
+        [aggregate.Observation("A", None, 2, 0, (50,))],  # fewer heights than persons
+        [aggregate.Observation("A", None, 0, 0, (50,))],  # more heights than persons
+        [aggregate.Observation("A", None, 1, 0, (-1,))],  # a negative height
+        [aggregate.Observation("A", None, 1, 0, (True,))],  # not an integer
+    ],
+)
+def test_build_record_refuses_inconsistent_heights(
+    observations: list[aggregate.Observation],
+) -> None:
+    with pytest.raises(aggregate.RecordError):
+        _build(observations)
+
+
+def test_height_keys_are_exactly_the_documented_set() -> None:
+    assert {str(h) for h in range(120)} | {"120+"} == aggregate.HEIGHT_KEYS
+    assert [aggregate.height_key(h) for h in (0, 9, 10, 119, 120, 10**30)] == [
+        "0",
+        "9",
+        "10",
+        "119",
+        "120+",
+        "120+",
+    ]
+    with pytest.raises(aggregate.RecordError):
+        aggregate.height_key(-1)
+
+
+def test_check_record_rejects_a_histogram_on_a_sweep_that_saw_nobody() -> None:
+    record = _build([_obs("A", "timeout")])
+    assert record["persons_by_height"] == {}
+    aggregate.check_record(record)
+    record["persons_by_height"] = {"3": 1}
+    with pytest.raises(aggregate.RecordError):
+        aggregate.check_record(record)
+
+
+def test_check_record_error_never_echoes_the_histogram() -> None:
+    record = _build([_heights("A", 50)])
+    record["persons_by_height"] = {"secret-key": 1}
+    with pytest.raises(aggregate.RecordError) as bad_key:
+        aggregate.check_record(record)
+    record["persons_by_height"] = {"50": 10**5000}
+    with pytest.raises(aggregate.RecordError) as huge:
+        aggregate.check_record(record)
+    assert "secret" not in str(bad_key.value) and len(str(huge.value)) < 200
+
+
 # The pipeline --------------------------------------------------------------------------
 
 
@@ -599,7 +680,10 @@ def test_detect_counts_releases_frames_as_it_goes() -> None:
     detector = _FakeDetector([1, 0])
     observations = aggregate.detect_counts(detector, results)
     assert results == []  # consumed: no frame is held after it has been seen
-    assert observations == [_obs("A", None, 1, 0), _obs("B", None, 0, 0)]
+    assert observations == [
+        aggregate.Observation("A", None, 1, 0, (222,)),  # 444.5 - 222.5
+        aggregate.Observation("B", None, 0, 0, ()),
+    ]
 
 
 def test_records_are_deterministic() -> None:

@@ -12,6 +12,11 @@ key is never fetched and never appears in `per_camera`, but it still counts in
 `cameras_listed` and under `frames_failed.invalid_id`, a category that is present only
 when it is at least 1 (a missing category means 0).
 
+Each record also carries `persons_by_height`: how many person boxes had each height
+(`box_height`, in source-frame pixels, with every height of 120 px or more under "120+").
+It holds counts per height only, never a position, width, score or camera, and it is
+optional in the schema: records published before it was added stay valid.
+
 `check_record` enforces the schema (data/schema/sweep.v1.json) and the rules between
 fields that a JSON Schema cannot express. The publisher runs it before writing a record
 and on every record it reads back.
@@ -79,6 +84,12 @@ RECORD_KEYS: Final = frozenset(
         "attribution",
     }
 )
+# Optional: absent from the records published before it was added.
+HEIGHTS: Final = "persons_by_height"
+# Heights from this many pixels up share one key, TALL_KEY.
+TALL: Final = 120
+TALL_KEY: Final = f"{TALL}+"
+HEIGHT_KEYS: Final = frozenset({*(str(h) for h in range(TALL)), TALL_KEY})
 WEATHER_KEYS: Final = frozenset({"temp_c", "apparent_c", "precip_mm", "observed_at", "source"})
 COUNT_KEYS: Final = frozenset({"persons", "umbrellas"})
 
@@ -95,12 +106,16 @@ class SweepError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """What one camera contributed to a sweep: an error category, or two counts."""
+    """What one camera contributed to a sweep: an error category, or two counts and the
+    height of each person box (`box_height`), in no particular order. `person_heights`
+    is None when the caller did not record heights; the record then has no
+    persons_by_height."""
 
     camera_id: str
     error: str | None
     persons: int = 0
     umbrellas: int = 0
+    person_heights: tuple[int, ...] | None = None
 
 
 # Formatting and parsing ----------------------------------------------------------------
@@ -140,6 +155,39 @@ def engine_version() -> str:
 
 
 # Building and checking records ---------------------------------------------------------
+
+
+def box_height(box: detect.Box) -> int:
+    """A box's height in source-frame pixels, rounded: round(y2 - y1). The spot-check's
+    per-box file uses the same rule."""
+    return round(box[3] - box[1])
+
+
+def height_key(height: int) -> str:
+    """The persons_by_height key for a height: "0" to "119", or "120+"."""
+    if height < 0:
+        raise RecordError("a box height is negative")
+    return TALL_KEY if height >= TALL else str(height)
+
+
+def _heights_histogram(observations: Sequence[Observation]) -> dict[str, int] | None:
+    """persons_by_height over the frames that succeeded, keys in height order; None when
+    no observation records heights. Raises RecordError when only some do, or when an
+    observation's heights do not match its person count."""
+    ok = [obs for obs in observations if obs.error is None]
+    recorded = [obs.person_heights for obs in ok if obs.person_heights is not None]
+    if not recorded and ok:
+        return None
+    if len(recorded) != len(ok):
+        raise RecordError("person heights are recorded for some frames only")
+    counts: Counter[str] = Counter()
+    for obs in ok:
+        heights = obs.person_heights or ()
+        if len(heights) != obs.persons:
+            raise RecordError("person heights do not match the person count")
+        counts.update(height_key(_count(h, "box height")) for h in heights)
+    ordered = [str(h) for h in range(TALL)] + [TALL_KEY]
+    return {key: counts[key] for key in ordered if counts[key]}
 
 
 def _weather_fields(conditions: weather.Conditions) -> dict[str, Any]:
@@ -206,6 +254,9 @@ def build_record(
         "model_sha256": model_sha256,
         "attribution": attribution,
     }
+    histogram = _heights_histogram(observations)
+    if histogram is not None:
+        record[HEIGHTS] = histogram
     check_record(record)
     return record
 
@@ -252,6 +303,22 @@ def _check_frames_failed(value: object) -> int:
     return sum(_count(v, "frames_failed count") for v in fields.values())
 
 
+def _check_heights(value: object, persons: int) -> None:
+    """persons_by_height: keys from HEIGHT_KEYS, positive integer counts summing to
+    `persons`. Never echoes a key or a value (either may be huge)."""
+    if not isinstance(value, dict) or len(value) > len(HEIGHT_KEYS):
+        raise RecordError(f"{HEIGHTS} is not an object of at most {len(HEIGHT_KEYS)} heights")
+    total = 0
+    for key, count in value.items():
+        if not isinstance(key, str) or key not in HEIGHT_KEYS:
+            raise RecordError(f"{HEIGHTS} has a key that is not a height")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise RecordError(f"{HEIGHTS} has a count that is not a positive integer")
+        total += count
+    if total != persons:
+        raise RecordError(f"{HEIGHTS} does not add up to persons_total")
+
+
 def _check_weather(value: object) -> None:
     if value is None:
         return
@@ -279,9 +346,13 @@ def check_record(record: object) -> None:
     Covers everything data/schema/sweep.v1.json says, plus: sweep_id is the minute of
     started_at, finished_at is not earlier, the counts add up, and the attribution names
     exactly the sources used. frames_failed has the five categories of ERROR_KINDS, and
-    also invalid_id when that count is at least 1.
+    also invalid_id when that count is at least 1. persons_by_height is optional; when
+    present, its counts add up to persons_total.
     """
-    rec = _object(record, RECORD_KEYS, "record")
+    if isinstance(record, dict) and HEIGHTS in record:
+        rec = _object(record, RECORD_KEYS | {HEIGHTS}, "record")
+    else:
+        rec = _object(record, RECORD_KEYS, "record")
     if rec["schema"] != SCHEMA_VERSION or rec["source"] != SOURCE:
         raise RecordError("schema or source is wrong")
     sweep_id = _string(rec["sweep_id"], SWEEP_ID, "sweep_id")
@@ -308,6 +379,8 @@ def check_record(record: object) -> None:
         persons, umbrellas = persons + p, umbrellas + u
     if _count(rec["persons_total"], "persons_total") != persons:
         raise RecordError("persons_total is not the sum over per_camera")
+    if HEIGHTS in rec:
+        _check_heights(rec[HEIGHTS], persons)
     if _count(rec["umbrellas_total"], "umbrellas_total") != umbrellas:
         raise RecordError("umbrellas_total is not the sum over per_camera")
     _check_weather(rec["weather"])
@@ -358,7 +431,8 @@ def usable_cameras(
 
 def detect_counts(detector: detect.Detector, results: list[fetch.FrameResult]) -> list[Observation]:
     """One observation per fetch result, in order. Consumes `results`: each frame is
-    released as soon as the detector has seen it, and only the two counts are kept."""
+    released as soon as the detector has seen it, and only the two counts and the
+    heights of the person boxes are kept."""
     results.reverse()
     observations: list[Observation] = []
     while results:
@@ -379,10 +453,10 @@ def detect_counts(detector: detect.Detector, results: list[fetch.FrameResult]) -
             continue
         finally:
             del frame
-        persons = sum(d.label == "person" for d in found)
+        heights = tuple(box_height(d.box) for d in found if d.label == "person")
         umbrellas = sum(d.label == "umbrella" for d in found)
         del found
-        observations.append(Observation(camera_id, None, persons, umbrellas))
+        observations.append(Observation(camera_id, None, len(heights), umbrellas, heights))
     return observations
 
 
