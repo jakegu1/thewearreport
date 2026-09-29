@@ -28,9 +28,11 @@ reviewer only. A malformed file is an error that names it.
 reads instead every per-box file, `<dir>/boxes/*.json` (box heights and labels only), and
 chooses a near-field threshold: the smallest box height H whose boxes (those at least H
 pixels tall) reach TARGET_PRECISION, with a Wilson 95% lower bound of at least
-MIN_LOWER_BOUND, over at least MIN_BOXES_ABOVE judged boxes. Precision is the boxes
-labelled person or in_vehicle over the judged ones (person, in_vehicle, not_person);
-unsure boxes are left out and counted. It prints every candidate height, the threshold
+MIN_LOWER_BOUND, over at least MIN_BOXES_ABOVE judged boxes, and whose judged share is at
+least MIN_JUDGED_SHARE. Precision is the boxes labelled person or in_vehicle over the
+judged ones (person, in_vehicle, not_person); unsure boxes are left out of it and counted.
+The judged share is the judged boxes over the judged and unsure ones: a box nobody can
+verify is not counted. It prints every candidate height and its judged share, the threshold
 (or none), the precision at it per light and, with `--data-dir` (a checkout of the data
 branch), per rain condition, and whether the baseline is complete (see `coverage`).
 
@@ -78,6 +80,7 @@ MAX_HEIGHT = 100_000  # pixels; no camera frame is this tall
 TARGET_PRECISION = 0.90
 MIN_LOWER_BOUND = 0.85
 MIN_BOXES_ABOVE = 100
+MIN_JUDGED_SHARE = 0.80
 WILSON_Z = NormalDist().inv_cdf(0.975)  # a two-sided 95% interval
 # The baseline is complete with BASELINE_BOXES judged boxes from BASELINE_SESSIONS
 # sessions on BASELINE_DATES dates, and MIN_CONDITION_BOXES judged boxes in each of
@@ -483,14 +486,21 @@ def with_rain(sessions: Sequence[Session], data_dir: Path) -> list[Session]:
 
 @dataclass(frozen=True, slots=True)
 class Tally:
-    """Judged boxes and, of them, those labelled a person (on foot or in a vehicle)."""
+    """Judged boxes, those of them labelled a person (on foot or in a vehicle), and the
+    unsure boxes."""
 
     judged: int
     positive: int
+    unsure: int = 0
 
     @property
     def precision(self) -> float | None:
         return self.positive / self.judged if self.judged else None
+
+    @property
+    def judged_share(self) -> float | None:
+        total = self.judged + self.unsure
+        return self.judged / total if total else None
 
     @property
     def interval(self) -> tuple[float, float] | None:
@@ -510,15 +520,21 @@ def tally(boxes: Iterable[tuple[int, str]], min_height: int = 0) -> Tally:
     labels = [label for height, label in boxes if height >= min_height]
     judged = sum(1 for label in labels if label in JUDGED_LABELS)
     positive = sum(1 for label in labels if label in ("person", "in_vehicle"))
-    return Tally(judged, positive)
+    unsure = sum(1 for label in labels if label == "unsure")
+    return Tally(judged, positive, unsure)
 
 
 def qualifies(t: Tally) -> bool:
-    """At least MIN_BOXES_ABOVE judged boxes, TARGET_PRECISION and MIN_LOWER_BOUND."""
-    precision, interval = t.precision, t.interval
-    if precision is None or interval is None or t.judged < MIN_BOXES_ABOVE:
+    """At least MIN_BOXES_ABOVE judged boxes, TARGET_PRECISION, MIN_LOWER_BOUND and
+    MIN_JUDGED_SHARE."""
+    precision, interval, share = t.precision, t.interval, t.judged_share
+    if precision is None or interval is None or share is None or t.judged < MIN_BOXES_ABOVE:
         return False
-    return precision >= TARGET_PRECISION - EPSILON and interval[0] >= MIN_LOWER_BOUND - EPSILON
+    return (
+        precision >= TARGET_PRECISION - EPSILON
+        and interval[0] >= MIN_LOWER_BOUND - EPSILON
+        and share >= MIN_JUDGED_SHARE - EPSILON
+    )
 
 
 def _all_boxes(sessions: Sequence[Session]) -> list[tuple[int, str]]:
@@ -593,14 +609,22 @@ def heights_report(sessions: Sequence[Session], directory: Path, rain: bool) -> 
         f"{len(sessions)} per-box file(s) in {directory / BOXES_DIR}",
         f"unsure boxes (left out): {unsure}",
     ]
-    for height in candidate_heights(sessions):
+    heights = candidate_heights(sessions)
+    for height in heights:
         above = tally(boxes, height)
         kept = _fmt(above.positive / positives if positives else None)
         lines.append(f">= {height} px: {_stat(above)} kept {kept}")
+    for height in heights:
+        above = tally(boxes, height)
+        lines.append(
+            f"judged share >= {height} px: {above.judged} of {above.judged + above.unsure} "
+            f"({_fmt(above.judged_share)})"
+        )
     chosen = threshold(sessions)
     lines.append(
         f"threshold rule: precision >= {TARGET_PRECISION:.2f}, Wilson lower bound >= "
-        f"{MIN_LOWER_BOUND:.2f}, at least {MIN_BOXES_ABOVE} judged boxes"
+        f"{MIN_LOWER_BOUND:.2f}, at least {MIN_BOXES_ABOVE} judged boxes, "
+        f"judged share >= {MIN_JUDGED_SHARE:.2f}"
     )
     lines.append(f"threshold: {'none' if chosen is None else f'{chosen} px'}")
     lines.append("over all boxes:" if chosen is None else f"at {chosen} px:")

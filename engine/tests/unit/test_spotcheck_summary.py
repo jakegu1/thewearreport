@@ -241,3 +241,16 @@ def test_a_height_with_only_unsure_boxes_is_a_candidate(
     lines = capsys.readouterr().out.splitlines()
     assert ">= 90 px: n=0 precision n/a wilson n/a kept 0.0000" in lines
     assert "coverage: 1 session, 1 date, 1 judged boxes" in lines[-1]
+    assert "judged share >= 90 px: 0 of 1 (0.0000)" in lines
+
+
+def test_the_judged_share_is_undefined_without_boxes() -> None:
+    assert summary.tally([]).judged_share is None
+    assert summary.tally([(40, "unsure")], 50).judged_share is None
+    assert summary.tally([(40, "person"), (60, "unsure")]).judged_share == 0.5
+
+
+def test_a_tally_without_boxes_or_below_the_share_does_not_qualify() -> None:
+    assert not summary.qualifies(summary.Tally(0, 0, 0))
+    assert summary.qualifies(summary.Tally(100, 100, 25))
+    assert not summary.qualifies(summary.Tally(100, 100, 26))

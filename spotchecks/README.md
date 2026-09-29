@@ -247,9 +247,16 @@ count. Precision is the boxes labelled `person` or `in_vehicle` over the judged 
 - for each candidate height H, every distinct height in the files, smallest first: the
   judged boxes at least H pixels tall, their precision and interval, and the share of all
   judged person boxes (`person` or `in_vehicle`) they keep;
+- for each candidate height H, the judged share: the judged boxes at least H pixels tall
+  over those judged boxes and the `unsure` ones, as `judged share >= H px: judged of
+  total (share)`, or `n/a` when there is no box that tall;
 - the threshold: the smallest H whose boxes have a precision of at least
   `TARGET_PRECISION` (0.90) and a Wilson lower bound of at least `MIN_LOWER_BOUND` (0.85),
-  over at least `MIN_BOXES_ABOVE` (100) judged boxes; or `none`;
+  over at least `MIN_BOXES_ABOVE` (100) judged boxes, with a judged share of at least
+  `MIN_JUDGED_SHARE` (0.80); or `none`. A box nobody can verify must not be counted, so
+  most boxes at or above the threshold must be ones the reviewer could judge: on real
+  cameras most small boxes are unsure, and the few judged ones alone would pass the
+  precision bar;
 - at the threshold (over all boxes when there is none), the precision, n and interval per
   `light`, and with `--data-dir` per rain condition;
 - a coverage line: sessions, dates, judged boxes, judged boxes per light and per rain
