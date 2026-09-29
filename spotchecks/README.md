@@ -35,6 +35,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxe
 | `--judge-max-requests N` | required with `--judge` | the most requests the judge may make, retries included (1 to 10000) |
 | `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
 | `--attributes` | off | run an attribute session instead of a detection check (see [Attribute session](#attribute-session-attributes)) |
+| `--confirm-stop` | off | in the window, a first `q` asks before it stops (see below); needs `--view window`, refused otherwise |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -59,6 +60,13 @@ directory is created anywhere. One key per crop:
 | `u` | cannot tell what the box is (left out of the statistics) |
 | `Backspace` | go back one crop, to change it |
 | `q`, or closing the window | stop without writing statistics |
+
+With `--confirm-stop`, a single `q` never ends the review. The first `q` (or `Q`) keeps
+the crop and the answers so far, and the header line shows "Stop and discard this
+session? Press q again to stop, any other key to continue." A second `q` then stops
+without writing statistics; any other key hides the question and is otherwise ignored (it
+is not an answer and does not go back). Closing the window and the review timeout still
+stop at once. Without the flag, `q` stops at once, as above.
 
 The window closes after the last crop, and the statistics are exactly those the keyboard
 would give for the same answers. The review timeout closes the window too, and the tool
@@ -320,6 +328,10 @@ window shows the crop and the current question above it:
 | `q`, or closing the window | stop without writing anything |
 
 Capitals work as well. The window's one-line legend (`ATTRIBUTE_LEGEND`) lists these keys.
+With `--confirm-stop` the first `q` only asks, as in a detection check: the header line
+shows "Stop and discard this session? Press q again to stop, any other key to continue.",
+a second `q` stops without writing anything, and any other key hides the question and is
+not taken as an answer. The crop and the question on screen stay as they were.
 
 With `--judgements PATH` write one entry per crop, keyed by crop number: either `"x"`, or
 an object with exactly the three keys, each `"y"`, `"n"` or `"u"`:
