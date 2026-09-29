@@ -254,3 +254,54 @@ def test_a_tally_without_boxes_or_below_the_share_does_not_qualify() -> None:
     assert not summary.qualifies(summary.Tally(0, 0, 0))
     assert summary.qualifies(summary.Tally(100, 100, 25))
     assert not summary.qualifies(summary.Tally(100, 100, 26))
+
+
+# The attribute summary (T-045) ---------------------------------------------------------
+
+
+def _pairs(**cells: int) -> summary.Pairs:
+    """cells like yu=3: reviewer y, model u, 3 crops."""
+    return summary.Pairs({(key[0], key[1]): n for key, n in cells.items()})
+
+
+def test_the_measures_count_a_model_unsure_as_wrong() -> None:
+    p = _pairs(yy=8, yn=1, yu=1, ny=2, nn=6, nu=2)
+    assert p.precision == (8, 10)
+    assert p.recall == (8, 10)
+    assert p.specificity == (6, 10)
+    assert p.count(model="u") == 3
+
+
+def test_verdict_no_model_without_pairs() -> None:
+    assert summary.verdict(_pairs()) == "no model"
+
+
+def test_verdict_names_every_short_count() -> None:
+    assert summary.verdict(_pairs(yy=1, nn=1)) == (
+        "insufficient (reviewer yes 1 < 30; reviewer no 1 < 30; reviewer yes+no 2 < 200)"
+    )
+
+
+def test_attributes_and_heights_together_are_refused(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        summary.main(["--attributes", "--heights", "--dir", str(tmp_path)])
+    assert stopped.value.code == 2
+
+
+def test_an_empty_attribute_directory_prints_no_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "attributes").mkdir()
+    assert summary.main(["--attributes", "--dir", str(tmp_path)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "crops: 0 shown, 0 rejected, 0 labelled, 0 with a model answer"
+    assert lines.count("  verdict: no model") == 3
+
+
+def test_attributes_with_a_missing_data_dir_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "attributes").mkdir()
+    args = ["--attributes", "--dir", str(tmp_path), "--data-dir", str(tmp_path / "missing")]
+    assert summary.main(args) == 1
+    assert "missing" in capsys.readouterr().err

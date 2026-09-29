@@ -32,7 +32,7 @@ import numpy.typing as npt
 import pytest
 
 from wearreport._cv import cv2
-from wearreport.tools import goldset, judge
+from wearreport.tools import goldset, judge, judge_hosted
 
 ROOT = Path(__file__).resolve().parents[3]
 PROXY_ENV = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
@@ -1151,3 +1151,96 @@ def test_deepinfra_a_one_mebibyte_error_message_ends_within_the_timeout(
         deepinfra(fake, timeout=timeout).classify(crop())
     assert time.monotonic() - start < timeout + 1.0
     assert str(caught.value) == "DeepInfra answered HTTP 422: …"
+
+
+# The attribute judge (T-045) ------------------------------------------------------------
+
+ATTRIBUTE_REPLY = "outer=no legs=yes umbrella=unsure"
+
+
+def _attribute_judge(fake: FakeServer, limit: int = 100, name: str = "di-qwen3-vl-235b") -> Any:
+    return judge_hosted.LiveAttributeJudge(
+        name, budget=judge_hosted.RequestBudget(limit), endpoint=fake.url, sleep=lambda s: None
+    )
+
+
+def _live_image() -> npt.NDArray[np.uint8]:
+    return np.random.default_rng(3).integers(0, 256, (80, 50, 3), dtype=np.uint8)
+
+
+def test_the_bake_off_prompt_and_token_limit_are_unchanged(server: Any) -> None:
+    fake = server(chat("person"))
+    assert deepinfra(fake).classify(crop()) == "person"
+    body = json.loads(fake.requests[0]["body"])
+    [text] = [p["text"] for p in body["messages"][0]["content"] if p["type"] == "text"]
+    assert text == judge_hosted.PROMPT
+    assert body["max_tokens"] == judge_hosted.REMOTE_MAX_TOKENS == 10
+
+
+def test_the_attribute_judge_asks_its_prompt_with_room_for_the_line(
+    server: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "test-key-123")
+    fake = server(chat(ATTRIBUTE_REPLY))
+    attribute_judge = _attribute_judge(fake)
+    image = _live_image()
+    assert attribute_judge.classify_attributes(image) == "nyu"
+    request = fake.requests[0]
+    assert request["path"] == judge_hosted.DEEPINFRA_PATH
+    assert request["headers"]["Authorization"] == "Bearer test-key-123"
+    body = json.loads(request["body"])
+    [text] = [p["text"] for p in body["messages"][0]["content"] if p["type"] == "text"]
+    assert text == judge_hosted.ATTRIBUTE_PROMPT
+    assert body["max_tokens"] == judge_hosted.ATTRIBUTE_MAX_TOKENS
+    assert body["temperature"] == 0 and "reasoning_effort" not in body
+    usage = attribute_judge.usage
+    assert (usage.requests, usage.input_tokens, usage.output_tokens) == (1, 300, 2)
+    attribute_judge.close()
+    with pytest.raises(judge.JudgeError):
+        attribute_judge.classify_attributes(image)
+    assert len(fake.requests) == 1
+
+
+def test_the_attribute_judge_asks_reasoning_models_not_to_reason(server: Any) -> None:
+    fake = server(chat(ATTRIBUTE_REPLY))
+    name = candidate(reasoning_off=True).name
+    assert _attribute_judge(fake, name=name).classify_attributes(_live_image()) == "nyu"
+    assert json.loads(fake.requests[0]["body"])["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [chat(None), chat("", finish="stop"), chat(ATTRIBUTE_REPLY, finish="content_filter")],
+)
+def test_the_attribute_judge_counts_silence_as_cannot_tell(server: Any, reply: Reply) -> None:
+    fake = server(reply)
+    assert _attribute_judge(fake).classify_attributes(_live_image()) == "uuu"
+
+
+def test_the_attribute_judge_takes_live_crops_not_only_marked_ones(server: Any) -> None:
+    fake = server(chat(ATTRIBUTE_REPLY))
+    image = _live_image()
+    assert not judge_hosted.is_licensed(image)
+    assert _attribute_judge(fake).classify_attributes(image) == "nyu"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("outer=yes legs=yes umbrella=yes", "yyy"),
+        ("  outer=no legs=no umbrella=no  ", "nnn"),
+        ("outer=unsure legs=unsure umbrella=unsure", "uuu"),
+        ("OUTER=yes legs=no umbrella=no", "uuu"),
+        ("outer=yes  legs=no umbrella=no", "uuu"),
+        ("outer=yes, legs=no, umbrella=no", "uuu"),
+        ("outer=yes legs=no umbrella=no outer=no", "uuu"),
+        ("`outer=yes legs=no umbrella=no`", "uuu"),
+    ],
+)
+def test_parse_attributes_is_strict(text: str, expected: str) -> None:
+    assert judge_hosted.parse_attributes(text) == expected
+
+
+def test_parse_attributes_rejects_what_is_not_text() -> None:
+    for value in (None, 3, b"outer=yes legs=no umbrella=no", ["outer=yes"]):
+        assert judge_hosted.parse_attributes(value) == judge_hosted.ALL_UNSURE

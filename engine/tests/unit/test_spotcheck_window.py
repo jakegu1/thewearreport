@@ -597,3 +597,71 @@ def test_window_unsure_without_record_boxes_writes_only_the_statistics(
     stats = json.loads((out / name).read_text(encoding="utf-8"))
     assert stats["boxes_shown"] == 2 and stats["boxes_not_person"] == 1
     assert [p.relative_to(out).as_posix() for p in out.rglob("*")] == [name]
+
+
+# The attribute window (T-045) ----------------------------------------------------------
+
+
+def test_attribute_window_keys_capitals_and_backspace() -> None:
+    _need_window()
+    # BackSpace before any answer does nothing; X rejects crop 1; Backspace undoes it; then
+    # N U Y answer crop 1, and y y y crop 2. Keys after the last crop are ignored.
+    keys = ["<BackSpace>", "<KeyPress-X>", "<BackSpace>", "<KeyPress-N>", "<KeyPress-U>"]
+    keys += ["<KeyPress-Y>", "<KeyPress-y>", "<KeyPress-y>", "<KeyPress-y>", "<KeyPress-q>"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    got = reviewer.attributes(_crops([1, 2]), time.monotonic() + WAIT_S)
+    assert dict(got) == {1: "nuy", 2: "yyy"}
+
+
+def test_attribute_window_ignores_the_detection_keys() -> None:
+    _need_window()
+    keys = ["<Return>", "<KeyPress-v>", "<space>", "<KeyPress-x>"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    assert dict(reviewer.attributes(_crops([1]), time.monotonic() + WAIT_S)) == {1: None}
+
+
+def test_attribute_window_closed_or_timed_out() -> None:
+    _need_window()
+    close = _send("<KeyPress-y>", extra=lambda root: root.event_generate("<KeyPress-Q>"))
+    with pytest.raises(spotcheck.ReviewAborted):
+        spotcheck.WindowReviewer(driver=close).attributes(_crops([1]), time.monotonic() + WAIT_S)
+    with pytest.raises(spotcheck.ReviewTimeout):
+        spotcheck.WindowReviewer(driver=_send()).attributes(_crops([1]), time.monotonic() + 0.5)
+
+
+def test_attribute_window_with_nothing_to_label_opens_nothing() -> None:
+    reviewer = spotcheck.WindowReviewer(driver=lambda root: pytest.fail("no window"))
+    assert reviewer.attributes([], time.monotonic() + WAIT_S) == {}
+
+
+def test_attribute_window_leaves_no_tk_object_for_another_thread_to_free() -> None:
+    _need_window()
+    send = _send("<KeyPress-y>", "<KeyPress-n>", "<KeyPress-u>")
+    gc.disable()  # only the review's own clean-up may free it
+    try:
+        spotcheck.WindowReviewer(driver=send).attributes(_crops([1]), time.monotonic() + WAIT_S)
+        root = weakref.ref(send.root)
+        del send
+        assert root() is None
+    finally:
+        gc.enable()
+
+
+def test_attribute_session_in_the_window_writes_only_the_attribute_file(
+    env: Path, tmp_path: Path
+) -> None:
+    _need_window()
+    out = tmp_path / "out"
+    keys = ["<KeyPress-y>", "<KeyPress-n>", "<KeyPress-n>", "<KeyPress-x>"]
+    args = ["--attributes", "--n", "1", "--min-persons", "1", "--view", "window"]
+    reviewer = spotcheck.WindowReviewer(driver=_send(*keys))
+    assert _run(args, out, pipeline=_pipeline([2]), reviewer=reviewer) == 0
+    name = f"{DAY.isoformat()}.json"
+    assert sorted(p.relative_to(out).as_posix() for p in out.rglob("*")) == [
+        spotcheck.ATTRIBUTES_DIR,
+        f"{spotcheck.ATTRIBUTES_DIR}/{name}",
+    ]
+    record = json.loads((out / spotcheck.ATTRIBUTES_DIR / name).read_text(encoding="utf-8"))
+    assert record["crops"] == [[60, "ynn", None]]
+    assert record["crops_shown"] == 2 and record["crops_rejected"] == 1
+    assert not list(env.iterdir())  # nothing in the temporary directory either

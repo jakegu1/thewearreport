@@ -40,6 +40,24 @@ A session is "rain" when the published sweep record nearest its `started_at`, wi
 RAIN_JOIN_MINUTES, has `weather.precip_mm` > 0, "dry" when it is 0, and "unknown"
 otherwise (no such record, or no weather in it). Only the records within that window are
 read; a malformed one is an error that names it.
+
+  python -m wearreport.tools.spotcheck_summary --attributes [--dir spotchecks] [--data-dir PATH]
+
+reads instead every attribute file, `<dir>/attributes/*.json` (heights and y/n/u answers
+only), and prints, for each attribute (outer layer, bare legs, open umbrella):
+
+- the reviewer's answers: yes, no and cannot tell, and the yes share over yes and no with
+  its Wilson 95% interval; the same per light and, with `--data-dir`, per rain condition
+  (joined as for `--heights`);
+- over the crops the reviewer answered yes or no and the model was asked (its answer is
+  not null): the model's precision on yes, its recall on yes and its specificity (recall on
+  no), each with n and its Wilson interval, and how often it said "cannot tell". A model
+  "cannot tell" counts as wrong in recall and specificity, so a model that never commits
+  cannot pass;
+- a verdict: `pass` with at least MIN_POSITIVES reviewer yes, MIN_NEGATIVES reviewer no
+  and MIN_LABELLED of both among those crops, and precision, recall and specificity each
+  at least TARGET_ATTRIBUTE_ACCURACY; `insufficient (...)` when a count is short; `fail
+  (...)` naming the measures below the bar; `no model` when the model answered nothing.
 """
 
 from __future__ import annotations
@@ -97,6 +115,29 @@ EPSILON = 1e-12  # a ratio this close to a bar meets it
 _STARTED_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z")
 _UTC_SECONDS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _SWEEP_FILE = re.compile(r"(\d{8}T\d{4}Z)\.json")
+
+# The attribute summary (--attributes).
+ATTRIBUTES_DIR = "attributes"
+ATTRIBUTE_FIELDS = frozenset(
+    {
+        "date",
+        "started_at",
+        "light",
+        "frames",
+        "detector",
+        "min_height_px",
+        "judge",
+        "crops_shown",
+        "crops_rejected",
+        "crops",
+    }
+)
+ATTRIBUTE_NAMES = ("outer_layer", "bare_legs", "umbrella")  # the letters' order
+MIN_POSITIVES = 30  # reviewer yes, among the crops the model answered
+MIN_NEGATIVES = 30  # reviewer no, among them
+MIN_LABELLED = 200  # reviewer yes or no, among them
+TARGET_ATTRIBUTE_ACCURACY = 0.85  # precision, recall and specificity, each
+_LETTERS = re.compile(r"[ynu]{3}")
 
 Confusion = dict[str, dict[str, int]]
 
@@ -478,7 +519,7 @@ def rain_condition(data_dir: Path, started_at: datetime.datetime) -> str:
     return "rain" if nearest[2] > 0 else "dry"
 
 
-def with_rain(sessions: Sequence[Session], data_dir: Path) -> list[Session]:
+def with_rain[S: (Session, Labelling)](sessions: Sequence[S], data_dir: Path) -> list[S]:
     if not data_dir.is_dir():
         raise SummaryError(f"cannot read {data_dir}: not a directory")
     return [dataclasses.replace(s, rain=rain_condition(data_dir, s.started_at)) for s in sessions]
@@ -653,6 +694,246 @@ def _heights_main(directory: Path, data_dir: Path | None) -> int:
     return 0
 
 
+# The attribute summary -----------------------------------------------------------------
+
+Crop = tuple[int, str, str | None]  # height, the reviewer's letters, the model's (or None)
+
+
+@dataclass(frozen=True, slots=True)
+class Labelling:
+    """What the attribute summary reads from one attribute file, and its rain condition."""
+
+    started_at: datetime.datetime
+    light: str
+    shown: int
+    rejected: int
+    crops: tuple[Crop, ...]
+    rain: str = "unknown"
+
+
+def _crop(value: object, judged: bool) -> Crop:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError("a crop is not [height, reviewer, model]")
+    height, reviewer, model = value
+    if type(height) is not int or not 0 <= height <= MAX_HEIGHT:
+        raise ValueError("a crop height is not a whole number of pixels")
+    if not isinstance(reviewer, str) or not _LETTERS.fullmatch(reviewer):
+        raise ValueError("a reviewer answer is not three of y, n, u")
+    if model is not None:
+        if not isinstance(model, str) or not _LETTERS.fullmatch(model):
+            raise ValueError("a model answer is not three of y, n, u")
+        if not judged:
+            raise ValueError("a model answer without a judge")
+    return height, reviewer, model
+
+
+def parse_labelling(raw: bytes) -> Labelling:
+    """One attribute file; raises ValueError (or a subclass) when it is malformed."""
+    if len(raw) > MAX_FILE_BYTES:
+        raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+    if set(data) != ATTRIBUTE_FIELDS:
+        raise ValueError("its fields are not " + ", ".join(sorted(ATTRIBUTE_FIELDS)))
+    day = data["date"]
+    if not isinstance(day, str) or not _DATE.fullmatch(day):
+        raise ValueError("date is not YYYY-MM-DD")
+    datetime.date.fromisoformat(day)
+    started = data["started_at"]
+    if not isinstance(started, str):
+        raise ValueError("started_at is not a UTC time")
+    light = data["light"]
+    if light not in LIGHTS:
+        raise ValueError("light is not one of " + ", ".join(LIGHTS))
+    _count(data["frames"], "frames")
+    _count(data["min_height_px"], "min_height_px")
+    if not isinstance(data["detector"], dict):
+        raise ValueError("detector is not an object")
+    judge = data["judge"]
+    if judge is not None and (not isinstance(judge, str) or not _MODEL.fullmatch(judge)):
+        raise ValueError("judge is not a model name")
+    shown = _count(data["crops_shown"], "crops_shown")
+    rejected = _count(data["crops_rejected"], "crops_rejected")
+    crops = data["crops"]
+    if not isinstance(crops, list):
+        raise ValueError("crops is not a list")
+    if rejected > shown or len(crops) != shown - rejected:
+        raise ValueError("crops_shown, crops_rejected and crops do not agree")
+    return Labelling(
+        started_at=_utc(started, _STARTED_AT, "%Y-%m-%dT%H:%MZ"),
+        light=light,
+        shown=shown,
+        rejected=rejected,
+        crops=tuple(_crop(crop, judge is not None) for crop in crops),
+    )
+
+
+def load_labellings(directory: Path) -> list[Labelling]:
+    """Every attribute file in `directory`/attributes, in name order."""
+    folder = directory / ATTRIBUTES_DIR
+    try:
+        paths = sorted(p for p in folder.iterdir() if p.suffix == ".json" and p.is_file())
+    except OSError as exc:
+        raise SummaryError(f"cannot read {folder}: {exc.strerror}") from None
+    labellings = []
+    for path in paths:
+        try:
+            labellings.append(parse_labelling(_read(path, MAX_FILE_BYTES)))
+        except OSError as exc:
+            raise SummaryError(f"cannot read {path.name}: {exc.strerror}") from None
+        except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
+            reason = str(exc) if type(exc) is ValueError else type(exc).__name__
+            raise SummaryError(f"{path.name} is not an attribute file ({reason})") from None
+    return labellings
+
+
+@dataclass(frozen=True, slots=True)
+class Answers:
+    """The reviewer's answers to one question: yes, no and cannot tell."""
+
+    yes: int
+    no: int
+    unsure: int
+
+
+def answers(letters: Iterable[str]) -> Answers:
+    found = list(letters)
+    return Answers(found.count("y"), found.count("n"), found.count("u"))
+
+
+def _ratio(k: int, n: int) -> str:
+    """k/n with its Wilson interval, or n/a when n is 0."""
+    if not n:
+        return "n/a wilson n/a"
+    lo, hi = wilson(k, n)
+    return f"{k / n:.4f} wilson [{lo:.4f}, {hi:.4f}]"
+
+
+def _answers_text(a: Answers) -> str:
+    return (
+        f"yes {a.yes}, no {a.no}, cannot tell {a.unsure}; "
+        f"yes share {_ratio(a.yes, a.yes + a.no)} (n={a.yes + a.no})"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Pairs:
+    """Over the crops the reviewer answered yes or no and the model answered: how often
+    each (reviewer, model) pair of letters occurs, e.g. pairs[("y", "u")]."""
+
+    pairs: dict[tuple[str, str], int]
+
+    def count(self, reviewer: str | None = None, model: str | None = None) -> int:
+        return sum(
+            n for (r, m), n in self.pairs.items() if reviewer in (None, r) and model in (None, m)
+        )
+
+    @property
+    def precision(self) -> tuple[int, int]:
+        return self.count("y", "y"), self.count(model="y")
+
+    @property
+    def recall(self) -> tuple[int, int]:
+        """A model "cannot tell" is in the denominator: it counts as wrong."""
+        return self.count("y", "y"), self.count("y")
+
+    @property
+    def specificity(self) -> tuple[int, int]:
+        return self.count("n", "n"), self.count("n")
+
+
+def pairs(crops: Iterable[Crop], index: int) -> Pairs:
+    found: dict[tuple[str, str], int] = {}
+    for _height, reviewer, model in crops:
+        if model is not None and reviewer[index] in ("y", "n"):
+            key = (reviewer[index], model[index])
+            found[key] = found.get(key, 0) + 1
+    return Pairs(found)
+
+
+def _meets(k: int, n: int) -> bool:
+    return bool(n) and k / n >= TARGET_ATTRIBUTE_ACCURACY - EPSILON
+
+
+def verdict(p: Pairs) -> str:
+    """pass, insufficient (what is short), fail (the measures below the bar), no model."""
+    if not p.count():
+        return "no model"
+    yes, no = p.count("y"), p.count("n")
+    short = []
+    if yes < MIN_POSITIVES:
+        short.append(f"reviewer yes {yes} < {MIN_POSITIVES}")
+    if no < MIN_NEGATIVES:
+        short.append(f"reviewer no {no} < {MIN_NEGATIVES}")
+    if yes + no < MIN_LABELLED:
+        short.append(f"reviewer yes+no {yes + no} < {MIN_LABELLED}")
+    if short:
+        return f"insufficient ({'; '.join(short)})"
+    measures = [("precision", p.precision), ("recall", p.recall), ("specificity", p.specificity)]
+    failed = [name for name, (k, n) in measures if not _meets(k, n)]
+    return f"fail ({', '.join(failed)})" if failed else "pass"
+
+
+def _measure(k: int, n: int) -> str:
+    if not n:
+        return "n/a (n=0) wilson n/a"
+    lo, hi = wilson(k, n)
+    return f"{k / n:.4f} (n={n}) wilson [{lo:.4f}, {hi:.4f}]"
+
+
+def attributes_report(labellings: Sequence[Labelling], directory: Path, rain: bool) -> list[str]:
+    """The lines `--attributes` prints. `rain`: whether the rain conditions are known."""
+    crops = [crop for s in labellings for crop in s.crops]
+    lines = [
+        f"{len(labellings)} attribute file(s) in {directory / ATTRIBUTES_DIR}",
+        f"crops: {sum(s.shown for s in labellings)} shown, "
+        f"{sum(s.rejected for s in labellings)} rejected, {len(crops)} labelled, "
+        f"{sum(1 for crop in crops if crop[2] is not None)} with a model answer",
+        f"verdict bar, over the crops the reviewer answered yes or no and the model answered: "
+        f"reviewer yes >= {MIN_POSITIVES}, reviewer no >= {MIN_NEGATIVES}, reviewer yes+no "
+        f">= {MIN_LABELLED}; precision, recall and specificity each >= "
+        f'{TARGET_ATTRIBUTE_ACCURACY:.2f}; a model "cannot tell" counts as wrong',
+    ]
+    for index, name in enumerate(ATTRIBUTE_NAMES):
+        lines.append(f"{name}:")
+        lines.append(f"  reviewer: {_answers_text(answers(r[index] for _h, r, _m in crops))}")
+        groups = [
+            (f"light {light}", [s for s in labellings if s.light == light]) for light in LIGHTS
+        ]
+        if rain:
+            groups += [
+                (f"rain {condition}", [s for s in labellings if s.rain == condition])
+                for condition in RAIN_CONDITIONS
+            ]
+        for label, group in groups:
+            letters = (r[index] for s in group for _h, r, _m in s.crops)
+            lines.append(f"  {label}: {_answers_text(answers(letters))}")
+        p = pairs(crops, index)
+        if p.count():
+            lines.append(f"  model: {p.count()} paired, model cannot tell {p.count(model='u')}")
+            lines.append(f"  model precision {_measure(*p.precision)}")
+            lines.append(f"  model recall {_measure(*p.recall)}")
+            lines.append(f"  model specificity {_measure(*p.specificity)}")
+        else:
+            lines.append("  model: none")
+        lines.append(f"  verdict: {verdict(p)}")
+    return lines
+
+
+def _attributes_main(directory: Path, data_dir: Path | None) -> int:
+    try:
+        labellings = load_labellings(directory)
+        if data_dir is not None:
+            labellings = with_rain(labellings, data_dir)
+    except SummaryError as exc:
+        print(f"summary: {exc}", file=sys.stderr)
+        return 1
+    for line in attributes_report(labellings, directory, data_dir is not None):
+        print(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m wearreport.tools.spotcheck_summary",
@@ -666,9 +947,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="summarise the per-box files in DIR/boxes and choose a near-field threshold",
     )
     ap.add_argument(
+        "--attributes",
+        action="store_true",
+        help="summarise the attribute files in DIR/attributes against the model's answers",
+    )
+    ap.add_argument(
         "--data-dir",
         default=None,
-        help="with --heights: a checkout of the data branch, for the rain condition",
+        help="with --heights or --attributes: a checkout of the data branch, for the rain "
+        "condition",
     )
     return ap
 
@@ -677,6 +964,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     directory = Path(args.dir)
+    if args.attributes:
+        if args.heights:
+            parser.error("--attributes and --heights are separate summaries; give one")
+        return _attributes_main(directory, None if args.data_dir is None else Path(args.data_dir))
     if args.heights:
         return _heights_main(directory, None if args.data_dir is None else Path(args.data_dir))
     if args.data_dir is not None:

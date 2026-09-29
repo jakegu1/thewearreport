@@ -5,7 +5,9 @@ cameras, without keeping any image. The tool samples live frames, shows the dete
 a reviewer, either in a window straight from memory or through a temporary directory that
 it always deletes, and keeps only the tallies. This directory holds one small JSON file of
 statistics per check and, in `boxes/`, one per-box file per check run with
-`--record-boxes`: each box's height and label, and nothing else about it.
+`--record-boxes`: each box's height and label, and nothing else about it. In
+`attributes/` it holds one attribute file per attribute session (`--attributes`, below):
+counts and labels only.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
@@ -32,6 +34,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxe
 | `--judge NAME` | none | after the review, send the same crops to this DeepInfra model (see below; crops mode only) |
 | `--judge-max-requests N` | required with `--judge` | the most requests the judge may make, retries included (1 to 10000) |
 | `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
+| `--attributes` | off | run an attribute session instead of a detection check (see [Attribute session](#attribute-session-attributes)) |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -274,6 +277,135 @@ minutes of a session are read; a malformed one is an error that names it.
 Without `--heights` the summary per week below is exactly as before, and the `boxes/`
 directory is not read.
 
+## Attribute session (`--attributes`)
+
+The site reports the share of near-field people wearing an outer layer, with bare legs and
+carrying an open umbrella. An attribute session collects the human labels those figures
+are checked against and, optionally, the answers of a hosted vision model to the same
+crops, so that the model's accuracy can be measured once against a fixed bar.
+
+```bash
+uv run python -m wearreport.tools.spotcheck --attributes --n 20 --min-persons 1 --view window
+uv run python -m wearreport.tools.spotcheck --attributes --n 20 --judgements answers.json
+```
+
+The sweep and the sampling are those of a detection check, except that only person boxes at
+least `NEAR_FIELD_MIN_HEIGHT_PX` (31) pixels tall in the source frame are kept (the height
+the per-box file records, and the near-field threshold `--heights` chose on the baseline
+data), and `--min-persons` counts those boxes only. Each kept box is shown as a crop,
+numbered 1, 2, ... over the session.
+
+It works in crops mode with `--view window`, or with `--judgements PATH` (then the crops
+are files in the temporary review directory, as above). Any other combination is refused
+before any network request: `--mode frames`, keyboard entry (`--view files` without
+`--judgements`, which is also the default outside Windows) and `--record-boxes`.
+`--view window` with `--judgements` stays refused, as for a detection check.
+
+### Questions and keys
+
+For each crop the reviewer answers three questions, in this order, one at a time; the
+window shows the crop and the current question above it:
+
+1. `outer_layer`: "Outer layer (coat or jacket)?"
+2. `bare_legs`: "Bare legs (shorts or short skirt)?"
+3. `umbrella`: "Holding an open umbrella?"
+
+| Key | Meaning |
+|---|---|
+| `y` | yes |
+| `n` | no |
+| `u` | cannot tell (this question only) |
+| `x` | at any question: not a person, or nothing can be told; the crop's answers are discarded and it is counted as rejected |
+| `Backspace` | go back one answer, also into the previous crop (an `x` is undone too) |
+| `q`, or closing the window | stop without writing anything |
+
+Capitals work as well. The window's one-line legend (`ATTRIBUTE_LEGEND`) lists these keys.
+
+With `--judgements PATH` write one entry per crop, keyed by crop number: either `"x"`, or
+an object with exactly the three keys, each `"y"`, `"n"` or `"u"`:
+
+```json
+{
+  "1": {"outer_layer": "y", "bare_legs": "n", "umbrella": "u"},
+  "2": "x"
+}
+```
+
+Anything else (a missing or extra key or crop, another value, `"X"`, a capital) is
+rejected with a message naming the entry, before anything is written; fix the file and
+save it again. `numbering.json` in the review directory holds a template with empty
+answers, which are rejected until filled in.
+
+### The model (`--judge`)
+
+`--judge NAME --judge-max-requests N` work as for a detection check (both required
+together, DeepInfra models only, a dry run needs a judge on this machine). Only once the
+reviewer has finished are the crops the reviewer did not reject sent, one per request, as
+PNG built in memory from the arrays shown: pixels only, never the reviewer's answers,
+never a whole frame. Each request asks one fixed prompt, `ATTRIBUTE_PROMPT` in
+`judge_hosted.py`, for exactly one line of the form `outer=yes legs=no umbrella=unsure`.
+The reply parser is strict: any reply that is not exactly that line (surrounding white space
+aside), within 64 characters, counts as `uuu` (cannot tell, three times). The key, the
+endpoint pinning, the retries, the timeouts, the redacted errors and the request budget are
+those above. A failure or the request cap ends the judging without losing the reviewer's
+labels: the crops not answered get `null`. The worst-case cost is about N × $0.00087 for
+`di-qwen3-vl-235b` (the largest crop, about 4,200 input tokens, and at most 32 output
+tokens).
+
+The model is tested once, with the fixed bar below. Do not tune the prompt against real
+crops.
+
+### Attribute file
+
+`<out-dir>/attributes/YYYY-MM-DD.json`; if that exists, `-2`, `-3` and so on, never
+overwritten. The session writes this one file and nothing else: no statistics file and no
+per-box file. It is one line of JSON with exactly these fields:
+
+| Field | Type | Value |
+|---|---|---|
+| `date` | string | the date of the session (local time), `YYYY-MM-DD` |
+| `started_at` | string | when the sweep began, UTC, to the minute: `YYYY-MM-DDTHH:MMZ` |
+| `light` | string | `day`, `twilight` or `dark`, as in the per-box file |
+| `frames` | integer | frames sampled |
+| `detector` | object | as in the statistics file |
+| `min_height_px` | integer | `NEAR_FIELD_MIN_HEIGHT_PX`, the smallest box height shown |
+| `judge` | string or null | the `--judge` model, or `null` |
+| `crops_shown` | integer | crops shown to the reviewer |
+| `crops_rejected` | integer | crops rejected with `x` |
+| `crops` | array | one `[height_px, reviewer, model]` per crop not rejected, sorted |
+
+`reviewer` is three letters, `y`, `n` or `u`, in the question order (for example `"ynn"`:
+an outer layer, no bare legs, no umbrella); `model` is the same form, or `null` when the
+model was not asked or did not answer. The file holds counts and labels only: no box
+position or width, no camera id, no frame index, no image and no free text, and the sorted
+order says nothing about which frame a crop came from.
+
+### Attribute summary
+
+```bash
+uv run python -m wearreport.tools.spotcheck_summary --attributes [--dir spotchecks] [--data-dir PATH]
+```
+
+reads every attribute file in `<dir>/attributes/` (a malformed file is an error that
+names it, exit 1) and prints, for each attribute:
+
+- the reviewer's answers: yes, no, cannot tell, and the yes share over yes and no with its
+  Wilson 95% interval; the same per `light` and, with `--data-dir`, per rain condition
+  (the same nearest-record join as `--heights`);
+- over the crops the reviewer answered yes or no and the model answered (`paired`): the
+  model's precision on yes, its recall on yes and its specificity (recall on no), each with
+  n and its Wilson 95% interval, and how many times the model said cannot tell. A model
+  cannot tell (`u`) counts as wrong in recall and specificity, so a model that always
+  answers cannot tell cannot pass;
+- a verdict. `pass` needs, among the paired crops, at least `MIN_POSITIVES` (30) reviewer
+  yes, at least `MIN_NEGATIVES` (30) reviewer no and at least `MIN_LABELLED` (200) of
+  both, and precision, recall and specificity each at least `TARGET_ATTRIBUTE_ACCURACY`
+  (0.85). `insufficient (...)` says which count is short; otherwise `fail (...)` names the
+  measures below the bar. With no model answer the verdict is `no model`.
+
+Without `--attributes` the summary's output is exactly as before, and `attributes/` is not
+read.
+
 ## Summary per week
 
 ```bash
@@ -301,7 +433,7 @@ estimate are both within 3 points of the reviewer's precision.
 
 With `--view window`, rendered images exist only in memory and in the window, and
 nothing is written except the statistics file (and, with `--record-boxes`, its per-box
-file). With `--judge`, the crops also go, in memory, to the DeepInfra API (and nowhere
+file), or, in an attribute session, the attribute file. With `--judge`, the crops also go, in memory, to the DeepInfra API (and nowhere
 else), after the review.
 
 With `--view files`, rendered images exist only in the temporary directory, and the tool
