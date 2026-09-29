@@ -757,7 +757,6 @@ def test_ac4_privacy_guard_still_passes() -> None:
 
 def test_ac5_the_judge_class_and_prompt() -> None:
     judge_class = judge_hosted.LiveAttributeJudge
-    assert judge_class is not judge_hosted.LiveCropJudge
     assert not issubclass(judge_class, judge_hosted.LiveCropJudge)
     prompt = judge_hosted.ATTRIBUTE_PROMPT
     assert prompt != judge_hosted.PROMPT
@@ -1089,7 +1088,7 @@ def test_ac6_hand_computed_example(tmp_path: Path, capsys: pytest.CaptureFixture
         "  verdict: insufficient (reviewer yes 0 < 30; reviewer no 6 < 30; "
         "reviewer yes+no 6 < 200)",
     ]
-    assert "precision 0.5000 (n=2) wilson [0.0945, 0.9055]" in lines  # checked by hand
+    assert "  model precision 0.5000 (n=2) wilson [0.0945, 0.9055]" in lines  # by hand
 
 
 def _verdict(tmp_path: Path, crops: list[tuple[int, str, str | None]], capsys: Any) -> str:
