@@ -4,6 +4,7 @@
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
+      [--confirm-stop]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -254,6 +255,17 @@ WINDOW_LEGEND = (
     "Enter or Space: pedestrian   n: not a person   v: person in a vehicle   "
     "u: cannot tell   Backspace: back   q: stop"
 )
+# With --confirm-stop, the header line after a first `q`.
+CONFIRM_STOP_QUESTION = (
+    "Stop and discard this session? Press q again to stop, any other key to continue."
+)
+# Keys that only modify another (Shift for `Q`, say): they neither answer the question
+# above nor dismiss it.
+MODIFIER_KEYS = frozenset(
+    f"{name}_{side}"
+    for name in ("Shift", "Control", "Alt", "Meta", "Super", "Hyper", "Option")
+    for side in "LR"
+) | {"Caps_Lock", "Num_Lock", "Shift_Lock", "ISO_Level3_Shift", "Mode_switch", "Command"}
 
 BOXES_DIR = "boxes"  # the per-box files, in the statistics directory
 # The light at the start of the sweep, from the sun's elevation over central London:
@@ -1435,7 +1447,8 @@ class WindowReviewer:
     one crop; crops mode only. An attribute session (`attributes`) asks
     ATTRIBUTE_QUESTIONS about each crop, one at a time: `y`, `n` or `u` answers the
     question on screen, `x` rejects the crop, Backspace goes back one answer. In both, `q`
-    or closing the window stop.
+    or closing the window stop. With `confirm_stop`, a first `q` only asks, in the header
+    line: a second `q` stops, and any other key dismisses the question and is ignored.
 
     Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
     as data. `driver`, if given, is called with the window once it shows the first crop
@@ -1446,9 +1459,11 @@ class WindowReviewer:
         self,
         driver: Callable[[tkinter.Tk], object] | None = None,
         guard: _SignalGuard | None = None,
+        confirm_stop: bool = False,
     ) -> None:
         self.driver = driver
         self.guard = guard
+        self.confirm_stop = confirm_stop
 
     def judge(
         self, items: Sequence[ReviewItem], mode: Mode, deadline: float
@@ -1476,7 +1491,7 @@ class WindowReviewer:
             raise SpotcheckError(f"cannot open the review window: {exc}") from None
         window: _Window[R] | None = None
         try:
-            window = kind(tk, root, items, deadline)
+            window = kind(tk, root, items, deadline, self.confirm_stop)
             return window.run(self.driver)
         finally:
             # Critical: a signal raised part-way would skip the rest and leave a cycle.
@@ -1504,9 +1519,16 @@ class _Window[R]:
     legend = WINDOW_LEGEND
 
     def __init__(
-        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+        self,
+        tk: ModuleType,
+        root: tkinter.Tk,
+        items: Sequence[ReviewItem],
+        deadline: float,
+        confirm_stop: bool = False,
     ) -> None:
         self.tk, self.root, self.items, self.deadline = tk, root, list(items), deadline
+        self.confirm_stop = confirm_stop
+        self.asking: str | None = None  # while the stop question shows: the header it hid
         self.outcome: BaseException | None = None
         self.done = False
         self.photo: tkinter.PhotoImage | None = None
@@ -1522,12 +1544,43 @@ class _Window[R]:
         self.legend_label = tk.Label(root, text=self.legend)
         self.legend_label.pack(padx=8, pady=(4, 8))
         self._bind_answers()
-        root.bind("<KeyPress-BackSpace>", lambda _event: self._back())
+        self._bind_key("BackSpace", self._back)
         for key in ("q", "Q"):
-            root.bind(f"<KeyPress-{key}>", lambda _event: self._stop())
+            root.bind(f"<KeyPress-{key}>", lambda _event: self._q())
+        if confirm_stop:
+            # Keys without a binding of their own: they only dismiss the stop question.
+            root.bind("<KeyPress>", self._other_key)
 
     def _bind_answers(self) -> None:
         raise NotImplementedError
+
+    def _bind_key(self, key: str, action: Callable[[], None]) -> None:
+        """Bind `key` to `action`, unless the stop question shows: then the key only
+        dismisses it."""
+
+        def pressed(_event: object) -> None:
+            if self.asking is not None:
+                self._dismiss()
+            else:
+                action()
+
+        self.root.bind(f"<KeyPress-{key}>", pressed)
+
+    def _q(self) -> None:
+        if not self.confirm_stop or self.asking is not None:
+            self._stop()
+        elif not self.done and self.outcome is None:
+            self.asking = str(self.header.cget("text"))
+            self.header.configure(text=CONFIRM_STOP_QUESTION)
+
+    def _dismiss(self) -> None:
+        if self.asking is not None:
+            self.header.configure(text=self.asking)
+            self.asking = None
+
+    def _other_key(self, event: tkinter.Event[tkinter.Misc]) -> None:
+        if event.keysym not in MODIFIER_KEYS:
+            self._dismiss()
 
     def _show(self) -> None:
         raise NotImplementedError
@@ -1591,17 +1644,22 @@ class _ReviewWindow(_Window[dict[int, Judgement]]):
     """A detection check: one key per crop."""
 
     def __init__(
-        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+        self,
+        tk: ModuleType,
+        root: tkinter.Tk,
+        items: Sequence[ReviewItem],
+        deadline: float,
+        confirm_stop: bool = False,
     ) -> None:
         self.index = 0
         self.judgements: dict[int, Judgement] = {}
-        super().__init__(tk, root, items, deadline)
+        super().__init__(tk, root, items, deadline, confirm_stop)
 
     def _bind_answers(self) -> None:
         answers = {"Return": "", "KP_Enter": "", "space": "", "n": "n", "N": "n"}
         answers |= {"v": "v", "V": "v", "u": "u", "U": "u"}
         for key, line in answers.items():
-            self.root.bind(f"<KeyPress-{key}>", self._on_answer(line))
+            self._bind_key(key, functools.partial(self._answer, line))
 
     def _result(self) -> dict[int, Judgement]:
         return self.judgements
@@ -1612,9 +1670,6 @@ class _ReviewWindow(_Window[dict[int, Judgement]]):
         self.header.configure(
             text=f"Image {item.number} ({_describe(item)}): {self.index + 1} of {len(self.items)}"
         )
-
-    def _on_answer(self, line: str) -> Callable[[object], None]:
-        return lambda _event: self._answer(line)
 
     def _answer(self, line: str) -> None:
         if self.done or self.outcome is not None:
@@ -1644,18 +1699,23 @@ class _AttributeWindow(_Window[dict[int, str | None]]):
     legend = ATTRIBUTE_LEGEND
 
     def __init__(
-        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+        self,
+        tk: ModuleType,
+        root: tkinter.Tk,
+        items: Sequence[ReviewItem],
+        deadline: float,
+        confirm_stop: bool = False,
     ) -> None:
         self.presses: list[str] = []
         self.shown: int | None = None  # the crop whose image is on screen
-        super().__init__(tk, root, items, deadline)
+        super().__init__(tk, root, items, deadline, confirm_stop)
         self.question = tk.Label(root, font=("TkDefaultFont", 16))
         self.question.pack(padx=8, pady=(0, 4), before=self.picture)
 
     def _bind_answers(self) -> None:
         for answer in (*ATTRIBUTE_ANSWERS, REJECT):
             for key in (answer, answer.upper()):
-                self.root.bind(f"<KeyPress-{key}>", self._on_press(answer))
+                self._bind_key(key, functools.partial(self._press, answer))
 
     def _result(self) -> dict[int, str | None]:
         finished, _current = attribute_state(self.presses)
@@ -1673,9 +1733,6 @@ class _AttributeWindow(_Window[dict[int, str | None]]):
         self.question.configure(
             text=f"Question {len(current) + 1} of {len(ATTRIBUTE_QUESTIONS)}: {text}"
         )
-
-    def _on_press(self, answer: str) -> Callable[[object], None]:
-        return lambda _event: self._press(answer)
 
     def _press(self, answer: str) -> None:
         if self.done or self.outcome is not None:
@@ -2234,10 +2291,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="label the outer layer, bare legs and umbrella of near-field crops instead, and "
         "write <out-dir>/attributes/ (with --view window or --judgements)",
     )
+    ap.add_argument(
+        "--confirm-stop",
+        action="store_true",
+        help="with --view window: a first q asks before it stops the review, and any other "
+        "key continues it",
+    )
     return ap
 
 
 WINDOW_FRAMES_REFUSAL = "--view window shows crops only; frames mode needs --view files"
+CONFIRM_STOP_REFUSAL = "--confirm-stop asks in the review window; it needs --view window"
 RECORD_BOXES_FRAMES_REFUSAL = "--record-boxes works in crops mode only; drop it or --mode frames"
 ATTRIBUTES_FRAMES_REFUSAL = "--attributes works in crops mode only; drop --mode frames"
 ATTRIBUTES_RECORD_BOXES_REFUSAL = (
@@ -2432,6 +2496,7 @@ def _run(
     mode: Mode = args.mode
     if args.attributes:
         view = attribute_view(args)
+        reviewer = _confirming(args, view, reviewer)
         attribute_judge = open_attribute_judge(args, setup or JudgeSetup())
         try:
             return _attribute_session(
@@ -2445,12 +2510,24 @@ def _run(
     if args.record_boxes and mode == "frames":
         raise SpotcheckError(RECORD_BOXES_FRAMES_REFUSAL)
     view = resolve_view(args.view, mode, args.judgements)
+    reviewer = _confirming(args, view, reviewer)
     judge = open_judge(args, mode, setup or JudgeSetup())
     try:
         return _check(args, pipeline, reviewer, day, guard, mode, view, judge, clock or _utcnow)
     finally:
         if judge is not None:
             judge.close()
+
+
+def _confirming[T](args: argparse.Namespace, view: View, reviewer: T) -> T:
+    """`reviewer`, asking before a stop if --confirm-stop is given (refused without the
+    window view, before anything else happens)."""
+    if args.confirm_stop:
+        if view != "window":
+            raise SpotcheckError(CONFIRM_STOP_REFUSAL)
+        if isinstance(reviewer, WindowReviewer):
+            reviewer.confirm_stop = True
+    return reviewer
 
 
 def attribute_view(args: argparse.Namespace) -> View:
@@ -2534,7 +2611,7 @@ def _check(
         if args.judgements is not None:
             reviewer = _judgements_reviewer(args.judgements)
         elif view == "window":
-            reviewer = WindowReviewer(guard=guard)
+            reviewer = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop)
         else:
             reviewer = KeyboardReviewer(sys.stdin.fileno())
     pipeline = _open_pipeline(args, pipeline, guard)
@@ -2614,7 +2691,7 @@ def _attribute_session(
         if args.judgements is not None:
             labeller = _judgements_reviewer(args.judgements)
         else:
-            labeller = WindowReviewer(guard=guard)
+            labeller = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop)
     elif isinstance(reviewer, AttributeReviewer):
         labeller = reviewer
     else:
