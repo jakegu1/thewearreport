@@ -342,6 +342,25 @@ def test_check_record_rejects_a_histogram_on_a_sweep_that_saw_nobody() -> None:
         aggregate.check_record(record)
 
 
+@pytest.mark.parametrize(
+    "histogram",
+    [
+        {"50": 1, "7": 1, "12": 0},  # a zero count; the sum still matches
+        {"50": 2, "7": 1, "12": -1},  # a negative count offset elsewhere; the sum still matches
+    ],
+)
+def test_schema_and_check_record_reject_a_count_below_one_that_adds_up(
+    histogram: dict[str, int],
+) -> None:
+    record = _build([_heights("A", 50, 7)])
+    assert sum(histogram.values()) == record["persons_total"] == 2
+    record["persons_by_height"] = histogram
+    with pytest.raises(jsonschema.ValidationError):
+        VALIDATOR.validate(record)
+    with pytest.raises(aggregate.RecordError):
+        aggregate.check_record(record)
+
+
 def test_check_record_error_never_echoes_the_histogram() -> None:
     record = _build([_heights("A", 50)])
     record["persons_by_height"] = {"secret-key": 1}
