@@ -3,7 +3,7 @@
   python -m wearreport.tools.spotcheck --n 20 [--mode crops|frames] [--min-persons 3]
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
-      [--judge NAME --judge-max-requests N] [--record-boxes]
+      [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -73,6 +73,18 @@ judge failure (the request limit, an HTTP error, a timeout) never loses the revi
 statistics: they are written with the judge's counts so far and `status` "incomplete".
 Nothing about a crop is printed, logged or kept.
 
+With `--attributes`, the tool runs an attribute session instead of a detection check. Only
+person boxes at least NEAR_FIELD_MIN_HEIGHT_PX tall in the source frame are kept (and
+`--min-persons` counts those), and each is shown as a crop. For each crop the reviewer
+answers ATTRIBUTE_QUESTIONS in order, one at a time: `y` yes, `n` no, `u` cannot tell, or
+`x` (not a person, or nothing can be told) to reject the crop; in the window
+(`--view window`), where Backspace goes back one answer, or in a JSON file
+(`--judgements`). With `--judge`, the crops the reviewer did not reject then go to that
+model (`judge_hosted.LiveAttributeJudge`), pixels only, under the same rules as above. The
+tool writes one file, `<out-dir>/attributes/YYYY-MM-DD.json` (then `-2`, ...): each kept
+crop's height and the reviewer's and the model's answers, and nothing else (no statistics
+file, no per-box file). Frames mode, keyboard entry and `--record-boxes` are refused.
+
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
 in fixtures/detect/ (no network). Its statistics describe those photos, not the
 cameras, so it needs an `--out-dir` other than spotchecks/.
@@ -85,6 +97,7 @@ import base64
 import contextlib
 import dataclasses
 import datetime
+import functools
 import gc
 import itertools
 import json
@@ -250,6 +263,25 @@ LONDON = (51.5074, -0.1278)  # latitude and longitude, degrees (west negative)
 LIGHT_DAY_DEG = 0.0
 LIGHT_TWILIGHT_DEG = -6.0
 
+# The attribute session (--attributes). Only person boxes at least this tall, in source-
+# frame pixels (the height the per-box file records), are shown: the near-field threshold
+# that `spotcheck_summary --heights` chose on the baseline data.
+NEAR_FIELD_MIN_HEIGHT_PX = 31
+ATTRIBUTES_DIR = "attributes"  # the attribute files, in the statistics directory
+# (the key in a judgements file and in the summary, the question), in the order asked.
+ATTRIBUTE_QUESTIONS = (
+    ("outer_layer", "Outer layer (coat or jacket)?"),
+    ("bare_legs", "Bare legs (shorts or short skirt)?"),
+    ("umbrella", "Holding an open umbrella?"),
+)
+ATTRIBUTE_NAMES = tuple(name for name, _question in ATTRIBUTE_QUESTIONS)
+ATTRIBUTE_ANSWERS = ("y", "n", "u")  # yes, no, cannot tell (that question only)
+REJECT = "x"  # not a person, or nothing can be told: the crop's answers are discarded
+ATTRIBUTE_LEGEND = (
+    "y: yes   n: no   u: cannot tell   x: not a person or nothing can be told   "
+    "Backspace: back   q: stop"
+)
+
 
 class SpotcheckError(RuntimeError):
     """The spot-check cannot go on; the message says why."""
@@ -312,11 +344,13 @@ def sample(
     min_persons: int,
     seed: int | None,
     progress: Callable[[int], None] | None = None,
+    min_height: int = 0,
 ) -> list[Sample]:
     """Up to `n` frames with at least `min_persons` person detections, chosen uniformly at
     random (reservoir sampling, so at most `n` frames are held) and returned in the order
     they came in. `progress`, if given, is called with the number of frames run through
-    the detector so far, after each one.
+    the detector so far, after each one. Only person boxes at least `min_height` pixels
+    tall (`box_height`) count, and only they are kept.
 
     A frame on which the detector raises DetectorError is skipped, and the number skipped
     is printed to stderr: only the count, never a camera id or image data."""
@@ -334,7 +368,7 @@ def sample(
             progress(done)
         if found is None:
             continue
-        persons = tuple(d for d in found if d.label == "person")
+        persons = tuple(d for d in found if d.label == "person" and box_height(d.box) >= min_height)
         if len(persons) < min_persons:
             continue
         if len(kept) < n:
@@ -747,11 +781,19 @@ class ReviewDirectory:
         with os.fdopen(fd, "wb") as fh:
             fh.write(encoded.tobytes())
 
-    def write_numbering(self, items: Sequence[ReviewItem], mode: Mode) -> Path:
-        """The numbering, and a judgements template to copy, as JSON next to the images."""
+    def write_numbering(
+        self,
+        items: Sequence[ReviewItem],
+        mode: Mode,
+        entry: Mapping[str, object] | None = None,
+    ) -> Path:
+        """The numbering, and a judgements template to copy, as JSON next to the images.
+        `entry` is each image's template entry (default: that of a detection check)."""
         if self.path is None:
             raise ValueError("no review directory")
-        template = {str(item.number): _template_entry(mode) for item in items}
+        template = {
+            str(item.number): _template_entry(mode) if entry is None else entry for item in items
+        }
         numbering = {
             "mode": mode,
             "images": [
@@ -887,6 +929,17 @@ class Reviewer(Protocol):
     ) -> Mapping[int, Judgement]: ...
 
 
+@runtime_checkable
+class AttributeReviewer(Protocol):
+    """Whoever answers the attribute questions. `attributes` returns, per item number, the
+    answers in ATTRIBUTE_QUESTIONS order (e.g. "ynu"), or None for a rejected crop, or
+    raises ReviewTimeout once `deadline` (time.monotonic()) has passed."""
+
+    def attributes(
+        self, items: Sequence[ReviewItem], deadline: float
+    ) -> Mapping[int, str | None]: ...
+
+
 # The answers a judgement gives per box, and how messages name them.
 BOX_ANSWERS = ("not_person", "in_vehicle", "unsure")
 BOX_ANSWER_WORDS = {
@@ -970,8 +1023,8 @@ def _box_list(value: object, key: str, image: str) -> frozenset[int]:
     return frozenset(value)
 
 
-def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dict[int, Judgement]:
-    """Parse a judgements file (format in spotchecks/README.md); raise JudgementError."""
+def _load_judgements(raw: bytes) -> object:
+    """A judgements file's JSON; raise JudgementError."""
     if len(raw) > MAX_JUDGEMENTS_BYTES:
         raise JudgementError(f"the file is larger than {MAX_JUDGEMENTS_BYTES} bytes")
     try:
@@ -988,6 +1041,12 @@ def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dic
         raise JudgementError("the file is not UTF-8 text") from None
     except (ValueError, RecursionError, OverflowError) as exc:
         raise JudgementError(f"not valid JSON: {type(exc).__name__}") from None
+    return data
+
+
+def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dict[int, Judgement]:
+    """Parse a judgements file (format in spotchecks/README.md); raise JudgementError."""
+    data = _load_judgements(raw)
     if not isinstance(data, dict):
         raise JudgementError('the file must hold one object, e.g. {"1": {...}, "2": {...}}')
     numbers = {str(item.number): item.number for item in items}
@@ -1013,6 +1072,83 @@ def parse_judgements(raw: bytes, items: Sequence[ReviewItem], mode: Mode) -> dic
             _box_list(entry.get("unsure", []), "unsure", key),
         )
     return validate_all(judgements, items, mode)
+
+
+def _attribute_entry(entry: object, key: str) -> str | None:
+    """One crop's entry of an attribute judgements file: "x", or an object with exactly
+    the ATTRIBUTE_NAMES, each "y", "n" or "u". Returns the letters, or None for "x"."""
+    if isinstance(entry, str) and entry == REJECT:
+        return None
+    if not isinstance(entry, dict) or set(entry) != set(ATTRIBUTE_NAMES):
+        raise JudgementError(
+            f'crop {key}: the entry must be "{REJECT}" or an object with exactly '
+            + ", ".join(ATTRIBUTE_NAMES)
+        )
+    letters = []
+    for name in ATTRIBUTE_NAMES:
+        value = entry[name]
+        if not isinstance(value, str) or value not in ATTRIBUTE_ANSWERS:
+            raise JudgementError(f"crop {key}: {name} must be y, n or u")
+        letters.append(value)
+    return "".join(letters)
+
+
+def parse_attribute_judgements(raw: bytes, items: Sequence[ReviewItem]) -> dict[int, str | None]:
+    """Parse an attribute judgements file (format in spotchecks/README.md): one entry per
+    crop, keyed by crop number. Returns each crop's letters in ATTRIBUTE_NAMES order (e.g.
+    "ynu"), or None for a rejected crop; raises JudgementError naming the entry."""
+    data = _load_judgements(raw)
+    if not isinstance(data, dict):
+        raise JudgementError('the file must hold one object, e.g. {"1": "x", "2": {...}}')
+    numbers = {str(item.number): item.number for item in items}
+    answers: dict[int, str | None] = {}
+    for key, entry in data.items():
+        if key not in numbers:
+            raise JudgementError(f"there is no crop {key[:20]!r}")
+        answers[numbers[key]] = _attribute_entry(entry, key)
+    return validate_attributes(answers, items)
+
+
+def validate_attributes(
+    answers: Mapping[int, str | None], items: Sequence[ReviewItem]
+) -> dict[int, str | None]:
+    """`answers` checked to hold one entry per item: None (rejected), or one of
+    ATTRIBUTE_ANSWERS per question. Raises JudgementError."""
+    numbers = [item.number for item in items]
+    extra = sorted(set(answers) - set(numbers), key=str)
+    if extra:
+        raise JudgementError(f"there is no crop {extra[0]!r}")
+    checked: dict[int, str | None] = {}
+    for number in numbers:
+        if number not in answers:
+            raise JudgementError(f"crop {number} has no answers")
+        letters = answers[number]
+        if letters is not None and not (
+            isinstance(letters, str)
+            and len(letters) == len(ATTRIBUTE_QUESTIONS)
+            and all(letter in ATTRIBUTE_ANSWERS for letter in letters)
+        ):
+            raise JudgementError(f"crop {number}: the answers must be y, n or u, one per question")
+        checked[number] = letters
+    return checked
+
+
+def attribute_state(presses: Sequence[str]) -> tuple[list[str | None], str]:
+    """Replay the attribute keys pressed so far (y, n, u or x; Backspace removes the last
+    one): the finished crops' answers (None for a rejected one), in order, and the current
+    crop's answers so far."""
+    finished: list[str | None] = []
+    current = ""
+    for press in presses:
+        if press == REJECT:
+            finished.append(None)
+            current = ""
+            continue
+        current += press
+        if len(current) == len(ATTRIBUTE_QUESTIONS):
+            finished.append(current)
+            current = ""
+    return finished, current
 
 
 LINE_TOKEN = re.compile(r"([nvum])(\d{1,6})?")
@@ -1208,6 +1344,14 @@ class JsonFileReviewer:
     def judge(
         self, items: Sequence[ReviewItem], mode: Mode, deadline: float
     ) -> Mapping[int, Judgement]:
+        return self._poll(lambda raw: parse_judgements(raw, items, mode), deadline)
+
+    def attributes(self, items: Sequence[ReviewItem], deadline: float) -> Mapping[int, str | None]:
+        """The attribute answers for `items` (see parse_attribute_judgements)."""
+        return self._poll(lambda raw: parse_attribute_judgements(raw, items), deadline)
+
+    def _poll[T](self, parse: Callable[[bytes], T], deadline: float) -> T:
+        """Wait for the file, and return what `parse` makes of it once it accepts it."""
         out = self.out or sys.stdout
         print(
             f"Waiting for judgements in {self.path} (format: spotchecks/README.md).",
@@ -1221,7 +1365,7 @@ class JsonFileReviewer:
             try:
                 seen = self._read()
                 if seen is not None and seen != rejected:
-                    return parse_judgements(seen, items, mode)
+                    return parse(seen)
             except JudgementError as exc:
                 seen = str(exc) if seen is None else seen
                 if seen != rejected:
@@ -1285,10 +1429,13 @@ def _import_tkinter() -> ModuleType:
 
 
 class WindowReviewer:
-    """Shows each crop in one tkinter window, straight from memory, and records one key
-    per crop: Enter or Space a pedestrian, `n` not a person, `v` a person in a vehicle,
-    `u` cannot tell, Backspace back one crop, `q` or closing the window stop. Crops mode
-    only.
+    """Shows each crop in one tkinter window, straight from memory, and records the keys
+    pressed. A detection check (`judge`) takes one key per crop: Enter or Space a
+    pedestrian, `n` not a person, `v` a person in a vehicle, `u` cannot tell, Backspace back
+    one crop; crops mode only. An attribute session (`attributes`) asks
+    ATTRIBUTE_QUESTIONS about each crop, one at a time: `y`, `n` or `u` answers the
+    question on screen, `x` rejects the crop, Backspace goes back one answer. In both, `q`
+    or closing the window stop.
 
     Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
     as data. `driver`, if given, is called with the window once it shows the first crop
@@ -1310,14 +1457,26 @@ class WindowReviewer:
             raise SpotcheckError(WINDOW_FRAMES_REFUSAL)
         if not items:
             return {}  # nothing to show: no window, and no need for tkinter
+        return self._in_window(_ReviewWindow, items, deadline)
+
+    def attributes(self, items: Sequence[ReviewItem], deadline: float) -> Mapping[int, str | None]:
+        """Each crop's answers in ATTRIBUTE_QUESTIONS order (e.g. "ynu"), or None for a
+        rejected crop, keyed by crop number."""
+        if not items:
+            return {}
+        return self._in_window(_AttributeWindow, items, deadline)
+
+    def _in_window[R](
+        self, kind: type[_Window[R]], items: Sequence[ReviewItem], deadline: float
+    ) -> R:
         tk = _import_tkinter()
         try:
             root = tk.Tk()
         except tk.TclError as exc:
             raise SpotcheckError(f"cannot open the review window: {exc}") from None
-        window: _ReviewWindow | None = None
+        window: _Window[R] | None = None
         try:
-            window = _ReviewWindow(tk, root, items, deadline)
+            window = kind(tk, root, items, deadline)
             return window.run(self.driver)
         finally:
             # Critical: a signal raised part-way would skip the rest and leave a cycle.
@@ -1338,15 +1497,16 @@ class WindowReviewer:
                 gc.collect()
 
 
-class _ReviewWindow:
-    """One review in one window: the state behind WindowReviewer.judge."""
+class _Window[R]:
+    """One review in one window: what both kinds share. A subclass binds its answer keys,
+    shows the current crop, and says what the review returns."""
+
+    legend = WINDOW_LEGEND
 
     def __init__(
         self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
     ) -> None:
         self.tk, self.root, self.items, self.deadline = tk, root, list(items), deadline
-        self.index = 0
-        self.judgements: dict[int, Judgement] = {}
         self.outcome: BaseException | None = None
         self.done = False
         self.photo: tkinter.PhotoImage | None = None
@@ -1359,19 +1519,26 @@ class _ReviewWindow:
         self.header.pack(padx=8, pady=(8, 4))
         self.picture = tk.Label(root)
         self.picture.pack(padx=8)
-        self.legend = tk.Label(root, text=WINDOW_LEGEND)
-        self.legend.pack(padx=8, pady=(4, 8))
-        answers = {"Return": "", "KP_Enter": "", "space": "", "n": "n", "N": "n"}
-        answers |= {"v": "v", "V": "v", "u": "u", "U": "u"}
-        for key, line in answers.items():
-            root.bind(f"<KeyPress-{key}>", self._on_answer(line))
+        self.legend_label = tk.Label(root, text=self.legend)
+        self.legend_label.pack(padx=8, pady=(4, 8))
+        self._bind_answers()
         root.bind("<KeyPress-BackSpace>", lambda _event: self._back())
         for key in ("q", "Q"):
             root.bind(f"<KeyPress-{key}>", lambda _event: self._stop())
 
-    def run(self, driver: Callable[[tkinter.Tk], object] | None) -> dict[int, Judgement]:
-        if not self.items:
-            return {}
+    def _bind_answers(self) -> None:
+        raise NotImplementedError
+
+    def _show(self) -> None:
+        raise NotImplementedError
+
+    def _back(self) -> None:
+        raise NotImplementedError
+
+    def _result(self) -> R:
+        raise NotImplementedError
+
+    def run(self, driver: Callable[[tkinter.Tk], object] | None) -> R:
         remaining_ms = math.ceil(max(0.0, self.deadline - time.monotonic()) * 1000)
         self.root.after(remaining_ms, self._timeout)
         self.root.after(WINDOW_TICK_MS, self._tick)
@@ -1385,39 +1552,13 @@ class _ReviewWindow:
             raise self.outcome
         if not self.done:
             raise ReviewAborted("the review window was closed")
-        return self.judgements
+        return self._result()
 
-    def _show(self) -> None:
-        item = self.items[self.index]
+    def _picture(self, item: ReviewItem) -> None:
         height, width = item.image.shape[:2]
         data = _png_data(item.image, window_scale(height, width))
         self.photo = self.tk.PhotoImage(master=self.root, data=data, format="png")
         self.picture.configure(image=self.photo)
-        self.header.configure(
-            text=f"Image {item.number} ({_describe(item)}): {self.index + 1} of {len(self.items)}"
-        )
-
-    def _on_answer(self, line: str) -> Callable[[object], None]:
-        return lambda _event: self._answer(line)
-
-    def _answer(self, line: str) -> None:
-        if self.done or self.outcome is not None:
-            return
-        item = self.items[self.index]
-        self.judgements[item.number] = parse_line(line, item, "crops")
-        self.index += 1
-        if self.index == len(self.items):
-            self.done = True
-            self.root.quit()
-        else:
-            self._show()
-
-    def _back(self) -> None:
-        if self.done or self.outcome is not None or self.index == 0:
-            return
-        self.index -= 1
-        self.judgements.pop(self.items[self.index].number, None)
-        self._show()
 
     def _finish(self, outcome: BaseException) -> None:
         if not self.done and self.outcome is None:
@@ -1444,6 +1585,114 @@ class _ReviewWindow:
         no reference cycle keeps a Tcl object alive once the review is over."""
         self.photo = None
         self.outcome = None
+
+
+class _ReviewWindow(_Window[dict[int, Judgement]]):
+    """A detection check: one key per crop."""
+
+    def __init__(
+        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+    ) -> None:
+        self.index = 0
+        self.judgements: dict[int, Judgement] = {}
+        super().__init__(tk, root, items, deadline)
+
+    def _bind_answers(self) -> None:
+        answers = {"Return": "", "KP_Enter": "", "space": "", "n": "n", "N": "n"}
+        answers |= {"v": "v", "V": "v", "u": "u", "U": "u"}
+        for key, line in answers.items():
+            self.root.bind(f"<KeyPress-{key}>", self._on_answer(line))
+
+    def _result(self) -> dict[int, Judgement]:
+        return self.judgements
+
+    def _show(self) -> None:
+        item = self.items[self.index]
+        self._picture(item)
+        self.header.configure(
+            text=f"Image {item.number} ({_describe(item)}): {self.index + 1} of {len(self.items)}"
+        )
+
+    def _on_answer(self, line: str) -> Callable[[object], None]:
+        return lambda _event: self._answer(line)
+
+    def _answer(self, line: str) -> None:
+        if self.done or self.outcome is not None:
+            return
+        item = self.items[self.index]
+        self.judgements[item.number] = parse_line(line, item, "crops")
+        self.index += 1
+        if self.index == len(self.items):
+            self.done = True
+            self.root.quit()
+        else:
+            self._show()
+
+    def _back(self) -> None:
+        if self.done or self.outcome is not None or self.index == 0:
+            return
+        self.index -= 1
+        self.judgements.pop(self.items[self.index].number, None)
+        self._show()
+
+
+class _AttributeWindow(_Window[dict[int, str | None]]):
+    """An attribute session: one key per question, the question on screen above the crop.
+    The keys pressed are kept in order, and the answers are replayed from them
+    (`attribute_state`), so Backspace can undo any answer, an `x` included."""
+
+    legend = ATTRIBUTE_LEGEND
+
+    def __init__(
+        self, tk: ModuleType, root: tkinter.Tk, items: Sequence[ReviewItem], deadline: float
+    ) -> None:
+        self.presses: list[str] = []
+        self.shown: int | None = None  # the crop whose image is on screen
+        super().__init__(tk, root, items, deadline)
+        self.question = tk.Label(root, font=("TkDefaultFont", 16))
+        self.question.pack(padx=8, pady=(0, 4), before=self.picture)
+
+    def _bind_answers(self) -> None:
+        for answer in (*ATTRIBUTE_ANSWERS, REJECT):
+            for key in (answer, answer.upper()):
+                self.root.bind(f"<KeyPress-{key}>", self._on_press(answer))
+
+    def _result(self) -> dict[int, str | None]:
+        finished, _current = attribute_state(self.presses)
+        return {item.number: answers for item, answers in zip(self.items, finished, strict=True)}
+
+    def _show(self) -> None:
+        finished, current = attribute_state(self.presses)
+        index = len(finished)
+        item = self.items[index]
+        if self.shown != index:
+            self._picture(item)
+            self.shown = index
+        self.header.configure(text=f"Crop {item.number}: {index + 1} of {len(self.items)}")
+        _name, text = ATTRIBUTE_QUESTIONS[len(current)]
+        self.question.configure(
+            text=f"Question {len(current) + 1} of {len(ATTRIBUTE_QUESTIONS)}: {text}"
+        )
+
+    def _on_press(self, answer: str) -> Callable[[object], None]:
+        return lambda _event: self._press(answer)
+
+    def _press(self, answer: str) -> None:
+        if self.done or self.outcome is not None:
+            return
+        self.presses.append(answer)
+        finished, _current = attribute_state(self.presses)
+        if len(finished) == len(self.items):
+            self.done = True
+            self.root.quit()
+        else:
+            self._show()
+
+    def _back(self) -> None:
+        if self.done or self.outcome is not None or not self.presses:
+            return
+        self.presses.pop()
+        self._show()
 
 
 # The paired judge ---------------------------------------------------------------------
@@ -1473,15 +1722,13 @@ def _is_loopback(endpoint: str | None) -> bool:
         return False
 
 
-def open_judge(
-    args: argparse.Namespace, mode: Mode, setup: JudgeSetup
-) -> judge_hosted.LiveCropJudge | None:
-    """The judge that `--judge` names, checked before anything else happens, or None.
-    Raises SpotcheckError when the options do not allow one. Sends nothing."""
+def _judge_wanted(args: argparse.Namespace, mode: Mode, setup: JudgeSetup) -> bool:
+    """Whether `--judge` asks for a judge; raises SpotcheckError when the options do not
+    allow one."""
     if args.judge is None:
         if args.judge_max_requests is not None:
             raise SpotcheckError("--judge-max-requests needs --judge")
-        return None
+        return False
     if mode != "crops":
         raise SpotcheckError(
             "--judge works in crops mode only: frames mode would send whole frames"
@@ -1493,6 +1740,16 @@ def open_judge(
             "--judge with --dry-run needs a fake judge on this machine: a dry run never "
             "calls DeepInfra"
         )
+    return True
+
+
+def open_judge(
+    args: argparse.Namespace, mode: Mode, setup: JudgeSetup
+) -> judge_hosted.LiveCropJudge | None:
+    """The judge that `--judge` names, checked before anything else happens, or None.
+    Raises SpotcheckError when the options do not allow one. Sends nothing."""
+    if not _judge_wanted(args, mode, setup):
+        return None
     try:
         return judge_hosted.LiveCropJudge(
             args.judge,
@@ -1526,12 +1783,53 @@ def ask_judge(
     return answers
 
 
-def _judge_stopped(reason: str) -> None:
+def _judge_stopped(reason: str, what: str = "its statistics are") -> None:
     print(
-        f"spotcheck: the judge stopped: {reason}; its statistics are incomplete",
+        f"spotcheck: the judge stopped: {reason}; {what} incomplete",
         file=sys.stderr,
         flush=True,
     )
+
+
+def open_attribute_judge(
+    args: argparse.Namespace, setup: JudgeSetup
+) -> judge_hosted.LiveAttributeJudge | None:
+    """The attribute judge that `--judge` names, checked as open_judge checks it, or None.
+    Sends nothing."""
+    if not _judge_wanted(args, "crops", setup):
+        return None
+    try:
+        return judge_hosted.LiveAttributeJudge(
+            args.judge,
+            budget=judge_hosted.RequestBudget(args.judge_max_requests),
+            endpoint=setup.endpoint,
+            timeout=setup.timeout,
+            sleep=setup.sleep,
+        )
+    except judge_hosted.JudgeError as exc:
+        raise SpotcheckError(f"cannot use the judge: {exc}") from None
+
+
+def ask_attribute_judge(
+    crops: Sequence[Frame], judge: judge_hosted.LiveAttributeJudge
+) -> list[str]:
+    """The judge's answers on each crop, in order, until the first failure, as ask_judge
+    asks: the pixels only, never the reviewer's answers; a failure or a signal ends the
+    judging without losing them. Closes the judge."""
+    answers: list[str] = []
+    what = "its answers are"
+    try:
+        for image in crops:
+            answers.append(judge.classify_attributes(image))
+    except judge_hosted.JudgeError as exc:  # the request limit, HTTP errors, timeouts
+        _judge_stopped(str(exc), what)
+    except Interrupted as exc:
+        _judge_stopped(f"stopped by {_signal_name(exc.signum)}", what)
+    except Exception as exc:  # any other failure must not lose the reviewer's answers
+        _judge_stopped(f"failed ({type(exc).__name__})", what)
+    finally:
+        judge.close()
+    return answers
 
 
 def box_label(box: int, judgement: Judgement) -> str:
@@ -1633,11 +1931,16 @@ def compute_stats(
     }
 
 
+def box_height(box: tuple[float, float, float, float]) -> int:
+    """A box's height in source-frame pixels, rounded to a whole number."""
+    return round(box[3] - box[1])
+
+
 def box_heights(samples: Sequence[Sample]) -> dict[int, int]:
     """Each box's height in source-frame pixels, rounded, by box number (numbered as
     `render` numbers them: 1, 2, ... across the whole check)."""
     boxes = (person.box for s in samples for person in s.persons)
-    return {number: round(box[3] - box[1]) for number, box in enumerate(boxes, start=1)}
+    return {number: box_height(box) for number, box in enumerate(boxes, start=1)}
 
 
 def box_record(
@@ -1665,6 +1968,43 @@ def box_record(
         "frames": frames_reviewed,
         "detector": dataclasses.asdict(info),
         "boxes": [[height, label] for height, label in boxes],
+    }
+
+
+def attribute_record(
+    items: Sequence[ReviewItem],
+    answers: Mapping[int, str | None],
+    heights: Mapping[int, int],
+    models: Sequence[str],
+    *,
+    frames_reviewed: int,
+    info: DetectorInfo,
+    day: datetime.date,
+    started_at: datetime.datetime,
+    judge: str | None,
+) -> dict[str, object]:
+    """The attribute record: for each crop the reviewer did not reject, its height, the
+    reviewer's answers and the model's (`models`, one per such crop in order, from the
+    first; None past its end), sorted so that the order says nothing about frames. No
+    position, width, camera id, frame index, image or free text."""
+    minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
+    kept = [item for item in items if answers[item.number] is not None]
+    crops = []
+    for k, item in enumerate(kept):
+        (box,) = item.boxes  # crops mode: one box per image
+        crops.append((heights[box], answers[item.number], models[k] if k < len(models) else None))
+    crops.sort(key=lambda crop: (crop[0], crop[1] or "", crop[2] or ""))
+    return {
+        "date": day.isoformat(),
+        "started_at": minute.strftime("%Y-%m-%dT%H:%MZ"),
+        "light": light_at(minute),
+        "frames": frames_reviewed,
+        "detector": dataclasses.asdict(info),
+        "min_height_px": NEAR_FIELD_MIN_HEIGHT_PX,
+        "judge": judge,
+        "crops_shown": len(items),
+        "crops_rejected": len(items) - len(kept),
+        "crops": [list(crop) for crop in crops],
     }
 
 
@@ -1740,11 +2080,11 @@ def write_stats(
     Raises SpotcheckError, with the records in the message so they are not lost, if the
     files cannot be written; then neither is left behind.
     """
-    texts = [json.dumps(stats, indent=2, ensure_ascii=True) + "\n"]
+    texts = [(out_dir, json.dumps(stats, indent=2, ensure_ascii=True) + "\n")]
     if boxes is not None:
-        texts.append(json.dumps(boxes, ensure_ascii=True) + "\n")
+        texts.append((out_dir / BOXES_DIR, json.dumps(boxes, ensure_ascii=True) + "\n"))
     try:
-        return _write_new(texts, out_dir, day)
+        return out_dir / _write_new(texts, day)
     except OSError as exc:
         lost = f"they were: {json.dumps(stats, ensure_ascii=True)}"
         if boxes is not None:
@@ -1754,16 +2094,31 @@ def write_stats(
         ) from None
 
 
-def _write_new(texts: Sequence[str], out_dir: Path, day: datetime.date) -> Path:
-    """texts[0] into `out_dir`, texts[1] (if any) into `out_dir/boxes`, under one name."""
-    directories = [out_dir, out_dir / BOXES_DIR][: len(texts)]
-    for directory in directories:
+def write_attributes(record: Mapping[str, object], out_dir: Path, day: datetime.date) -> Path:
+    """Write `record` to a new `<out-dir>/attributes/<day>.json` (or `<day>-2.json`, ...);
+    never overwrite. Raises SpotcheckError, with the record in the message so it is not
+    lost, if it cannot be written."""
+    directory = out_dir / ATTRIBUTES_DIR
+    text = json.dumps(record, ensure_ascii=True) + "\n"
+    try:
+        return directory / _write_new([(directory, text)], day)
+    except OSError as exc:
+        raise SpotcheckError(
+            f"cannot write the attribute file into {directory} ({exc.strerror}); it was: "
+            f"{json.dumps(record, ensure_ascii=True)}"
+        ) from None
+
+
+def _write_new(texts: Sequence[tuple[Path, str]], day: datetime.date) -> str:
+    """Each text into its directory, under one new name, the first free in all of them;
+    returns the name."""
+    for directory, _text in texts:
         directory.mkdir(parents=True, exist_ok=True)
     for k in range(1, MAX_FILES_PER_DAY + 1):
         name = f"{day.isoformat()}.json" if k == 1 else f"{day.isoformat()}-{k}.json"
         created: list[Path] = []
         try:
-            for directory, text in zip(directories, texts, strict=True):
+            for directory, text in texts:
                 path = directory / name
                 fh = open(path, "x", encoding="utf-8")  # noqa: SIM115  (closed below)
                 created.append(path)
@@ -1777,8 +2132,9 @@ def _write_new(texts: Sequence[str], out_dir: Path, day: datetime.date) -> Path:
             for path in created:
                 path.unlink(missing_ok=True)
             raise
-        return out_dir / name
-    raise SpotcheckError(f"{out_dir} already holds {MAX_FILES_PER_DAY} files for {day}")
+        return name
+    where = " and ".join(str(directory) for directory, _text in texts)
+    raise SpotcheckError(f"{where} already holds {MAX_FILES_PER_DAY} files for {day}")
 
 
 # Command line -------------------------------------------------------------------------
@@ -1872,11 +2228,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also write each box's height and label to <out-dir>/boxes/ (crops mode only)",
     )
+    ap.add_argument(
+        "--attributes",
+        action="store_true",
+        help="label the outer layer, bare legs and umbrella of near-field crops instead, and "
+        "write <out-dir>/attributes/ (with --view window or --judgements)",
+    )
     return ap
 
 
 WINDOW_FRAMES_REFUSAL = "--view window shows crops only; frames mode needs --view files"
 RECORD_BOXES_FRAMES_REFUSAL = "--record-boxes works in crops mode only; drop it or --mode frames"
+ATTRIBUTES_FRAMES_REFUSAL = "--attributes works in crops mode only; drop --mode frames"
+ATTRIBUTES_RECORD_BOXES_REFUSAL = (
+    "--attributes writes its own file and no per-box file; drop --record-boxes"
+)
+ATTRIBUTES_KEYBOARD_REFUSAL = (
+    "--attributes takes its answers in the window (--view window) or from a JSON file "
+    "(--judgements PATH), not from the keyboard"
+)
 
 
 def default_view(platform: str = sys.platform) -> View:
@@ -1970,6 +2340,25 @@ def _collect(
         raise SpotcheckError(f"the reviewer returned an invalid judgement: {exc}") from None
 
 
+def _collect_attributes(
+    items: Sequence[ReviewItem],
+    reviewer: AttributeReviewer,
+    timeout_s: float,
+    guard: _SignalGuard,
+) -> dict[int, str | None]:
+    """Ask for the attribute answers, under the review timeout, and check them."""
+    deadline = time.monotonic() + timeout_s
+    guard.alarm(timeout_s)
+    try:
+        answers = reviewer.attributes(items, deadline)
+    finally:
+        guard.alarm(0)
+    try:
+        return validate_attributes(answers, items)
+    except JudgementError as exc:
+        raise SpotcheckError(f"the reviewer returned invalid answers: {exc}") from None
+
+
 def _review(
     items: Sequence[ReviewItem],
     mode: Mode,
@@ -1980,9 +2369,32 @@ def _review(
 ) -> dict[int, Judgement]:
     """Render to the review directory, collect the judgements, delete the directory. The
     window view writes nothing: the reviewer is given the images in memory."""
+    return _shown(
+        items,
+        mode,
+        guard,
+        view,
+        WINDOW_LEGEND,
+        None,
+        lambda: _collect(items, mode, reviewer, timeout_s, guard),
+    )
+
+
+def _shown[T](
+    items: Sequence[ReviewItem],
+    mode: Mode,
+    guard: _SignalGuard,
+    view: View,
+    legend: str,
+    entry: Mapping[str, object] | None,
+    collect: Callable[[], T],
+) -> T:
+    """Show `items` in the view, run `collect`, and delete what the view wrote. The files
+    view renders them to the review directory, with `entry` as each image's template entry
+    in the numbering; the window view writes nothing."""
     if view == "window":
-        print(f"Review window open: {len(items)} crop(s). {WINDOW_LEGEND}", flush=True)
-        return _collect(items, mode, reviewer, timeout_s, guard)
+        print(f"Review window open: {len(items)} crop(s). {legend}", flush=True)
+        return collect()
     directory = ReviewDirectory()
     try:
         try:
@@ -1990,12 +2402,12 @@ def _review(
                 workdir = directory.create()
             for item in items:
                 directory.write_image(item)
-            directory.write_numbering(items, mode)
+            directory.write_numbering(items, mode, entry)
         except OSError as exc:
             reason = exc.strerror or type(exc).__name__
             raise SpotcheckError(f"cannot write the review directory: {reason}") from None
         _print_numbering(workdir, items)
-        return _collect(items, mode, reviewer, timeout_s, guard)
+        return collect()
     finally:
         # A signal can land before critical() has begun. The guard raises only the
         # first one, so the second attempt cannot be interrupted.
@@ -2011,13 +2423,25 @@ def _review(
 def _run(
     args: argparse.Namespace,
     pipeline: Pipeline | None,
-    reviewer: Reviewer | None,
+    reviewer: Reviewer | AttributeReviewer | None,
     day: datetime.date,
     guard: _SignalGuard,
     setup: JudgeSetup | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
     mode: Mode = args.mode
+    if args.attributes:
+        view = attribute_view(args)
+        attribute_judge = open_attribute_judge(args, setup or JudgeSetup())
+        try:
+            return _attribute_session(
+                args, pipeline, reviewer, day, guard, view, attribute_judge, clock or _utcnow
+            )
+        finally:
+            if attribute_judge is not None:
+                attribute_judge.close()
+    if reviewer is not None and not isinstance(reviewer, Reviewer):
+        raise SpotcheckError("the reviewer given cannot judge detections")
     if args.record_boxes and mode == "frames":
         raise SpotcheckError(RECORD_BOXES_FRAMES_REFUSAL)
     view = resolve_view(args.view, mode, args.judgements)
@@ -2027,6 +2451,71 @@ def _run(
     finally:
         if judge is not None:
             judge.close()
+
+
+def attribute_view(args: argparse.Namespace) -> View:
+    """The view of an attribute session: crops mode, no per-box file, and the window or a
+    judgements file (any view that resolve_view allows with it). Raises SpotcheckError
+    for any other combination, before anything else happens."""
+    if args.mode != "crops":
+        raise SpotcheckError(ATTRIBUTES_FRAMES_REFUSAL)
+    if args.record_boxes:
+        raise SpotcheckError(ATTRIBUTES_RECORD_BOXES_REFUSAL)
+    view = resolve_view(args.view, "crops", args.judgements)
+    if view != "window" and args.judgements is None:
+        raise SpotcheckError(ATTRIBUTES_KEYBOARD_REFUSAL)
+    return view
+
+
+def _prepare(args: argparse.Namespace) -> Path:
+    """Check the temporary and output directories; returns the output directory."""
+    _check_temp_dir(Path(tempfile.gettempdir()))
+    out_dir = Path(args.out_dir)
+    if args.dry_run and _is_real_spotchecks(out_dir):
+        raise SpotcheckError("--dry-run needs an --out-dir other than spotchecks/")
+    _check_out_dir(out_dir)
+    return out_dir
+
+
+def _judgements_reviewer(text: str) -> JsonFileReviewer:
+    path = Path(text)
+    if os.path.lexists(path):
+        raise SpotcheckError(f"{path} already exists; remove it, then start again")
+    return JsonFileReviewer(path)
+
+
+def _open_pipeline(
+    args: argparse.Namespace, pipeline: Pipeline | None, guard: _SignalGuard
+) -> Pipeline:
+    """Delete what earlier runs left behind, then open the pipeline (unless given)."""
+    removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
+    if removed:
+        print(f"Deleted {removed} review directories left by earlier runs.")
+    if pipeline is None:
+        pipeline = dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
+    return pipeline
+
+
+def _sample_sweep(
+    args: argparse.Namespace, pipeline: Pipeline, min_height: int = 0
+) -> list[Sample]:
+    """Sweep, detect and sample, printing progress."""
+    frames = pipeline.frames()
+    total = len(frames) if isinstance(frames, Sized) else None
+
+    def detected(done: int) -> None:
+        if _due(done, total):
+            _progress(f"detected {done} of {total}" if total is not None else f"detected {done}")
+
+    return sample(
+        frames,
+        pipeline.detector,
+        n=args.n,
+        min_persons=args.min_persons,
+        seed=args.seed,
+        progress=detected,
+        min_height=min_height,
+    )
 
 
 def _check(
@@ -2040,44 +2529,18 @@ def _check(
     judge: judge_hosted.LiveCropJudge | None,
     clock: Callable[[], datetime.datetime],
 ) -> int:
-    _check_temp_dir(Path(tempfile.gettempdir()))
-    out_dir = Path(args.out_dir)
-    if args.dry_run and _is_real_spotchecks(out_dir):
-        raise SpotcheckError("--dry-run needs an --out-dir other than spotchecks/")
-    _check_out_dir(out_dir)
+    out_dir = _prepare(args)
     if reviewer is None:
         if args.judgements is not None:
-            path = Path(args.judgements)
-            if os.path.lexists(path):
-                raise SpotcheckError(f"{path} already exists; remove it, then start again")
-            reviewer = JsonFileReviewer(path)
+            reviewer = _judgements_reviewer(args.judgements)
         elif view == "window":
             reviewer = WindowReviewer(guard=guard)
         else:
             reviewer = KeyboardReviewer(sys.stdin.fileno())
-    removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
-    if removed:
-        print(f"Deleted {removed} review directories left by earlier runs.")
-    if pipeline is None:
-        pipeline = dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
+    pipeline = _open_pipeline(args, pipeline, guard)
 
     started_at = clock()
-    frames = pipeline.frames()
-    total = len(frames) if isinstance(frames, Sized) else None
-
-    def detected(done: int) -> None:
-        if _due(done, total):
-            _progress(f"detected {done} of {total}" if total is not None else f"detected {done}")
-
-    samples = sample(
-        frames,
-        pipeline.detector,
-        n=args.n,
-        min_persons=args.min_persons,
-        seed=args.seed,
-        progress=detected,
-    )
-    del frames
+    samples = _sample_sweep(args, pipeline)
     if not samples:
         raise SpotcheckError(f"no frame had at least {args.min_persons} person detections")
     frames_reviewed = len(samples)
@@ -2128,6 +2591,93 @@ def _check(
     return 0
 
 
+# The template entry of each crop in an attribute session's numbering file: to be filled
+# with "y", "n" or "u" each, or replaced by "x".
+ATTRIBUTE_TEMPLATE_ENTRY: dict[str, object] = dict.fromkeys(ATTRIBUTE_NAMES, "")
+
+
+def _attribute_session(
+    args: argparse.Namespace,
+    pipeline: Pipeline | None,
+    reviewer: Reviewer | AttributeReviewer | None,
+    day: datetime.date,
+    guard: _SignalGuard,
+    view: View,
+    judge: judge_hosted.LiveAttributeJudge | None,
+    clock: Callable[[], datetime.datetime],
+) -> int:
+    """Label the near-field crops of one sweep, then (with a judge) ask the model the same
+    questions about the crops the reviewer did not reject; write the attribute file."""
+    out_dir = _prepare(args)
+    labeller: AttributeReviewer
+    if reviewer is None:
+        if args.judgements is not None:
+            labeller = _judgements_reviewer(args.judgements)
+        else:
+            labeller = WindowReviewer(guard=guard)
+    elif isinstance(reviewer, AttributeReviewer):
+        labeller = reviewer
+    else:
+        raise SpotcheckError("the reviewer given cannot answer the attribute questions")
+    pipeline = _open_pipeline(args, pipeline, guard)
+
+    started_at = clock()
+    samples = _sample_sweep(args, pipeline, NEAR_FIELD_MIN_HEIGHT_PX)
+    if not samples:
+        raise SpotcheckError(
+            f"no frame had at least {args.min_persons} near-field person detections "
+            f"(boxes at least {NEAR_FIELD_MIN_HEIGHT_PX} px tall)"
+        )
+    frames_reviewed = len(samples)
+    heights = box_heights(samples)
+    items = render(samples, "crops")
+    del samples  # the frames are not needed any more
+    _progress(f"opening the review: {len(items)} crop(s)")
+    answers: dict[int, str | None] = {}
+    if items:
+        answers = _shown(
+            items,
+            "crops",
+            guard,
+            view,
+            ATTRIBUTE_LEGEND,
+            ATTRIBUTE_TEMPLATE_ENTRY,
+            functools.partial(_collect_attributes, items, labeller, args.timeout, guard),
+        )
+    models: list[str] = []
+    if judge is not None:
+        # Only now, with the labelling over and its answers valid: the crops in memory,
+        # except those the reviewer rejected.
+        kept = [item for item in items if answers[item.number] is not None]
+        models = ask_attribute_judge([item.image for item in kept], judge)
+        usage = judge.usage
+        cost = judge_hosted.cost_usd(judge.candidate, usage.input_tokens, usage.output_tokens)
+        print(
+            f"Judge {args.judge}: {len(models)} of {len(kept)} crop(s) answered, "
+            f"{usage.requests} request(s), ${cost:.6f}",
+            flush=True,
+        )
+        del kept
+    record = attribute_record(
+        items,
+        answers,
+        heights,
+        models,
+        frames_reviewed=frames_reviewed,
+        info=pipeline.info,
+        day=day,
+        started_at=started_at,
+        judge=args.judge,
+    )
+    del items
+    path = write_attributes(record, out_dir, day)
+    print(
+        f"Attribute labels written to {path}: {record['crops_shown']} crop(s) shown, "
+        f"{record['crops_rejected']} rejected"
+    )
+    return 0
+
+
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
@@ -2136,14 +2686,15 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     pipeline: Pipeline | None = None,
-    reviewer: Reviewer | None = None,
+    reviewer: Reviewer | AttributeReviewer | None = None,
     today: datetime.date | None = None,
     judge_endpoint: str | None = None,
     judge_timeout: float = judge_hosted.REQUEST_TIMEOUT,
     judge_sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
-    """Run one spot-check. `pipeline` and `reviewer` replace the live ones,
+    """Run one spot-check (or, with `--attributes`, one attribute session). `pipeline` and
+    `reviewer` replace the live ones (an attribute session needs an AttributeReviewer),
     `judge_endpoint`, `judge_timeout` and `judge_sleep` the judge's origin, request timeout
     and wait between retries (tests: a fake judge on this machine), and `clock` the UTC
     clock that dates the start of the sweep."""

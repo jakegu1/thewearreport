@@ -13,7 +13,7 @@ unsure. Every request has a timeout, and is counted against a shared `RequestBud
 backoff, other errors not at all; redirects are never followed; replies are capped and
 parsed as hostile input; an error never carries a credential.
 
-Two entry points, and only two, send crops (AGENTS.md INV-1):
+Three entry points, and only three, send crops (AGENTS.md INV-1):
 
 - `DeepInfraClassifier.classify`, the bake-off's: gold-set and control crops only
   (`mark_licensed`); anything else is refused before a request is made. It sends no
@@ -24,6 +24,10 @@ Two entry points, and only two, send crops (AGENTS.md INV-1):
   when it is set, and is sent as a bearer token; without it no Authorization header is
   sent, for an environment that injects the credential. Nothing about a crop is logged,
   cached or written.
+- `LiveAttributeJudge.classify_attributes`, the attribute session's, and nothing else's:
+  the same transport, origin, key handling, request budget, retries, timeouts and error
+  redaction as LiveCropJudge, but it asks ATTRIBUTE_PROMPT, three yes/no questions about
+  the person in the crop, and parses the reply with `parse_attributes`.
 """
 
 from __future__ import annotations
@@ -75,6 +79,26 @@ ANSWER_WORDS: dict[str, Answer] = {
 }
 MAX_ANSWER_CHARS = 64
 MAX_IMAGE_SIDE = 2048
+
+# The attribute questions, and the one line they must be answered with: yes, no or unsure
+# for each, in this order. The answers are returned as three letters, y, n or u, in the
+# same order (e.g. "ynu").
+ATTRIBUTE_PROMPT = (
+    "This picture is a crop from a low-resolution street camera. "
+    "Look at the person inside the green box.\n"
+    "outer - is the person wearing an outer layer (a coat or a jacket)?\n"
+    "legs - are the person's legs bare (shorts or a short skirt)?\n"
+    "umbrella - is the person holding an open umbrella?\n"
+    "Answer each with yes, no or unsure (unsure when you cannot tell). Reply with exactly "
+    "one line in this form and nothing else, for example:\n"
+    "outer=yes legs=no umbrella=unsure"
+)
+ATTRIBUTE_VALUES = {"yes": "y", "no": "n", "unsure": "u"}
+_ATTRIBUTE_REPLY = re.compile(
+    r"outer=(yes|no|unsure) legs=(yes|no|unsure) umbrella=(yes|no|unsure)"
+)
+MAX_ATTRIBUTE_REPLY_CHARS = 64
+ALL_UNSURE = "uuu"
 
 
 class JudgeError(RuntimeError):
@@ -217,6 +241,19 @@ def parse_answer(text: str) -> Answer:
     return ANSWER_WORDS[words[0]] if len(named) == 1 else "unsure"
 
 
+def parse_attributes(text: object) -> str:
+    """The three answers of a reply to ATTRIBUTE_PROMPT, as letters (e.g. "ynu"). The
+    reply must be exactly the one line the prompt asks for, give or take surrounding
+    white space, within MAX_ATTRIBUTE_REPLY_CHARS; anything else, including text before or
+    after it, another order or an empty reply, is ALL_UNSURE."""
+    if not isinstance(text, str) or len(text) > MAX_ATTRIBUTE_REPLY_CHARS:
+        return ALL_UNSURE
+    match = _ATTRIBUTE_REPLY.fullmatch(text.strip())
+    if match is None:
+        return ALL_UNSURE
+    return "".join(ATTRIBUTE_VALUES[word] for word in match.groups())
+
+
 def validate_image(image: object) -> Image:
     if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
         raise ValueError("an image must be a uint8 numpy array")
@@ -268,6 +305,7 @@ REQUEST_TIMEOUT = 60.0  # seconds, for each request in all (each retry has its o
 MAX_RETRIES = 3  # after the first attempt, on throttling and server errors only
 BACKOFF_SECONDS = 2.0  # doubled after each retry
 REMOTE_MAX_TOKENS = 10
+ATTRIBUTE_MAX_TOKENS = 32  # the longest well-formed attribute line is about 15 tokens
 PNG_SUFFIX = ".png"  # the format each crop is sent in, encoded in memory
 MAX_RESPONSE_BYTES = 1 << 20
 READ_CHUNK_BYTES = 1 << 16
@@ -725,6 +763,8 @@ class DeepInfraClassifier(_HostedClassifier):
     held or sent by this code."""
 
     provider = "DeepInfra"
+    prompt = PROMPT
+    max_tokens = REMOTE_MAX_TOKENS
 
     def __init__(
         self,
@@ -757,11 +797,11 @@ class DeepInfraClassifier(_HostedClassifier):
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": image}},
-                        {"type": "text", "text": PROMPT},
+                        {"type": "text", "text": self.prompt},
                     ],
                 }
             ],
-            "max_tokens": REMOTE_MAX_TOKENS,
+            "max_tokens": self.max_tokens,
             "temperature": 0,
             "stream": False,
         }
@@ -780,6 +820,12 @@ class DeepInfraClassifier(_HostedClassifier):
         return ""
 
     def _answer(self, raw: bytes) -> Answer:
+        text = self._reply_text(raw)
+        return "unsure" if text is None else parse_answer(text)
+
+    def _reply_text(self, raw: bytes) -> str | None:
+        """The reply's text, or None when the model said nothing (a refusal, a filtered
+        reply, or reasoning that ran out of tokens). Counts the tokens used."""
         p = self.provider
         data = _dict(_load_json(raw, p), "the reply", p)
         usage = data.get("usage")
@@ -797,14 +843,14 @@ class DeepInfraClassifier(_HostedClassifier):
         if finish is not None and not isinstance(finish, str):
             raise JudgeError(f"{p} sent a malformed reply (the finish reason is not text)")
         if finish in DEEPINFRA_FILTERED:
-            return "unsure"
+            return None
         message = _dict(choice.get("message"), "the message", p)
         content = message.get("content")
         if content is None:
-            return "unsure"  # nothing said (a refusal, or reasoning that ran out of tokens)
+            return None  # nothing said (a refusal, or reasoning that ran out of tokens)
         if not isinstance(content, str):
             raise JudgeError(f"{p} sent a malformed reply (the content is not text)")
-        return parse_answer(content)
+        return content
 
 
 # Live camera crops (the paired spot-check) ------------------------------------------------
@@ -824,6 +870,38 @@ class _LiveDeepInfra(DeepInfraClassifier):
     def _describe(self, status: int, kind: str, raw: bytes) -> str:
         """The HTTP status and the error kind only."""
         return f"{self.provider} answered HTTP {status}" + (f" {kind}" if kind else "")
+
+
+class _LiveAttributes(_LiveDeepInfra):
+    """_LiveDeepInfra asking ATTRIBUTE_PROMPT instead of PROMPT."""
+
+    prompt = ATTRIBUTE_PROMPT
+    max_tokens = ATTRIBUTE_MAX_TOKENS
+
+    def ask_attributes(self, pixels: Image) -> str:
+        """One crop, already checked by the entry point that took it, sent and answered."""
+        if self._closed:
+            raise JudgeError("the judge is closed")
+        return parse_attributes(self._reply_text(self._call(self._body(pixels))))
+
+
+def _live_options(name: str, endpoint: str | None) -> tuple[HostedCandidate, str | None]:
+    """The DEEPINFRA candidate `name` and the key from API_KEY_ENV (None when unset),
+    after checking that `endpoint`, if given, is DEEPINFRA_ORIGIN or a server on this
+    machine. Raises JudgeError before any request."""
+    candidate = DEEPINFRA.get(name)
+    if candidate is None:
+        raise JudgeError("unknown DeepInfra model")
+    if endpoint is not None:
+        origin, local = _origin(endpoint, "DeepInfra")
+        if not local and origin != DEEPINFRA_ORIGIN:
+            raise JudgeError(f"the DeepInfra endpoint is pinned to {DEEPINFRA_ORIGIN}")
+    key: str | None = os.environ.get(API_KEY_ENV, "")
+    if not key:
+        key = None
+    elif not _TOKEN.fullmatch(key):
+        raise JudgeError(f"{API_KEY_ENV} is not a well-formed key")
+    return candidate, key
 
 
 class LiveCropJudge:
@@ -847,18 +925,7 @@ class LiveCropJudge:
         timeout: float = REQUEST_TIMEOUT,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        candidate = DEEPINFRA.get(name)
-        if candidate is None:
-            raise JudgeError("unknown DeepInfra model")
-        if endpoint is not None:
-            origin, local = _origin(endpoint, "DeepInfra")
-            if not local and origin != DEEPINFRA_ORIGIN:
-                raise JudgeError(f"the DeepInfra endpoint is pinned to {DEEPINFRA_ORIGIN}")
-        key: str | None = os.environ.get(API_KEY_ENV, "")
-        if not key:
-            key = None
-        elif not _TOKEN.fullmatch(key):
-            raise JudgeError(f"{API_KEY_ENV} is not a well-formed key")
+        candidate, key = _live_options(name, endpoint)
         self.candidate = candidate
         self._judge = _LiveDeepInfra(
             candidate, key=key, budget=budget, endpoint=endpoint, timeout=timeout, sleep=sleep
@@ -875,6 +942,47 @@ class LiveCropJudge:
     def classify_live_crop(self, image: Image) -> Answer:
         """The model's answer about the box drawn in `image`, one detection crop."""
         return self._judge._ask(validate_image(image))
+
+    def close(self) -> None:
+        self._judge.close()
+
+
+class LiveAttributeJudge:
+    """The entry point for crops of live camera frames in the attribute session, and
+    nothing else: the DEEPINFRA model `name` answers ATTRIBUTE_PROMPT about one detection
+    crop per request (HxWx3 uint8, BGR; never a whole frame), encoded to PNG in memory.
+    It is given the pixels only. Endpoint pinning, the key, the request budget, retries,
+    timeouts and error redaction are those of LiveCropJudge. Raises JudgeError for an
+    unknown model, another endpoint or a malformed key, before any request."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        budget: RequestBudget,
+        endpoint: str | None = None,
+        timeout: float = REQUEST_TIMEOUT,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        candidate, key = _live_options(name, endpoint)
+        self.candidate = candidate
+        self._judge = _LiveAttributes(
+            candidate, key=key, budget=budget, endpoint=endpoint, timeout=timeout, sleep=sleep
+        )
+
+    @property
+    def url(self) -> str:
+        return self._judge._url
+
+    @property
+    def usage(self) -> Usage:
+        return self._judge.usage
+
+    def classify_attributes(self, image: Image) -> str:
+        """The model's three answers about the person in the box drawn in `image`, one
+        detection crop, as letters: y, n or u for the outer layer, bare legs and open
+        umbrella, in that order (e.g. "ynu")."""
+        return self._judge.ask_attributes(validate_image(image))
 
     def close(self) -> None:
         self._judge.close()

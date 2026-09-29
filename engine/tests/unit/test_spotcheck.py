@@ -1659,3 +1659,162 @@ def test_dry_run_process_writes_images_only_into_its_directory(tmp_path: Path, m
     stats = json.loads(stats_file.read_text(encoding="utf-8"))
     assert stats["frames_reviewed"] == 4 and stats["mode"] == mode
     assert _leftovers(tmp) == []
+
+
+# The attribute session (T-045) --------------------------------------------------------
+
+
+class Labels:
+    """An attribute reviewer answering `answer` for every crop."""
+
+    def __init__(self, answer: str | None = "ynn") -> None:
+        self.answer = answer
+        self.items: list[spotcheck.ReviewItem] = []
+
+    def attributes(
+        self, items: Sequence[spotcheck.ReviewItem], deadline: float
+    ) -> dict[int, str | None]:
+        self.items = list(items)
+        return {item.number: self.answer for item in items}
+
+
+@pytest.mark.parametrize(
+    ("presses", "finished", "current"),
+    [
+        ([], [], ""),
+        (["y"], [], "y"),
+        (["y", "n", "u"], ["ynu"], ""),
+        (["x"], [None], ""),
+        (["y", "x", "n"], [None], "n"),
+        (["y", "n", "x", "u", "u", "u", "y"], [None, "uuu"], "y"),
+    ],
+)
+def test_attribute_state_replays_the_keys(
+    presses: list[str], finished: list[str | None], current: str
+) -> None:
+    assert spotcheck.attribute_state(presses) == (finished, current)
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        {1: "ynn"},  # crop 2 missing
+        {1: "ynn", 2: "ynn", 3: "ynn"},  # no crop 3
+        {1: "yn", 2: "ynn"},
+        {1: "ynx", 2: "ynn"},
+        {1: "YNN", 2: "ynn"},
+        {1: ["y", "n", "n"], 2: "ynn"},
+    ],
+)
+def test_validate_attributes_refuses_what_is_not_one_answer_per_question(
+    answers: dict[int, Any],
+) -> None:
+    with pytest.raises(spotcheck.JudgementError):
+        spotcheck.validate_attributes(answers, _items("crops"))
+
+
+def test_validate_attributes_accepts_answers_and_rejections() -> None:
+    answers = {1: None, 2: "uuu"}
+    assert spotcheck.validate_attributes(answers, _items("crops")) == answers
+
+
+def test_an_invalid_answer_from_the_reviewer_writes_nothing(env: Path, tmp_path: Path) -> None:
+    args = ["--attributes", "--n", "1", "--min-persons", "1", "--view", "window"]
+    assert _run(args, tmp_path / "o", pipeline=_pipeline([2]), reviewer=Labels("yes")) == 1
+    assert not (tmp_path / "o").exists()
+
+
+def test_a_detection_reviewer_is_refused_in_an_attribute_session(
+    env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["--attributes", "--n", "1", "--min-persons", "1", "--view", "window"]
+    assert _run(args, tmp_path / "o", pipeline=_pipeline([2]), reviewer=Scripted()) == 1
+    assert "attribute" in capsys.readouterr().err
+
+
+def test_an_attribute_reviewer_is_refused_in_a_detection_check(
+    env: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = ["--n", "1", "--min-persons", "1", "--view", "window"]
+    assert _run(args, tmp_path / "o", pipeline=_pipeline([2]), reviewer=Labels()) == 1
+    assert "cannot judge detections" in capsys.readouterr().err
+
+
+def test_sample_keeps_only_boxes_at_least_min_height() -> None:
+    class Heights:
+        def detect(self, frame: npt.NDArray[np.uint8]) -> list[detect.Detection]:
+            return [
+                detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 30.49)),  # 30
+                detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 30.5)),  # 30 (to even)
+                detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 30.51)),  # 31
+                detect.Detection("umbrella", 0.9, (0.0, 0.0, 10.0, 90.0)),
+            ]
+
+    frames = [np.zeros((4, 4, 3), np.uint8)]
+    [kept] = spotcheck.sample(frames, Heights(), n=1, min_persons=1, seed=0, min_height=31)
+    assert [d.box[3] for d in kept.persons] == [30.51]
+    assert spotcheck.sample(frames, Heights(), n=1, min_persons=2, seed=0, min_height=31) == []
+    [every] = spotcheck.sample(frames, Heights(), n=1, min_persons=3, seed=0)
+    assert len(every.persons) == 3
+
+
+def test_attribute_record_pairs_the_model_with_the_kept_crops_in_order() -> None:
+    third = spotcheck.ReviewItem(3, "crop-0003.png", (3,), np.zeros((4, 4, 3), np.uint8))
+    items = [*_items("crops"), third]
+    answers = {1: "yyy", 2: None, 3: "nnn"}
+    heights = {1: 50, 2: 40, 3: 31}
+    record = spotcheck.attribute_record(
+        items,
+        answers,
+        heights,
+        ["ynu"],  # the model answered crop 1, then stopped
+        frames_reviewed=1,
+        info=INFO,
+        day=DAY,
+        started_at=datetime.datetime(2026, 9, 25, 23, 59, 59, tzinfo=datetime.UTC),
+        judge="di-qwen3-vl-235b",
+    )
+    assert record["crops"] == [[31, "nnn", None], [50, "yyy", "ynu"]]
+    assert record["crops_shown"] == 3 and record["crops_rejected"] == 1
+    assert record["started_at"] == "2026-09-25T23:59Z" and record["light"] == "dark"
+
+
+def test_an_unwritable_attribute_file_keeps_the_record_in_the_error(
+    env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def full(*args: Any, **kwargs: Any) -> str:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(spotcheck, "_write_new", full)
+    args = ["--attributes", "--n", "1", "--min-persons", "1", "--view", "window"]
+    assert _run(args, tmp_path / "o", pipeline=_pipeline([2]), reviewer=Labels("nyu")) == 1
+    err = capsys.readouterr().err
+    assert "No space left on device" in err and '"crops": [[60, "nyu", null]' in err
+
+
+def test_the_attribute_numbering_template_must_be_filled_in(env: Path, tmp_path: Path) -> None:
+    answers = tmp_path / "a.json"
+    seen: list[dict[str, Any]] = []
+
+    def copy_the_template() -> None:
+        deadline = time.monotonic() + WAIT_S
+        while time.monotonic() < deadline:
+            found = list(env.glob(f"{spotcheck.TEMP_PREFIX}*/{spotcheck.NUMBERING_FILE}"))
+            if found:
+                numbering = json.loads(found[0].read_text(encoding="utf-8"))
+                seen.append(numbering)
+                answers.write_text(json.dumps(numbering["template"]), encoding="utf-8")
+                return
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=copy_the_template, daemon=True)
+    thread.start()
+    args = ["--attributes", "--n", "1", "--min-persons", "1", "--judgements", str(answers)]
+    assert _run([*args, "--timeout", "2"], tmp_path / "o", pipeline=_pipeline([2])) == 3
+    thread.join()
+    [numbering] = seen
+    assert numbering["template"] == {
+        "1": {"outer_layer": "", "bare_legs": "", "umbrella": ""},
+        "2": {"outer_layer": "", "bare_legs": "", "umbrella": ""},
+    }
+    assert not (tmp_path / "o").exists()
