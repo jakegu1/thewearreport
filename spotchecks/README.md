@@ -36,6 +36,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxe
 | `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
 | `--attributes` | off | run an attribute session instead of a detection check (see [Attribute session](#attribute-session-attributes)) |
 | `--confirm-stop` | off | in the window, a first `q` asks before it stops (see below); needs `--view window`, refused otherwise |
+| `--min-height N` | 31 | in an attribute session, show only person boxes at least N px tall (31 to 200; see [Box height](#box-height---min-height)); needs `--attributes`, refused otherwise |
 | `--allow-dark` | off | start an attribute session in the window even when it is dark in London (see [Daylight](#daylight---allow-dark)); needs `--attributes`, refused otherwise |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
@@ -310,6 +311,23 @@ before any network request: `--mode frames`, keyboard entry (`--view files` with
 `--judgements`, which is also the default outside Windows) and `--record-boxes`.
 `--view window` with `--judgements` stays refused, as for a detection check.
 
+### Box height (`--min-height`)
+
+In daylight most crops under about 41 px cannot be judged for clothing, so the reviewer
+would spend the session answering cannot tell. `--min-height N` shows only person boxes at
+least N pixels tall in the source frame (N a whole number from 31, the near-field
+threshold, to 200), and `--min-persons` then counts those boxes only. The attribute file
+records N as `min_height_px`. Without the flag everything is as before: the threshold is
+31. Any other value (30, 201, `4.5`, `abc`) is refused before any network request, and
+`--min-height` without `--attributes` exits 1 with:
+
+```
+spotcheck: --min-height applies to attribute sessions only; add --attributes or drop it
+```
+
+The attribute threshold itself will be chosen later from the height bands of the
+[attribute summary](#attribute-summary), which show where clothing becomes judgeable.
+
 ### Daylight (`--allow-dark`)
 
 After dark most near-field crops cannot be judged, so a live session in the window does not
@@ -398,7 +416,7 @@ per-box file. It is one line of JSON with exactly these fields:
 | `light` | string | `day`, `twilight` or `dark`, as in the per-box file |
 | `frames` | integer | frames sampled |
 | `detector` | object | as in the statistics file |
-| `min_height_px` | integer | `NEAR_FIELD_MIN_HEIGHT_PX`, the smallest box height shown |
+| `min_height_px` | integer | the smallest box height shown: `--min-height N`, else `NEAR_FIELD_MIN_HEIGHT_PX` (31) |
 | `judge` | string or null | the `--judge` model, or `null` |
 | `crops_shown` | integer | crops shown to the reviewer |
 | `crops_rejected` | integer | crops rejected with `x` |
@@ -431,7 +449,18 @@ names it, exit 1) and prints, for each attribute:
   yes, at least `MIN_NEGATIVES` (30) reviewer no and at least `MIN_LABELLED` (200) of
   both, and precision, recall and specificity each at least `TARGET_ATTRIBUTE_ACCURACY`
   (0.85). `insufficient (...)` says which count is short; otherwise `fail (...)` names the
-  measures below the bar. With no model answer the verdict is `no model`.
+  measures below the bar. With no model answer the verdict is `no model`;
+- after those lines, the judgeable share by height: one line per height band (31-35,
+  36-40, 41-45, 46-50, 51-60 and 61+ px), not indented and starting with the attribute's
+  name, with the crops in it and how many the reviewer answered yes or no (not cannot
+  tell), and their share, over all files but day and twilight only: dark files are left
+  out, as the line says. For example:
+
+  ```
+  outer_layer height 41-45 px, day and twilight (dark excluded): 12 crop(s), 7 answered yes or no, share 0.5833
+  ```
+
+  The attribute threshold (`--min-height`) will be chosen from these height bands.
 
 Without `--attributes` the summary's output is exactly as before, and `attributes/` is not
 read.

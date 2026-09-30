@@ -76,7 +76,9 @@ Nothing about a crop is printed, logged or kept.
 
 With `--attributes`, the tool runs an attribute session instead of a detection check. Only
 person boxes at least NEAR_FIELD_MIN_HEIGHT_PX tall in the source frame are kept (and
-`--min-persons` counts those), and each is shown as a crop. For each crop the reviewer
+`--min-persons` counts those), and each is shown as a crop. `--min-height N` (attribute
+sessions only, NEAR_FIELD_MIN_HEIGHT_PX to MAX_ATTRIBUTE_MIN_HEIGHT_PX) keeps only boxes at
+least N pixels tall instead, and the attribute file records N. For each crop the reviewer
 answers ATTRIBUTE_QUESTIONS in order, one at a time: `y` yes, `n` no, `u` cannot tell, or
 `x` (not a person, or nothing can be told) to reject the crop; in the window
 (`--view window`), where Backspace goes back one answer, or in a JSON file
@@ -281,6 +283,9 @@ LIGHT_TWILIGHT_DEG = -6.0
 # frame pixels (the height the per-box file records), are shown: the near-field threshold
 # that `spotcheck_summary --heights` chose on the baseline data.
 NEAR_FIELD_MIN_HEIGHT_PX = 31
+# --min-height N raises that threshold for one session, to at most this: crops too short to
+# judge clothing are then not shown. The attribute file records the threshold used.
+MAX_ATTRIBUTE_MIN_HEIGHT_PX = 200
 ATTRIBUTES_DIR = "attributes"  # the attribute files, in the statistics directory
 # (the key in a judgements file and in the summary, the question), in the order asked.
 ATTRIBUTE_QUESTIONS = (
@@ -2041,11 +2046,13 @@ def attribute_record(
     day: datetime.date,
     started_at: datetime.datetime,
     judge: str | None,
+    min_height: int = NEAR_FIELD_MIN_HEIGHT_PX,
 ) -> dict[str, object]:
     """The attribute record: for each crop the reviewer did not reject, its height, the
     reviewer's answers and the model's (`models`, one per such crop in order, from the
-    first; None past its end), sorted so that the order says nothing about frames. No
-    position, width, camera id, frame index, image or free text."""
+    first; None past its end), sorted so that the order says nothing about frames, and
+    `min_height`, the smallest box height shown. No position, width, camera id, frame
+    index, image or free text."""
     minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
     kept = [item for item in items if answers[item.number] is not None]
     crops = []
@@ -2059,7 +2066,7 @@ def attribute_record(
         "light": light_at(minute),
         "frames": frames_reviewed,
         "detector": dataclasses.asdict(info),
-        "min_height_px": NEAR_FIELD_MIN_HEIGHT_PX,
+        "min_height_px": min_height,
         "judge": judge,
         "crops_shown": len(items),
         "crops_rejected": len(items) - len(kept),
@@ -2300,6 +2307,15 @@ def build_parser() -> argparse.ArgumentParser:
         "key continues it",
     )
     ap.add_argument(
+        "--min-height",
+        type=_count(NEAR_FIELD_MIN_HEIGHT_PX, MAX_ATTRIBUTE_MIN_HEIGHT_PX),
+        default=None,
+        metavar="N",
+        help="with --attributes: show only person boxes at least N px tall in the source "
+        f"frame ({NEAR_FIELD_MIN_HEIGHT_PX} to {MAX_ATTRIBUTE_MIN_HEIGHT_PX}; default "
+        f"{NEAR_FIELD_MIN_HEIGHT_PX}, the near-field threshold)",
+    )
+    ap.add_argument(
         "--allow-dark",
         action="store_true",
         help="with --attributes: start the session even when it is dark in London (refused "
@@ -2316,6 +2332,7 @@ ATTRIBUTES_RECORD_BOXES_REFUSAL = (
     "--attributes writes its own file and no per-box file; drop --record-boxes"
 )
 ALLOW_DARK_REFUSAL = "--allow-dark applies to attribute sessions only; add --attributes or drop it"
+MIN_HEIGHT_REFUSAL = "--min-height applies to attribute sessions only; add --attributes or drop it"
 DARK_REFUSAL = (
     "it is dark in London now (sun below -6°); attribute sessions need daylight. "
     "Use --allow-dark to run anyway."
@@ -2522,6 +2539,8 @@ def _run(
                 attribute_judge.close()
     if args.allow_dark:
         raise SpotcheckError(ALLOW_DARK_REFUSAL)
+    if args.min_height is not None:
+        raise SpotcheckError(MIN_HEIGHT_REFUSAL)
     if reviewer is not None and not isinstance(reviewer, Reviewer):
         raise SpotcheckError("the reviewer given cannot judge detections")
     if args.record_boxes and mode == "frames":
@@ -2723,12 +2742,13 @@ def _attribute_session(
         raise SpotcheckError("the reviewer given cannot answer the attribute questions")
     pipeline = _open_pipeline(args, pipeline, guard)
 
+    min_height = NEAR_FIELD_MIN_HEIGHT_PX if args.min_height is None else args.min_height
     started_at = clock()
-    samples = _sample_sweep(args, pipeline, NEAR_FIELD_MIN_HEIGHT_PX)
+    samples = _sample_sweep(args, pipeline, min_height)
     if not samples:
         raise SpotcheckError(
             f"no frame had at least {args.min_persons} near-field person detections "
-            f"(boxes at least {NEAR_FIELD_MIN_HEIGHT_PX} px tall)"
+            f"(boxes at least {min_height} px tall)"
         )
     frames_reviewed = len(samples)
     heights = box_heights(samples)
@@ -2770,6 +2790,7 @@ def _attribute_session(
         day=day,
         started_at=started_at,
         judge=args.judge,
+        min_height=min_height,
     )
     del items
     path = write_attributes(record, out_dir, day)

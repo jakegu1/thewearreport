@@ -57,7 +57,10 @@ only), and prints, for each attribute (outer layer, bare legs, open umbrella):
 - a verdict: `pass` with at least MIN_POSITIVES reviewer yes, MIN_NEGATIVES reviewer no
   and MIN_LABELLED of both among those crops, and precision, recall and specificity each
   at least TARGET_ATTRIBUTE_ACCURACY; `insufficient (...)` when a count is short; `fail
-  (...)` naming the measures below the bar; `no model` when the model answered nothing.
+  (...)` naming the measures below the bar; `no model` when the model answered nothing;
+- the judgeable share by height: for each band of HEIGHT_BANDS, the crops in it and how
+  many the reviewer answered yes or no (not "cannot tell"), over the day and twilight files
+  only (dark files are left out). The attribute threshold is chosen from these lines.
 """
 
 from __future__ import annotations
@@ -138,6 +141,17 @@ MIN_NEGATIVES = 30  # reviewer no, among them
 MIN_LABELLED = 200  # reviewer yes or no, among them
 TARGET_ATTRIBUTE_ACCURACY = 0.85  # precision, recall and specificity, each
 _LETTERS = re.compile(r"[ynu]{3}")
+# The judgeable share by height: (label, lowest, highest) in pixels, highest None for no
+# bound; over the files in BAND_LIGHTS only.
+HEIGHT_BANDS: tuple[tuple[str, int, int | None], ...] = (
+    ("31-35", 31, 35),
+    ("36-40", 36, 40),
+    ("41-45", 41, 45),
+    ("46-50", 46, 50),
+    ("51-60", 51, 60),
+    ("61+", 61, None),
+)
+BAND_LIGHTS = ("day", "twilight")
 
 Confusion = dict[str, dict[str, int]]
 
@@ -882,6 +896,23 @@ def _measure(k: int, n: int) -> str:
     return f"{k / n:.4f} (n={n}) wilson [{lo:.4f}, {hi:.4f}]"
 
 
+def band_lines(labellings: Sequence[Labelling], index: int) -> list[str]:
+    """For each height band, the crops in it and how many the reviewer answered yes or no
+    to question `index`, over the day and twilight files only. The lines are not indented
+    but start with the attribute's name: its indented block ends with its verdict."""
+    crops = [crop for s in labellings if s.light in BAND_LIGHTS for crop in s.crops]
+    lines = []
+    for label, low, high in HEIGHT_BANDS:
+        letters = [r[index] for h, r, _m in crops if low <= h and (high is None or h <= high)]
+        answered = sum(1 for letter in letters if letter in ("y", "n"))
+        share = f"{answered / len(letters):.4f}" if letters else "n/a"
+        lines.append(
+            f"{ATTRIBUTE_NAMES[index]} height {label} px, day and twilight (dark excluded): "
+            f"{len(letters)} crop(s), {answered} answered yes or no, share {share}"
+        )
+    return lines
+
+
 def attributes_report(labellings: Sequence[Labelling], directory: Path, rain: bool) -> list[str]:
     """The lines `--attributes` prints. `rain`: whether the rain conditions are known."""
     crops = [crop for s in labellings for crop in s.crops]
@@ -918,6 +949,7 @@ def attributes_report(labellings: Sequence[Labelling], directory: Path, rain: bo
         else:
             lines.append("  model: none")
         lines.append(f"  verdict: {verdict(p)}")
+        lines += band_lines(labellings, index)
     return lines
 
 

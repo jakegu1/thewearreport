@@ -9,9 +9,10 @@ bake-off) imports every name here back, so each `judge.X` still resolves to the 
 Each request carries one crop, as a PNG built in memory and sent as a base64 data URL, and
 asks PROMPT; the reply is parsed by `parse_answer` into person, in_vehicle, not_person or
 unsure. Every request has a timeout, and is counted against a shared `RequestBudget`
-(retries count); throttling and server errors are retried at most MAX_RETRIES times with
-backoff, other errors not at all; redirects are never followed; replies are capped and
-parsed as hostile input; an error never carries a credential.
+(retries count); throttling, server errors and a connection that fails before any HTTP
+response (refused, reset, a TLS error) are retried at most MAX_RETRIES times with
+backoff, other errors (a timeout among them) not at all; redirects are never followed;
+replies are capped and parsed as hostile input; an error never carries a credential.
 
 Three entry points, and only three, send crops (AGENTS.md INV-1):
 
@@ -302,7 +303,7 @@ def is_licensed(image: object) -> bool:
 # The hosted backends ----------------------------------------------------------------------
 
 REQUEST_TIMEOUT = 60.0  # seconds, for each request in all (each retry has its own)
-MAX_RETRIES = 3  # after the first attempt, on throttling and server errors only
+MAX_RETRIES = 3  # after the first attempt: throttling, server errors, dropped connections
 BACKOFF_SECONDS = 2.0  # doubled after each retry
 REMOTE_MAX_TOKENS = 10
 ATTRIBUTE_MAX_TOKENS = 32  # the longest well-formed attribute line is about 15 tokens
@@ -405,6 +406,19 @@ def _origin(base: str, provider: str) -> tuple[str, bool]:
 
 class _DeadlinePassed(JudgeError):
     """A request ran past its deadline while its reply was being read."""
+
+
+class _ConnectionFailed(JudgeError):
+    """A request failed before any HTTP response because the connection did: retried."""
+
+
+class _NoResponse(Exception):
+    """The connection failed (a reset, a TLS error) before the reply's status line: urllib
+    raises that outside URLError. `reason` is the error."""
+
+    def __init__(self, reason: OSError) -> None:
+        super().__init__(type(reason).__name__)
+        self.reason = reason
 
 
 def _set_read_timeout(response: Any, seconds: float) -> None:
@@ -569,10 +583,10 @@ def _png_base64(pixels: Image) -> str:
 class _HostedClassifier:
     """What every hosted backend shares: one crop per request, only marked gold-set and
     control crops, a shared request budget, a timeout on every request, at most
-    MAX_RETRIES retries on throttling and server errors, no redirects, capped replies
-    parsed as hostile input, and errors that never carry a credential. `endpoint` replaces
-    the provider's origin (tests: a fake server on the loopback interface); `sleep` waits
-    between retries."""
+    MAX_RETRIES retries on throttling, server errors and dropped connections, no
+    redirects, capped replies parsed as hostile input, and errors that never carry a
+    credential. `endpoint` replaces the provider's origin (tests: a fake server on the
+    loopback interface); `sleep` waits between retries."""
 
     provider = "hosted"
 
@@ -641,7 +655,13 @@ class _HostedClassifier:
 
     def _call(self, body: bytes) -> bytes:
         for attempt in range(MAX_RETRIES + 1):
-            status, raw, kind = self._send(body)
+            try:
+                status, raw, kind = self._send(body)
+            except _ConnectionFailed:
+                if attempt == MAX_RETRIES:
+                    raise
+                self._sleep(BACKOFF_SECONDS * 2**attempt)
+                continue
             if 200 <= status < 300:
                 return raw
             if not self._retryable(status, kind) or attempt == MAX_RETRIES:
@@ -673,9 +693,13 @@ class _HostedClassifier:
         except urllib.error.URLError as exc:
             if watchdog.fired or isinstance(exc.reason, TimeoutError):
                 raise JudgeError(timed_out) from None
-            raise JudgeError(
+            raise _ConnectionFailed(
                 f"cannot reach {self.provider} ({type(exc.reason).__name__})"
             ) from None
+        except _NoResponse as exc:
+            if watchdog.fired:  # the socket was shut under the wait for the status line
+                raise JudgeError(timed_out) from None
+            raise _ConnectionFailed(f"the request failed ({type(exc.reason).__name__})") from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             if watchdog.fired:  # the socket was shut under a read: a reset, IncompleteRead
                 raise JudgeError(timed_out) from None
@@ -690,8 +714,7 @@ class _HostedClassifier:
     def _exchange(self, request: urllib.request.Request, deadline: float) -> tuple[int, bytes, str]:
         """Send `request` and read its reply: the HTTP status, the body and the error type."""
         try:
-            with self._opener.open(request, timeout=self._timeout) as response:
-                return response.status, _read_capped(response, self.provider, deadline), ""
+            response = self._opener.open(request, timeout=self._timeout)
         except urllib.error.HTTPError as exc:
             try:
                 raw = _read_capped(exc, self.provider, deadline)
@@ -700,6 +723,10 @@ class _HostedClassifier:
             finally:
                 exc.close()
             return exc.code, raw, self._error_kind(exc, raw)
+        except (ssl.SSLError, ConnectionError) as exc:
+            raise _NoResponse(exc) from None
+        with response:
+            return response.status, _read_capped(response, self.provider, deadline), ""
 
     def _message(self, data: object) -> str:
         """The error message in a provider's error body, or ''."""
