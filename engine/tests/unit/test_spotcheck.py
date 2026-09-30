@@ -32,6 +32,9 @@ from wearreport.tools import spotcheck
 
 H, W = 288, 352
 DAY = datetime.date(2026, 9, 25)
+# The clock _run passes unless a test gives its own: daytime in London, so that attribute
+# sessions start whatever the wall-clock time.
+DAYTIME = datetime.datetime(2026, 9, 25, 11, 22, 33, tzinfo=datetime.UTC)
 WAIT_S = 60
 INFO = spotcheck.DetectorInfo(model="stub", sha256="0" * 64, conf=detect.DEFAULT_CONF)
 IMAGE_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF8", b"BM", b"RIFF", b"II*\x00")
@@ -105,6 +108,7 @@ def _leftovers(tmp: Path) -> list[Path]:
 
 def _run(args: Sequence[str], out: Path, **kwargs: Any) -> int:
     argv = [*args, "--reviewer", "tester", "--out-dir", str(out)]
+    kwargs.setdefault("clock", lambda: DAYTIME)
     return spotcheck.main(argv, today=DAY, **kwargs)
 
 

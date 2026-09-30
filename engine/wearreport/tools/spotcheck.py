@@ -4,7 +4,7 @@
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
-      [--confirm-stop]
+      [--confirm-stop] [--allow-dark]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -84,7 +84,9 @@ answers ATTRIBUTE_QUESTIONS in order, one at a time: `y` yes, `n` no, `u` cannot
 model (`judge_hosted.LiveAttributeJudge`), pixels only, under the same rules as above. The
 tool writes one file, `<out-dir>/attributes/YYYY-MM-DD.json` (then `-2`, ...): each kept
 crop's height and the reviewer's and the model's answers, and nothing else (no statistics
-file, no per-box file). Frames mode, keyboard entry and `--record-boxes` are refused.
+file, no per-box file). Frames mode, keyboard entry and `--record-boxes` are refused. In
+the window, the session does not start when it is dark in London (sun below -6°) unless
+`--allow-dark` is given; answers from a JSON file are taken at any light.
 
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
 in fixtures/detect/ (no network). Its statistics describe those photos, not the
@@ -2297,6 +2299,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --view window: a first q asks before it stops the review, and any other "
         "key continues it",
     )
+    ap.add_argument(
+        "--allow-dark",
+        action="store_true",
+        help="with --attributes: start the session even when it is dark in London (refused "
+        "otherwise when the answers are taken in the window)",
+    )
     return ap
 
 
@@ -2306,6 +2314,11 @@ RECORD_BOXES_FRAMES_REFUSAL = "--record-boxes works in crops mode only; drop it 
 ATTRIBUTES_FRAMES_REFUSAL = "--attributes works in crops mode only; drop --mode frames"
 ATTRIBUTES_RECORD_BOXES_REFUSAL = (
     "--attributes writes its own file and no per-box file; drop --record-boxes"
+)
+ALLOW_DARK_REFUSAL = "--allow-dark applies to attribute sessions only; add --attributes or drop it"
+DARK_REFUSAL = (
+    "it is dark in London now (sun below -6°); attribute sessions need daylight. "
+    "Use --allow-dark to run anyway."
 )
 ATTRIBUTES_KEYBOARD_REFUSAL = (
     "--attributes takes its answers in the window (--view window) or from a JSON file "
@@ -2494,17 +2507,21 @@ def _run(
     clock: Callable[[], datetime.datetime] | None = None,
 ) -> int:
     mode: Mode = args.mode
+    clock = clock or _utcnow
     if args.attributes:
         view = attribute_view(args)
         reviewer = _confirming(args, view, reviewer)
+        check_light(args, clock)
         attribute_judge = open_attribute_judge(args, setup or JudgeSetup())
         try:
             return _attribute_session(
-                args, pipeline, reviewer, day, guard, view, attribute_judge, clock or _utcnow
+                args, pipeline, reviewer, day, guard, view, attribute_judge, clock
             )
         finally:
             if attribute_judge is not None:
                 attribute_judge.close()
+    if args.allow_dark:
+        raise SpotcheckError(ALLOW_DARK_REFUSAL)
     if reviewer is not None and not isinstance(reviewer, Reviewer):
         raise SpotcheckError("the reviewer given cannot judge detections")
     if args.record_boxes and mode == "frames":
@@ -2513,7 +2530,7 @@ def _run(
     reviewer = _confirming(args, view, reviewer)
     judge = open_judge(args, mode, setup or JudgeSetup())
     try:
-        return _check(args, pipeline, reviewer, day, guard, mode, view, judge, clock or _utcnow)
+        return _check(args, pipeline, reviewer, day, guard, mode, view, judge, clock)
     finally:
         if judge is not None:
             judge.close()
@@ -2528,6 +2545,14 @@ def _confirming[T](args: argparse.Namespace, view: View, reviewer: T) -> T:
         if isinstance(reviewer, WindowReviewer):
             reviewer.confirm_stop = True
     return reviewer
+
+
+def check_light(args: argparse.Namespace, clock: Callable[[], datetime.datetime]) -> None:
+    """Refuse an attribute session whose answers are taken live (not from --judgements)
+    when it is dark in London at `clock()`, unless --allow-dark is given: after dark most
+    near-field crops cannot be judged. Raises SpotcheckError before anything else happens."""
+    if args.judgements is None and not args.allow_dark and light_at(clock()) == "dark":
+        raise SpotcheckError(DARK_REFUSAL)
 
 
 def attribute_view(args: argparse.Namespace) -> View:

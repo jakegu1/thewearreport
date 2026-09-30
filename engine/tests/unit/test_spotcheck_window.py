@@ -35,6 +35,9 @@ from wearreport.tools import spotcheck
 
 H, W = 288, 352
 DAY = datetime.date(2026, 9, 27)
+# The clock _run passes unless a test gives its own: daytime in London, so that attribute
+# sessions start whatever the wall-clock time.
+DAYTIME = datetime.datetime(2026, 9, 27, 11, 22, 33, tzinfo=datetime.UTC)
 WAIT_S = 60
 INFO = spotcheck.DetectorInfo(model="stub", sha256="0" * 64, conf=detect.DEFAULT_CONF)
 REQUIRE_TK = "WEARREPORT_REQUIRE_TK"
@@ -91,6 +94,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
 
 def _run(args: Sequence[str], out: Path, **kwargs: Any) -> int:
     argv = [*args, "--reviewer", "tester", "--out-dir", str(out)]
+    kwargs.setdefault("clock", lambda: DAYTIME)
     return spotcheck.main(argv, today=DAY, **kwargs)
 
 
