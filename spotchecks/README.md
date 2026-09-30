@@ -36,6 +36,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxe
 | `--record-boxes` | off | also write the per-box file (below) next to the statistics file; crops mode only, refused with `--mode frames` |
 | `--attributes` | off | run an attribute session instead of a detection check (see [Attribute session](#attribute-session-attributes)) |
 | `--confirm-stop` | off | in the window, a first `q` asks before it stops (see below); needs `--view window`, refused otherwise |
+| `--allow-dark` | off | start an attribute session in the window even when it is dark in London (see [Daylight](#daylight---allow-dark)); needs `--attributes`, refused otherwise |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -308,6 +309,23 @@ are files in the temporary review directory, as above). Any other combination is
 before any network request: `--mode frames`, keyboard entry (`--view files` without
 `--judgements`, which is also the default outside Windows) and `--record-boxes`.
 `--view window` with `--judgements` stays refused, as for a detection check.
+
+### Daylight (`--allow-dark`)
+
+After dark most near-field crops cannot be judged, so a live session in the window does not
+start when it is dark in London at its start (`light` `dark`: the sun below -6°, see
+[the per-box file](#per-box-file)). The tool then exits 1 before any network request or
+sweep, writes nothing, and prints one line:
+
+```
+spotcheck: it is dark in London now (sun below -6°); attribute sessions need daylight. Use --allow-dark to run anyway.
+```
+
+`--allow-dark` runs the session anyway, exactly as in daylight; the attribute file still
+records `"light": "dark"`. Sessions that start in `day` or `twilight`, and sessions whose
+answers come from a JSON file (`--judgements PATH`), are never refused: the check protects
+a reviewer's time in the window only. `--allow-dark` without `--attributes` is refused, as
+the detection check runs at any light.
 
 ### Questions and keys
 
