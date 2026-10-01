@@ -104,8 +104,12 @@ REDUCTIONS: tuple[tuple[int, int], ...] = (
 )
 # Start-of-frame markers (C0-CF, except DHT C4, JPG C8 and DAC CC) carry the frame size.
 SOF_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
-# Markers without a length field: TEM and the restart markers.
-STANDALONE_MARKERS = frozenset({0x01, *range(0xD0, 0xD8)})
+# The only other markers the JPEG decoder accepts before the frame header: the one without
+# a length field (TEM), and the segments it skips or reads by their length (APP0-APP15,
+# COM, DQT, DHT, DAC and DRI). Anything else there, a stuffed zero (FF 00) included, may
+# be read differently by the decoder, so the header reader refuses it.
+TEM_MARKER = 0x01
+SEGMENTS_BEFORE_SOF = frozenset({*range(0xE0, 0xF0), 0xFE, 0xDB, 0xC4, 0xCC, 0xDD})
 
 FailureKind = Literal["timeout", "http", "decode", "network", "detector"]
 FAILURE_KINDS: tuple[FailureKind, ...] = (*fetch.ERROR_KINDS, "detector")
@@ -302,8 +306,8 @@ def _download(url: str, scheme: str, timeout_s: float) -> bytes:
 
 
 def jpeg_size(body: bytes) -> tuple[int, int] | None:
-    """(width, height) from a JPEG's start-of-frame header, or None if none is found
-    before the image data starts."""
+    """(width, height) from a JPEG's start-of-frame header, or None unless only the
+    markers the decoder accepts before it (see SEGMENTS_BEFORE_SOF) come first."""
     pos = 2  # after the start-of-image marker
     while pos + 4 <= len(body):
         if body[pos] != 0xFF:
@@ -312,10 +316,10 @@ def jpeg_size(body: bytes) -> tuple[int, int] | None:
         if marker == 0xFF:  # fill byte
             pos += 1
             continue
-        if marker in STANDALONE_MARKERS:
+        if marker == TEM_MARKER:
             pos += 2
             continue
-        if marker in (0xD8, 0xD9, 0xDA):  # another SOI, EOI or start of scan
+        if marker not in SOF_MARKERS and marker not in SEGMENTS_BEFORE_SOF:
             return None
         length = int.from_bytes(body[pos + 2 : pos + 4], "big")
         if length < 2:

@@ -36,10 +36,70 @@ def test_jpeg_size_reads_a_rewritten_header() -> None:
     assert ph.jpeg_size(jpeg_declaring(30000, 20000)) == (30000, 20000)
 
 
-def test_jpeg_size_skips_fill_and_standalone_markers() -> None:
+def test_jpeg_size_skips_fill_bytes_and_tem() -> None:
     body = _jpeg(64, 48)
-    padded = body[:2] + b"\xff\xff\xff\xd0" + body[2:]  # fill bytes, then RST0
+    padded = body[:2] + b"\xff\xff\xff\x01" + body[2:]  # fill bytes, then TEM
     assert ph.jpeg_size(padded) == (64, 48)
+
+
+# The markers the JPEG decoder accepts before the frame header: APP0-APP15, COM, DQT,
+# DHT, DAC and DRI (each with a length), and TEM (without one).
+_SEGMENTS_BEFORE_SOF = {*range(0xE0, 0xF0), 0xFE, 0xDB, 0xC4, 0xCC, 0xDD}
+_SOF_8X16 = b"\x00\x0b\x08\x00\x10\x00\x08\x01\x01\x11\x00"  # 8 wide, 16 high
+
+
+@pytest.mark.parametrize("marker", range(0x100))
+def test_jpeg_size_accepts_only_the_decoders_markers_before_the_frame(marker: int) -> None:
+    body = _jpeg(64, 48)
+    if marker in ph.SOF_MARKERS:
+        inserted, expected = _SOF_8X16, (8, 16)  # the first frame header is the one read
+    elif marker == 0xFF:
+        inserted, expected = b"", (64, 48)  # a fill byte before the next marker
+    elif marker == 0x01:
+        inserted, expected = b"", (64, 48)  # TEM
+    elif marker in _SEGMENTS_BEFORE_SOF:
+        inserted, expected = b"\x00\x04\x00\x00", (64, 48)
+    else:  # FF 00, RSTn, SOI, EOI, SOS, DNL, DHP, EXP, JPGn and anything else
+        inserted, expected = b"\x00\x04\x00\x00", None
+    assert ph.jpeg_size(body[:2] + bytes([0xFF, marker]) + inserted + body[2:]) == expected
+
+
+def test_decoy_frame_header_behind_a_stuffed_zero_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The decoder reads FF 00 as a stuffed zero and decodes the 3000x3000 frame inside
+    # what a length-skipping reader would pass over, to reach the small decoy header.
+    hidden = _progressive(3000, 3000)[2:]
+    decoy = b"\xff\xc2\x00\x11\x08\x00\x3d\xff\xff\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    assert 65535 * 61 <= ph.MAX_HEADER_PIXELS < 3000 * 3000
+    body = b"\xff\xd8\xff\x00" + (len(hidden) + 2).to_bytes(2, "big") + hidden + decoy
+    body += b"\xff\xd9"
+    assert ph.jpeg_size(body) is None
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
+
+
+def _with_segments(body: bytes) -> bytes:
+    exif = b"\xff\xe1\x00\x10Exif\x00\x00II*\x00\x08\x00\x00\x00"
+    return body[:2] + exif + b"\xff\xfe\x00\x07hello" + b"\xff\xe2\x00\x04\x00\x00" + body[2:]
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+@pytest.mark.parametrize("segments", [False, True])
+def test_real_1080p_frames_still_decode(progressive: bool, segments: bool) -> None:
+    image = np.random.default_rng(0).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
+    params = [cv2.IMWRITE_JPEG_PROGRESSIVE, 1] if progressive else []
+    ok, buf = cv2.imencode(".jpg", image, params)
+    assert ok
+    body = _with_segments(buf.tobytes()) if segments else buf.tobytes()
+    assert ph.jpeg_size(body) == (1920, 1080)
+    decoded = ph.decode_frame(body)
+    assert decoded.frame.shape == (540, 960, 3)
+    assert (decoded.width, decoded.height) == (1920, 1080)
 
 
 @pytest.mark.parametrize(
