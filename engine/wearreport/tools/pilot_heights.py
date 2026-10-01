@@ -26,10 +26,13 @@ Safety:
   first, as the sweep does). The engine caps every decoded image at
   `_cv.MAX_IMAGE_PIXELS` (one megapixel), which a 1920x1080 still exceeds, so a frame
   over the cap is decoded by the JPEG decoder at 1/2, 1/4 or 1/8 of its size, the
-  smallest reduction that fits under the cap; the cap itself still applies. The
-  detector letterboxes every frame to 640x640 anyway (a 1920x1080 frame to 640x360,
-  whether it starts at 1920x1080 or 960x540), and box heights are scaled back to pixels
-  of the original frame, whose size is read from the JPEG header.
+  smallest reduction that fits under the cap; the cap itself still applies. A header
+  that declares more than four times the cap (`MAX_HEADER_PIXELS`; 2560x1440 still
+  fits) is refused before any decoding, since the decoder holds a progressive frame's
+  coefficients at full size whatever the reduction. The detector letterboxes every
+  frame to 640x640 anyway (a 1920x1080 frame to 640x360, whether it starts at 1920x1080
+  or 960x540), and box heights are scaled back to pixels of the original frame, whose
+  size is read from the JPEG header.
 """
 
 from __future__ import annotations
@@ -88,6 +91,9 @@ BANDS: tuple[tuple[str, int], ...] = (
     ("200+", 200),
 )
 HD = (1920, 1080)
+# The largest frame area a header may declare. The JPEG decoder holds a progressive or
+# multi-scan frame's coefficients at full size, however much it reduces the output.
+MAX_HEADER_PIXELS = 4 * MAX_IMAGE_PIXELS
 
 # The JPEG decoder's reduced-size modes, smallest reduction first.
 REDUCTIONS: tuple[tuple[int, int], ...] = (
@@ -333,6 +339,8 @@ def decode_frame(body: bytes) -> _Decoded:
     if size is None:
         raise _Failed("decode")
     width, height = size
+    if width * height > MAX_HEADER_PIXELS:
+        raise _Failed("decode")
     fits = [
         (flag, -(-width // factor), -(-height // factor))
         for factor, flag in REDUCTIONS

@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import datetime
 import json
+from collections.abc import Callable
 
 import numpy as np
 import pytest
 
 from wearreport import detect, fetch
-from wearreport._cv import MAX_IMAGE_PIXELS, encode_jpeg
+from wearreport._cv import MAX_IMAGE_PIXELS, cv2, encode_jpeg
 from wearreport.testing.fake_cameras import jpeg_declaring
 from wearreport.tools import pilot_heights as ph
 
@@ -78,7 +79,7 @@ def test_small_frames_decode_at_full_size() -> None:
         (1000, 1000, (1000, 1000, 3)),  # exactly the cap
         (1001, 1000, (500, 501, 3)),
         (2560, 1440, (720, 1280, 3)),
-        (3840, 2160, (540, 960, 3)),
+        (2000, 2000, (1000, 1000, 3)),  # exactly the header bound
         (1921, 1081, (541, 961, 3)),  # odd sizes round up
     ],
 )
@@ -102,12 +103,75 @@ def test_large_frames_decode_reduced_under_the_cap(
         _jpeg(64, 48)[:-100],
         b"\xff\xd8\xff\xe0\x00\x10" + b"\0" * 32 + b"\xff\xd9",  # no frame header
         jpeg_declaring(30000, 30000),  # over the cap even at 1/8
+        _jpeg(3840, 2160),  # over the header bound
     ],
 )
 def test_decode_refuses_anything_but_a_complete_jpeg(body: bytes) -> None:
     with pytest.raises(ph._Failed) as exc:
         ph.decode_frame(body)
     assert exc.value.kind == "decode"
+
+
+def _progressive(width: int, height: int) -> bytes:
+    image = np.full((height, width, 3), 100, dtype=np.uint8)
+    ok, buf = cv2.imencode(
+        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 50, cv2.IMWRITE_JPEG_PROGRESSIVE, 1]
+    )
+    assert ok
+    body = buf.tobytes()
+    assert b"\xff\xc2" in body and b"\xff\xc0" not in body
+    return body
+
+
+def _with_sof(body: bytes, marker: int) -> bytes:
+    sof = body.find(b"\xff\xc0")
+    assert sof >= 0
+    return body[: sof + 1] + bytes([marker]) + body[sof + 2 :]
+
+
+def test_header_bound_is_four_times_the_cap() -> None:
+    assert ph.MAX_HEADER_PIXELS == 4 * MAX_IMAGE_PIXELS
+    assert ph.MAX_HEADER_PIXELS >= 2560 * 1440
+
+
+@pytest.mark.parametrize("make", [_jpeg, _progressive])
+def test_decode_accepts_a_header_exactly_at_the_bound(make: Callable[[int, int], bytes]) -> None:
+    decoded = ph.decode_frame(make(2000, 2000))
+    assert ph.MAX_HEADER_PIXELS == 2000 * 2000
+    assert decoded.frame.shape == (1000, 1000, 3)
+    assert (decoded.width, decoded.height) == (2000, 2000)
+
+
+@pytest.mark.parametrize("make", [_jpeg, _progressive])
+@pytest.mark.parametrize(("width", "height"), [(2001, 2000), (2000, 2001), (4001, 1000)])
+def test_decode_refuses_a_header_above_the_bound_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+    make: Callable[[int, int], bytes],
+    width: int,
+    height: int,
+) -> None:
+    body = make(width, height)
+    assert ph.jpeg_size(body) == (width, height)
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
+
+
+@pytest.mark.parametrize("marker", sorted(ph.SOF_MARKERS))
+def test_header_bound_holds_for_every_frame_type(
+    monkeypatch: pytest.MonkeyPatch, marker: int
+) -> None:
+    body = _with_sof(jpeg_declaring(2001, 2000), marker)
+    assert ph.jpeg_size(body) == (2001, 2000)
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
 
 
 def test_decode_reuses_the_sweeps_markers() -> None:
