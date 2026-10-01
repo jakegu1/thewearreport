@@ -725,12 +725,14 @@ class Labelling:
     rain: str = "unknown"
 
 
-def _crop(value: object, judged: bool) -> Crop:
+def _crop(value: object, judged: bool, min_height: int) -> Crop:
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError("a crop is not [height, reviewer, model]")
     height, reviewer, model = value
     if type(height) is not int or not 0 <= height <= MAX_HEIGHT:
         raise ValueError("a crop height is not a whole number of pixels")
+    if height < min_height:
+        raise ValueError("a crop height is below min_height_px")
     if not isinstance(reviewer, str) or not _LETTERS.fullmatch(reviewer):
         raise ValueError("a reviewer answer is not three of y, n, u")
     if model is not None:
@@ -761,7 +763,11 @@ def parse_labelling(raw: bytes) -> Labelling:
     if light not in LIGHTS:
         raise ValueError("light is not one of " + ", ".join(LIGHTS))
     _count(data["frames"], "frames")
-    _count(data["min_height_px"], "min_height_px")
+    # spotcheck's NEAR_FIELD_MIN_HEIGHT_PX to MAX_ATTRIBUTE_MIN_HEIGHT_PX, the --min-height
+    # range; written out so that this counts-only tool does not import the image pipeline.
+    min_height = _count(data["min_height_px"], "min_height_px")
+    if not 31 <= min_height <= 200:
+        raise ValueError("min_height_px is not 31 to 200")
     if not isinstance(data["detector"], dict):
         raise ValueError("detector is not an object")
     judge = data["judge"]
@@ -779,7 +785,7 @@ def parse_labelling(raw: bytes) -> Labelling:
         light=light,
         shown=shown,
         rejected=rejected,
-        crops=tuple(_crop(crop, judge is not None) for crop in crops),
+        crops=tuple(_crop(crop, judge is not None, min_height) for crop in crops),
     )
 
 
