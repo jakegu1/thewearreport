@@ -31,9 +31,10 @@ header and relies on the credential the environment adds. DeepInfra requests nev
 an Authorization header of their own: the environment adds it. A remote run refuses to
 start without `--max-requests N` and stops at N requests (retries count). The backends
 send only gold-set and control crops (`mark_licensed`): anything else is refused before a
-request is made (AGENTS.md INV-1). Each request has a timeout; throttling and server
-errors are retried at most MAX_RETRIES times with backoff, other errors not at all;
-redirects are never followed. That HTTP path (the DeepInfra backend, the base every hosted
+request is made (AGENTS.md INV-1). Each request has a timeout; throttling, server errors
+and a connection that fails before any HTTP response (refused, reset, a TLS error) are
+retried at most MAX_RETRIES times with backoff, other errors (a timeout among them) not at
+all; redirects are never followed. That HTTP path (the DeepInfra backend, the base every hosted
 backend shares, the request budget, the gold-set guard, PROMPT and parse_answer) is in
 `wearreport.tools.judge_hosted`, which imports on Windows; its names are imported back
 here, so each judge.X is the same object.
