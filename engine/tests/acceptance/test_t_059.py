@@ -356,7 +356,7 @@ def test_ac1_the_sweep_decodes_1080p_at_full_size_and_refuses_one_pixel_more() -
 
 
 def test_ac1_the_detector_takes_a_whole_1080p_frame() -> None:
-    assert detect.MAX_IMAGE_PIXELS == 1920 * 1080
+    assert detect.MAX_IMAGE_PIXELS == 1920 * 1080  # type: ignore[attr-defined]
 
 
 # AC2: the option ----------------------------------------------------------------------
