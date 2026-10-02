@@ -728,3 +728,31 @@ def test_window_teardown_with_a_failed_cancel_leaves_no_tk_object_for_another_th
         assert root() is None
     finally:
         gc.enable()
+
+
+def _window_closed(root: Any) -> bool:
+    import tkinter
+
+    try:
+        return not root.winfo_exists()
+    except tkinter.TclError:
+        return True
+
+
+@pytest.mark.parametrize("kind", ["judge", "attributes"])
+@pytest.mark.parametrize("path", ["timeout", "answered"])
+def test_window_teardown_destroys_the_root_after_a_failed_cancel(
+    first_cancel_fails: list[tuple[str, bool]], kind: str, path: str
+) -> None:
+    answers = {"judge": ["<Return>"], "attributes": ["<KeyPress-y>"] * 3}[kind]
+    send = _send(*(answers if path == "answered" else []), extra=_keep_scheduled)
+    reviewer = spotcheck.WindowReviewer(driver=send)
+    review: Any = reviewer.judge if kind == "judge" else reviewer.attributes
+    args: tuple[Any, ...] = (_crops([1]), "crops") if kind == "judge" else (_crops([1]),)
+    if path == "timeout":
+        with pytest.raises(spotcheck.ReviewTimeout):
+            review(*args, time.monotonic() + 0.5)
+    else:
+        assert len(review(*args, time.monotonic() + WAIT_S)) == 1
+    assert first_cancel_fails
+    assert _window_closed(send.root)
