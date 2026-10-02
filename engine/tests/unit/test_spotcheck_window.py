@@ -669,3 +669,62 @@ def test_attribute_session_in_the_window_writes_only_the_attribute_file(
     assert record["crops"] == [[60, "ynn", None]]
     assert record["crops_shown"] == 2 and record["crops_rejected"] == 1
     assert not list(env.iterdir())  # nothing in the temporary directory either
+
+
+# Teardown when a cancel fails (T-061) -------------------------------------------------
+
+
+@pytest.fixture
+def first_cancel_fails(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[tuple[str, bool]]]:
+    """The first `after_cancel` raises TclError, as tkinter's does for an id whose
+    callback already ran; later ones cancel. Yields each id asked for and whether it was
+    cancelled."""
+    _need_window()
+    import tkinter
+
+    real = tkinter.Misc.after_cancel
+    asked: list[tuple[str, bool]] = []
+
+    def after_cancel(self: Any, id: str) -> None:
+        if not asked:
+            asked.append((id, False))
+            raise tkinter.TclError(f'event "{id}" doesn\'t exist')
+        real(self, id)
+        asked.append((id, True))
+
+    monkeypatch.setattr(tkinter.Misc, "after_cancel", after_cancel)
+    yield asked
+
+
+def _keep_scheduled(root: Any) -> None:
+    """A driver that leaves two long callbacks for the teardown to cancel."""
+    root.after(WAIT_S * 10_000, int)
+    root.after(WAIT_S * 10_000, int)
+
+
+def test_window_teardown_cancels_the_rest_after_a_failed_cancel(
+    first_cancel_fails: list[tuple[str, bool]],
+) -> None:
+    with pytest.raises(spotcheck.ReviewTimeout):
+        spotcheck.WindowReviewer(driver=_keep_scheduled).judge(
+            _crops([1]), "crops", time.monotonic() + 0.5
+        )
+    # The tick and both of the driver's callbacks were still scheduled.
+    assert len(first_cancel_fails) >= 3
+    assert [done for _id, done in first_cancel_fails[1:]] == [True] * (len(first_cancel_fails) - 1)
+    assert len({id for id, _done in first_cancel_fails}) == len(first_cancel_fails)
+
+
+def test_window_teardown_with_a_failed_cancel_leaves_no_tk_object_for_another_thread(
+    first_cancel_fails: list[tuple[str, bool]],
+) -> None:
+    send = _send("<KeyPress-y>", "<KeyPress-n>", "<KeyPress-u>")
+    gc.disable()  # only the review's own clean-up may free it
+    try:
+        spotcheck.WindowReviewer(driver=send).attributes(_crops([1]), time.monotonic() + WAIT_S)
+        assert first_cancel_fails
+        root = weakref.ref(send.root)
+        del send
+        assert root() is None
+    finally:
+        gc.enable()

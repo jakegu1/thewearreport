@@ -1754,10 +1754,16 @@ class WindowReviewer:
                     window.close()  # deletes the image now: Tk calls stay in this thread
                 with contextlib.suppress(AttributeError):
                     del root.report_callback_exception  # the root's reference to the window
+                # Cancel what is still scheduled, or Tcl runs it after the window is gone.
+                # One suppression per callback: one that ran meanwhile must not skip the
+                # rest, nor the destroy.
+                pending: tuple[str, ...] = ()
                 with contextlib.suppress(tk.TclError):
-                    # Cancel what is still scheduled, or Tcl runs it after the window is gone.
-                    for pending in root.tk.splitlist(root.tk.call("after", "info")):
-                        root.after_cancel(pending)
+                    pending = root.tk.splitlist(root.tk.call("after", "info"))
+                for scheduled in pending:
+                    with contextlib.suppress(tk.TclError):
+                        root.after_cancel(scheduled)
+                with contextlib.suppress(tk.TclError):
                     root.destroy()
                 # Tcl objects must be freed in this thread. Left in a reference cycle, they
                 # would be freed by whichever thread next runs the garbage collector (a
