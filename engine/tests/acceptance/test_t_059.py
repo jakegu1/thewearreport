@@ -363,7 +363,7 @@ def test_ac1_the_detector_takes_a_whole_1080p_frame() -> None:
 
 
 def test_ac2_the_sources() -> None:
-    assert spotcheck.SOURCES == ("london", "austin")
+    assert spotcheck.SOURCES == ("london", "austin", "calgary")
     args = spotcheck.build_parser().parse_args(["--n", "1"])
     assert args.source == "london"
 
