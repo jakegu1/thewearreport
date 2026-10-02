@@ -63,6 +63,10 @@ import numpy.typing as npt
 from wearreport import aggregate, detect, fetch, registry
 from wearreport._cv import MAX_IMAGE_PIXELS, cv2
 
+# The sweep's scan limit and marker, defined in fetch and re-exported here.
+from wearreport.fetch import JPEG_SOS as JPEG_SOS
+from wearreport.fetch import MAX_SCANS as MAX_SCANS
+
 SOURCE = "austin"
 DATASET_HOST = "data.austintexas.gov"
 DATASET_URL = f"https://{DATASET_HOST}/resource/b4k4-adkb.json?camera_status=TURNED_ON&$limit=2000"
@@ -99,12 +103,6 @@ HD = (1920, 1080)
 # The largest frame area a header may declare. The JPEG decoder holds a progressive or
 # multi-scan frame's coefficients at full size, however much it reduces the output.
 MAX_HEADER_PIXELS = 4_000_000
-# The most start-of-scan markers (FF DA) a body may hold. The decoder's work grows with
-# the number of scans times the declared area, and it cannot be interrupted; a baseline
-# frame has one scan and the engine's progressive encoder writes about ten. Counted over
-# the whole body, so anything that adds markers (a thumbnail) only makes it stricter.
-MAX_SCANS = 32
-JPEG_SOS = b"\xff\xda"
 
 # The JPEG decoder's reduced-size modes, smallest reduction first.
 REDUCTIONS: tuple[tuple[int, int], ...] = (
@@ -361,7 +359,7 @@ def decode_frame(body: bytes) -> _Decoded:
     width, height = size
     if width * height > MAX_HEADER_PIXELS:
         raise _Failed("decode")
-    if body.count(JPEG_SOS) > MAX_SCANS:
+    if fetch.count_scans(body) > fetch.MAX_SCANS:
         raise _Failed("decode")  # before decoding: each scan costs a pass over the frame
     fits = [
         (flag, -(-width // factor), -(-height // factor))

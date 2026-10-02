@@ -294,6 +294,27 @@ def test_decode_reuses_the_sweeps_markers() -> None:
         ph.decode_frame(body)
 
 
+def test_scan_limit_and_marker_come_from_the_sweep() -> None:
+    assert (ph.MAX_SCANS, ph.JPEG_SOS) == (fetch.MAX_SCANS, fetch.JPEG_SOS)
+
+
+@pytest.mark.parametrize("marker", [0xE1, 0xFE], ids=["APP1", "COM"])
+def test_decode_counts_scan_markers_inside_skipped_segments(
+    monkeypatch: pytest.MonkeyPatch, marker: int
+) -> None:
+    body = _jpeg(64, 48)
+    payload = ph.JPEG_SOS * ph.MAX_SCANS  # with the one real scan: one over the limit
+    segment = bytes([0xFF, marker]) + (2 + len(payload)).to_bytes(2, "big") + payload
+    body = body[:2] + segment + body[2:]
+    assert ph.jpeg_size(body) == (64, 48)
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
+
+
 # Camera list --------------------------------------------------------------------------
 
 
