@@ -13,10 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from wearreport import detect
-from wearreport._cv import encode_jpeg
+from wearreport._cv import cv2, encode_jpeg
 from wearreport.tools import pilot_heights, spotcheck
 
 INSIDE = [-97.745, 30.270]  # lon, lat: inside the default box
@@ -134,6 +135,70 @@ def test_closing_early_stops_the_pass(host: Host) -> None:
     time.sleep(0.2)
     with host.lock:
         assert host.hits.count("/a") <= 4  # at most the window in flight, never all 20
+
+
+def _many_scans(extra: int) -> bytes:
+    """A progressive all-black 1920x1080 JPEG with `extra` copies of its smallest scan
+    appended before the end-of-image marker: small to send, slow to decode."""
+    image = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_PROGRESSIVE, 1])
+    assert ok
+    body = buf.tobytes()
+    starts = [i for i in range(len(body) - 1) if body[i : i + 2] == pilot_heights.JPEG_SOS]
+    ends = [body.index(b"\xff", start + 4 + body[start + 3]) for start in starts]
+    smallest = min((body[a:b] for a, b in zip(starts, ends, strict=True)), key=len)
+    body = body[:-2] + smallest * extra + b"\xff\xd9"
+    assert len(body) < 1024 * 1024
+    return body
+
+
+def test_multi_scan_stills_never_outlive_the_deadline(
+    host: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[int] = []
+    imdecode = cv2.imdecode
+
+    def spy(buf: npt.NDArray[np.uint8], flags: int) -> object:
+        calls.append(len(buf))
+        return imdecode(buf, flags)
+
+    monkeypatch.setattr(cv2, "imdecode", spy)
+    host.routes |= {"/a": (200, _many_scans(8_000)), "/b": (200, _many_scans(100))}
+    endpoints = host.endpoints(["/a", "/b"])
+    timeout_s = 2.0
+    started = time.monotonic()
+    frames = list(
+        spotcheck.austin_frames(endpoints, pilot_heights.DEFAULT_BBOX, timeout_s=timeout_s)
+    )
+    assert time.monotonic() - started < timeout_s + 1
+    assert frames == []
+    assert "2 failed" in capsys.readouterr().err
+    seen = len(calls)
+    time.sleep(0.5)
+    assert len(calls) == seen == 0  # refused before decoding, and nothing decodes later
+
+
+def test_only_1080p_headers_reach_the_decoder(
+    host: Host, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    decoded: list[tuple[int, int] | None] = []
+    decode_frame = pilot_heights.decode_frame
+
+    def spy(body: bytes) -> pilot_heights._Decoded:
+        decoded.append(pilot_heights.jpeg_size(body))
+        return decode_frame(body)
+
+    monkeypatch.setattr(pilot_heights, "decode_frame", spy)
+    host.routes |= {
+        "/a": (200, _jpeg(320, 176)),
+        "/b": (200, _jpeg(2560, 1440)),
+        "/c": (200, _jpeg(1920, 1080)),
+    }
+    endpoints = host.endpoints(["/a", "/b", "/c"])
+    frames = list(spotcheck.austin_frames(endpoints, pilot_heights.DEFAULT_BBOX))
+    assert [f.shape for f in frames] == [(1080, 1920, 3)]
+    assert decoded == [(1920, 1080)]
+    assert "2 not 1920x1080 (skipped)" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

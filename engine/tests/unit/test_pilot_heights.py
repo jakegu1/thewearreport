@@ -234,6 +234,59 @@ def test_header_bound_holds_for_every_frame_type(
     assert calls == []
 
 
+def _scans(body: bytes) -> list[bytes]:
+    """Each scan of a JPEG: its start-of-scan segment and the entropy-coded data after it,
+    up to the next marker (FF 00 is a stuffed zero, FF D0-D7 a restart marker)."""
+    scans = []
+    start = body.find(ph.JPEG_SOS)
+    while start >= 0:
+        end = start + 2 + int.from_bytes(body[start + 2 : start + 4], "big")
+        while not (body[end] == 0xFF and body[end + 1] not in {0x00, *range(0xD0, 0xD8)}):
+            end += 1
+        scans.append(body[start:end])
+        start = body.find(ph.JPEG_SOS, end)
+    return scans
+
+
+def _with_scans(total: int) -> bytes:
+    """A progressive 1920x1080 JPEG made to hold `total` scans, by repeating its smallest
+    scan before the end-of-image marker (the decoder only warns about such a body)."""
+    image = np.random.default_rng(0).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_PROGRESSIVE, 1])
+    assert ok
+    body = buf.tobytes()
+    scans = _scans(body)
+    assert len(scans) < total and body.endswith(b"\xff\xd9")
+    smallest = min(scans, key=len)
+    body = body[:-2] + smallest * (total - len(scans)) + b"\xff\xd9"
+    assert body.count(ph.JPEG_SOS) == total
+    return body
+
+
+def test_scan_limit_is_32() -> None:
+    assert ph.MAX_SCANS == 32
+    assert ph.JPEG_SOS == b"\xff\xda"
+
+
+def test_decode_refuses_more_than_32_scans_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _with_scans(ph.MAX_SCANS + 1)
+    assert ph.jpeg_size(body) == (1920, 1080)
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
+
+
+def test_decode_accepts_exactly_32_scans() -> None:
+    decoded = ph.decode_frame(_with_scans(ph.MAX_SCANS))
+    assert decoded.frame.shape == (1080, 1920, 3)
+    assert (decoded.width, decoded.height) == (1920, 1080)
+
+
 def test_decode_reuses_the_sweeps_markers() -> None:
     assert fetch.JPEG_SOI == b"\xff\xd8\xff" and fetch.JPEG_EOI == b"\xff\xd9"
     body = _jpeg(64, 48) + b"\0" * (fetch.EOI_WINDOW + 1)  # end marker too far from the end

@@ -29,10 +29,11 @@ Safety:
   its size, the smallest reduction that fits under the cap; the cap itself still
   applies. A header that declares more than `MAX_HEADER_PIXELS` (four million pixels;
   2560x1440 still fits) is refused before any decoding, since the decoder holds a
-  progressive frame's coefficients at full size whatever the reduction. The detector
-  letterboxes every frame to 640x640 anyway (a 1920x1080 frame to 640x360), and box
-  heights are scaled back to pixels of the original frame, whose size is read from the
-  JPEG header.
+  progressive frame's coefficients at full size whatever the reduction. A body with more
+  than `MAX_SCANS` (32) start-of-scan markers is refused before any decoding too, since
+  each scan costs the decoder a pass over the whole frame. The detector letterboxes every
+  frame to 640x640 anyway (a 1920x1080 frame to 640x360), and box heights are scaled back
+  to pixels of the original frame, whose size is read from the JPEG header.
 
 The spot-check tool's Austin attribute sessions (`--attributes --source austin`) reuse the
 camera list, the selection, the URL policies, the download (`download_within`), the
@@ -98,6 +99,12 @@ HD = (1920, 1080)
 # The largest frame area a header may declare. The JPEG decoder holds a progressive or
 # multi-scan frame's coefficients at full size, however much it reduces the output.
 MAX_HEADER_PIXELS = 4_000_000
+# The most start-of-scan markers (FF DA) a body may hold. The decoder's work grows with
+# the number of scans times the declared area, and it cannot be interrupted; a baseline
+# frame has one scan and the engine's progressive encoder writes about ten. Counted over
+# the whole body, so anything that adds markers (a thumbnail) only makes it stricter.
+MAX_SCANS = 32
+JPEG_SOS = b"\xff\xda"
 
 # The JPEG decoder's reduced-size modes, smallest reduction first.
 REDUCTIONS: tuple[tuple[int, int], ...] = (
@@ -354,6 +361,8 @@ def decode_frame(body: bytes) -> _Decoded:
     width, height = size
     if width * height > MAX_HEADER_PIXELS:
         raise _Failed("decode")
+    if body.count(JPEG_SOS) > MAX_SCANS:
+        raise _Failed("decode")  # before decoding: each scan costs a pass over the frame
     fits = [
         (flag, -(-width // factor), -(-height // factor))
         for factor, flag in REDUCTIONS
