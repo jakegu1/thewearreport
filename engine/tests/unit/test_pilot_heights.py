@@ -98,7 +98,7 @@ def test_real_1080p_frames_still_decode(progressive: bool, segments: bool) -> No
     body = _with_segments(buf.tobytes()) if segments else buf.tobytes()
     assert ph.jpeg_size(body) == (1920, 1080)
     decoded = ph.decode_frame(body)
-    assert decoded.frame.shape == (540, 960, 3)
+    assert decoded.frame.shape == (1080, 1920, 3)
     assert (decoded.width, decoded.height) == (1920, 1080)
 
 
@@ -135,9 +135,9 @@ def test_small_frames_decode_at_full_size() -> None:
 @pytest.mark.parametrize(
     ("width", "height", "shape"),
     [
-        (1920, 1080, (540, 960, 3)),
+        (1920, 1080, (1080, 1920, 3)),
         (1000, 1000, (1000, 1000, 3)),  # exactly the cap
-        (1001, 1000, (500, 501, 3)),
+        (1001, 1000, (1000, 1001, 3)),
         (2560, 1440, (720, 1280, 3)),
         (2000, 2000, (1000, 1000, 3)),  # exactly the header bound
         (1921, 1081, (541, 961, 3)),  # odd sizes round up
@@ -364,6 +364,22 @@ def test_heights_scale_back_to_the_original_frame() -> None:
     assert tally.bands_hd == tally.bands
     assert (tally.persons, tally.umbrellas, tally.frames_ok) == (2, 1, 1)
     assert tally.resolutions == {"1920x1080": 1}
+
+
+def test_a_reduced_decode_scales_heights_back_to_the_header_size() -> None:
+    assert MAX_IMAGE_PIXELS < 2560 * 1440 <= ph.MAX_HEADER_PIXELS
+    decoded = ph.decode_frame(_jpeg(2560, 1440))
+    assert decoded.frame.shape == (720, 1280, 3)
+    assert (decoded.width, decoded.height) == (2560, 1440)
+    tally = ph.Tally()
+    found = [
+        detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 22.6)),  # 45.2 px -> 45
+        detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 22.8)),  # 45.6 px -> 46
+    ]
+    tally.add(decoded, found)
+    assert tally.bands == {"31-45": 1, "46-79": 1}
+    assert tally.bands_hd == {}
+    assert tally.resolutions == {"2560x1440": 1}
 
 
 def test_report_rounds_and_orders() -> None:

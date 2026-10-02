@@ -200,8 +200,8 @@ def test_read_source_refuses_bad_files(tmp_path: Path) -> None:
     source = _write_source(tmp_path, encoded.tobytes())
     with pytest.raises(goldset.GoldsetError, match="400x600"):
         goldset.read_source(source, tmp_path)
-    _, encoded = cv2.imencode(".png", np.zeros((1100, 1000, 3), np.uint8))
-    big = _write_source(tmp_path, encoded.tobytes(), width=1000, height=1100)
+    _, encoded = cv2.imencode(".png", np.zeros((1081, 1920, 3), np.uint8))
+    big = _write_source(tmp_path, encoded.tobytes(), width=1920, height=1081)
     with pytest.raises(goldset.GoldsetError):  # over the decoder's pixel cap
         goldset.read_source(big, tmp_path)
 
