@@ -102,7 +102,8 @@ def test_frames_are_full_resolution_and_counted(
     err = capsys.readouterr().err
     assert "4 Austin cameras listed, 4 selected" in err
     assert (
-        "fetched 1 1920x1080 frame(s) of 4: 1 not 1920x1080 (skipped), 2 failed, 0 refused" in err
+        "fetched 1 1920x1080 frame(s) of 4: 1 not 1920x1080 (skipped), "
+        "2 failed (http 1, decode 1), 0 refused" in err
     )
     assert "127.0.0.1" not in err
 
