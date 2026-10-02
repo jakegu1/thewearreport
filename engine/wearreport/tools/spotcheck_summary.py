@@ -63,11 +63,13 @@ only), and prints, for each attribute (outer layer, bare legs, open umbrella):
   only (dark files are left out). The attribute threshold is chosen from these lines.
 
 Sources are never pooled. A London file has exactly the fields above; an Austin file
-(from an attribute session with `--source austin`) has them and `"source": "austin"`; any other
-source is malformed. The London files are summarised first, exactly as without Austin
+(from an attribute session with `--source austin`) has them and `"source": "austin"`, a
+Calgary file (`--source calgary`) them and `"source": "calgary"`; any other source is
+malformed. The London files are summarised first, exactly as without Austin or Calgary
 files; then, only if there is an Austin file, the Austin files on their own, after an empty
-line, with their own counts, measures and verdicts. The data branch holds London's weather
-only, so the Austin section has no rain lines, with or without `--data-dir`.
+line, with their own counts, measures and verdicts; then, likewise, the Calgary files. The
+data branch holds London's weather only, so the Austin and Calgary sections have no rain
+lines, with or without `--data-dir`.
 """
 
 from __future__ import annotations
@@ -143,8 +145,9 @@ ATTRIBUTE_FIELDS = frozenset(
     }
 )
 ATTRIBUTE_NAMES = ("outer_layer", "bare_legs", "umbrella")  # the letters' order
-# Where an attribute file's frames came from: London (no source key) or Austin.
-SOURCES = ("london", "austin")
+# Where an attribute file's frames came from: London (no source key), Austin or Calgary,
+# in the order the summary reports them.
+SOURCES = ("london", "austin", "calgary")
 MIN_POSITIVES = 30  # reviewer yes, among the crops the model answered
 MIN_NEGATIVES = 30  # reviewer no, among them
 MIN_LABELLED = 200  # reviewer yes or no, among them
@@ -763,9 +766,9 @@ def parse_labelling(raw: bytes) -> Labelling:
     fields = set(data)
     source = "london"
     if "source" in fields:
-        if not isinstance(data["source"], str) or data["source"] != "austin":
-            raise ValueError('source is not "austin" (a London file has no source)')
-        source = "austin"
+        if not isinstance(data["source"], str) or data["source"] not in SOURCES[1:]:
+            raise ValueError('source is not "austin" or "calgary" (a London file has no source)')
+        source = data["source"]
         fields.discard("source")
     if fields != ATTRIBUTE_FIELDS:
         raise ValueError("its fields are not " + ", ".join(sorted(ATTRIBUTE_FIELDS)))
@@ -982,19 +985,21 @@ def attributes_report(
 
 
 def _attributes_main(directory: Path, data_dir: Path | None) -> int:
-    """London's section, then Austin's if there is an Austin file (see the docstring)."""
+    """London's section, then Austin's if there is an Austin file, then Calgary's if
+    there is a Calgary file (see the docstring)."""
     try:
         labellings = load_labellings(directory)
         london = [s for s in labellings if s.source == "london"]
-        austin = [s for s in labellings if s.source == "austin"]
         if data_dir is not None:
             london = with_rain(london, data_dir)
     except SummaryError as exc:
         print(f"summary: {exc}", file=sys.stderr)
         return 1
     lines = attributes_report(london, directory, data_dir is not None)
-    if austin:
-        lines += ["", *attributes_report(austin, directory, False, "austin")]
+    for source in SOURCES[1:]:
+        files = [s for s in labellings if s.source == source]
+        if files:
+            lines += ["", *attributes_report(files, directory, False, source)]
     for line in lines:
         print(line)
     return 0

@@ -324,6 +324,14 @@ below and `"source": "austin"`; the [attribute summary](#attribute-summary) repo
 apart from London's, after it, without rain lines. `--dry-run` serves a fake Austin on
 127.0.0.1. `--source london`, the default, is unchanged.
 
+`--source calgary` does the same on the City of Calgary's traffic cameras, inside `--bbox`
+(default downtown Calgary): only stills whose header is exactly 840x630 are shown, the list's
+`http://` still URLs are fetched as `https://` from the same host only, and Calgary's sun
+decides the daylight check and `light`. The file is `YYYY-MM-DD-calgary.json` (then
+`-calgary-2`, ...) with `"source": "calgary"`, and the summary reports it on its own after
+London's and Austin's. `python -m wearreport.tools.pilot_heights --live --source calgary`
+measures the same cameras' person heights, counts only.
+
 ### Box height (`--min-height`)
 
 In daylight most crops under about 41 px cannot be judged for clothing, so the reviewer

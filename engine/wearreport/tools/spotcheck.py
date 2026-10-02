@@ -4,7 +4,7 @@
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
-      [--confirm-stop] [--allow-dark] [--source london|austin] [--bbox S,W,N,E]
+      [--confirm-stop] [--allow-dark] [--source london|austin|calgary] [--bbox S,W,N,E]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -101,10 +101,16 @@ screen (`display_size`), and the daylight check and the record's `light` use Aus
 sun. The record is `<out-dir>/attributes/YYYY-MM-DD-austin.json` (then `-austin-2`, ...)
 and ends with `"source": "austin"`. `--source london`, the default, is unchanged.
 
+`--source calgary` does the same with the City of Calgary's traffic cameras (inside
+`--bbox`, default downtown Calgary) and Calgary's sun: only stills whose header declares
+840x630 are kept, and the record is `<out-dir>/attributes/YYYY-MM-DD-calgary.json` (then
+`-calgary-2`, ...), ending with `"source": "calgary"`.
+
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
 in fixtures/detect/ (no network); with `--source austin`, a fake Austin camera list and
-1920x1080 stills made from them, and placeholders. Its statistics describe those photos, not the
-cameras, so it needs an `--out-dir` other than spotchecks/.
+1920x1080 stills made from them, and placeholders; with `--source calgary`, the same at
+840x630. Its statistics describe those photos, not the cameras, so it needs an `--out-dir`
+other than spotchecks/.
 """
 
 from __future__ import annotations
@@ -187,8 +193,9 @@ MODES: tuple[Mode, ...] = get_args(Mode)
 View = Literal["files", "window"]
 VIEWS: tuple[View, ...] = get_args(View)
 # Where the frames come from: TfL's JamCams, or (attribute sessions only) the City of
-# Austin's HD traffic cameras, fetched as `pilot_heights` fetches them.
-Source = Literal["london", "austin"]
+# Austin's HD traffic cameras or the City of Calgary's, fetched as `pilot_heights` fetches
+# them.
+Source = Literal["london", "austin", "calgary"]
 SOURCES: tuple[Source, ...] = get_args(Source)
 Frame = npt.NDArray[np.uint8]
 
@@ -308,6 +315,7 @@ BOXES_DIR = "boxes"  # the per-box files, in the statistics directory
 # "dark".
 LONDON = (51.5074, -0.1278)  # latitude and longitude, degrees (west negative)
 AUSTIN = pilot_heights.AUSTIN  # central Austin, for Austin sessions
+CALGARY = pilot_heights.CALGARY  # central Calgary, for Calgary sessions
 LIGHT_DAY_DEG = 0.0
 LIGHT_TWILIGHT_DEG = -6.0
 
@@ -341,6 +349,9 @@ AUSTIN_FETCH_TIMEOUT_S = float(pilot_heights.DEFAULT_TIMEOUT_S)
 AUSTIN_FILE_SUFFIX = "-austin"  # the attribute file is <date>-austin.json, then -2, ...
 DRY_RUN_AUSTIN_CAMERAS = 6
 DRY_RUN_PLACEHOLDER = (320, 176)  # width, height
+# Calgary sessions (--source calgary): the same, at Calgary's frame size.
+CALGARY_FRAME_SIZE = pilot_heights.CALGARY_FRAME_SIZE  # width, height
+CALGARY_FILE_SUFFIX = "-calgary"  # the attribute file is <date>-calgary.json, then -2, ...
 
 
 class SpotcheckError(RuntimeError):
@@ -558,26 +569,50 @@ class AustinEndpoints:
     image_policy: pilot_heights.UrlPolicy = pilot_heights.SCREENSHOT_POLICY
 
 
+@dataclass(frozen=True, slots=True)
+class CalgaryEndpoints:
+    """Where a Calgary session's camera list and stills come from, and the URL policies
+    they must meet (tests: a server on 127.0.0.1)."""
+
+    dataset_url: str = pilot_heights.CALGARY_DATASET_URL
+    dataset_policy: pilot_heights.UrlPolicy = pilot_heights.CALGARY_DATASET_POLICY
+    image_policy: pilot_heights.UrlPolicy = pilot_heights.CALGARY_IMAGE_POLICY
+
+
+CityEndpoints = AustinEndpoints | CalgaryEndpoints
+StillFetcher = Callable[[str, str, float], Frame]
+
+
 class _NotHD(Exception):
-    """A still whose header declares a size other than AUSTIN_FRAME_SIZE."""
+    """A still whose header declares a size other than its city's frame size."""
 
 
-def _austin_still(url: str, scheme: str, end: float) -> Frame:
-    """One Austin still, fetched once and decoded in memory at full resolution. Raises
-    _NotHD for any other declared size (before decoding), and pilot_heights' FrameRefused
-    or FrameFailed as its pass would count them."""
+def _city_still(url: str, scheme: str, end: float, frame_size: tuple[int, int]) -> Frame:
+    """One still, fetched once and decoded in memory at full resolution. Raises _NotHD
+    for any declared size other than `frame_size` (before decoding), and pilot_heights'
+    FrameRefused or FrameFailed as its pass would count them."""
     body = pilot_heights.download_within(url, scheme, end)
     try:
         size = pilot_heights.jpeg_size(body)
-        if size is not None and size != AUSTIN_FRAME_SIZE:
+        if size is not None and size != frame_size:
             raise _NotHD
         decoded = pilot_heights.decode_frame(body)  # the header allowlist and bound, too
     finally:
         del body
-    width, height = AUSTIN_FRAME_SIZE
+    width, height = frame_size
     if decoded.frame.shape[:2] != (height, width):
         raise _NotHD  # never a reduced frame: crops come from full-resolution pixels
     return decoded.frame
+
+
+def _austin_still(url: str, scheme: str, end: float) -> Frame:
+    """One Austin still (see _city_still)."""
+    return _city_still(url, scheme, end, AUSTIN_FRAME_SIZE)
+
+
+def _calgary_still(url: str, scheme: str, end: float) -> Frame:
+    """One Calgary still (see _city_still)."""
+    return _city_still(url, scheme, end, CALGARY_FRAME_SIZE)
 
 
 def _austin_result(future: Future[Frame], counts: Counter[str]) -> Frame | None:
@@ -611,9 +646,50 @@ def austin_frames(
     timeout_s: float = AUSTIN_FETCH_TIMEOUT_S,
     concurrency: int = pilot_heights.CONCURRENCY,
 ) -> Generator[Frame]:
-    """The 1920x1080 stills of the Austin cameras inside `bbox`, as they arrive. The
-    camera list, the selection (at most pilot_heights.DEFAULT_MAX_CAMERAS cameras), the
-    URL policies, one attempt per camera and the body cap are pilot_heights'. At most
+    """The 1920x1080 stills of the Austin cameras inside `bbox`, as they arrive (see
+    city_frames)."""
+    return city_frames(
+        pilot_heights.AUSTIN_CITY,
+        endpoints,
+        bbox,
+        _austin_still,
+        timeout_s=timeout_s,
+        concurrency=concurrency,
+    )
+
+
+def calgary_frames(
+    endpoints: CalgaryEndpoints,
+    bbox: pilot_heights.BBox,
+    *,
+    timeout_s: float = AUSTIN_FETCH_TIMEOUT_S,
+    concurrency: int = pilot_heights.CONCURRENCY,
+) -> Generator[Frame]:
+    """The 840x630 stills of the Calgary cameras inside `bbox`, as they arrive (see
+    city_frames)."""
+    return city_frames(
+        pilot_heights.CALGARY_CITY,
+        endpoints,
+        bbox,
+        _calgary_still,
+        timeout_s=timeout_s,
+        concurrency=concurrency,
+    )
+
+
+def city_frames(
+    city: pilot_heights.City,
+    endpoints: CityEndpoints,
+    bbox: pilot_heights.BBox,
+    still: StillFetcher,
+    *,
+    timeout_s: float = AUSTIN_FETCH_TIMEOUT_S,
+    concurrency: int = pilot_heights.CONCURRENCY,
+) -> Generator[Frame]:
+    """The stills of `city`'s cameras inside `bbox` whose header declares the city's
+    frame size, fetched by `still`, as they arrive. The camera list and its record
+    fields, the selection (at most pilot_heights.DEFAULT_MAX_CAMERAS cameras), the URL
+    policies, one attempt per camera and the body cap are pilot_heights'. At most
     `concurrency` stills are being fetched or waiting at a time, and nothing is kept once
     handed on. Prints counts only: never a URL, a camera or image data."""
     end = time.monotonic() + timeout_s
@@ -624,24 +700,28 @@ def austin_frames(
             min(pilot_heights.DATASET_TIMEOUT_S, timeout_s),
         )
     except pilot_heights.PilotError as exc:
-        raise SpotcheckError(f"cannot list the Austin cameras: {exc}") from None
+        raise SpotcheckError(f"cannot list the {city.title} cameras: {exc}") from None
     selection = pilot_heights.select_cameras(
-        records, bbox, policy=endpoints.image_policy, max_cameras=pilot_heights.DEFAULT_MAX_CAMERAS
+        records,
+        bbox,
+        policy=endpoints.image_policy,
+        max_cameras=pilot_heights.DEFAULT_MAX_CAMERAS,
+        fields=(city.url_field, city.point_field),
     )
     del records
     _progress(
-        f"{selection.listed} Austin cameras listed, {len(selection.urls)} selected "
+        f"{selection.listed} {city.title} cameras listed, {len(selection.urls)} selected "
         f"({selection.skipped} malformed record(s) skipped, {selection.refused} URL(s) refused)"
     )
     counts: Counter[str] = Counter(refused=selection.refused)
     urls = iter(selection.urls)
     scheme = endpoints.image_policy.scheme
-    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="austin")
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=city.name)
     pending: set[Future[Frame]] = set()
 
     def submit() -> None:
         for url in urls:
-            pending.add(pool.submit(_austin_still, url, scheme, end))
+            pending.add(pool.submit(still, url, scheme, end))
             return
 
     try:
@@ -666,9 +746,10 @@ def austin_frames(
                 del frame
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+    size = "{}x{}".format(*city.frame_size)
     _progress(
-        f"fetched {counts['ok']} 1920x1080 frame(s) of {len(selection.urls)}: "
-        f"{counts['not_hd']} not 1920x1080 (skipped), {_failed_text(counts)}, "
+        f"fetched {counts['ok']} {size} frame(s) of {len(selection.urls)}: "
+        f"{counts['not_hd']} not {size} (skipped), {_failed_text(counts)}, "
         f"{counts['refused']} refused"
     )
 
@@ -680,12 +761,20 @@ def austin_pipeline(
     return Pipeline(frames=lambda: austin_frames(endpoints, bbox), detector=detector, info=info)
 
 
-def _hd_still(body: bytes) -> bytes:
-    """A licensed fixture photo, enlarged 1.5 times onto a grey 1920x1080 frame, as JPEG."""
+def calgary_pipeline(
+    model: str, bbox: pilot_heights.BBox, endpoints: CalgaryEndpoints, opener: DetectorOpener
+) -> Pipeline:
+    detector, info = opener(model)
+    return Pipeline(frames=lambda: calgary_frames(endpoints, bbox), detector=detector, info=info)
+
+
+def _hd_still(body: bytes, frame_size: tuple[int, int] = AUSTIN_FRAME_SIZE) -> bytes:
+    """A licensed fixture photo, enlarged 1.5 times (or less, to fit) onto a grey frame of
+    `frame_size` (1920x1080 by default), as JPEG."""
     photo = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
     if photo is None:
         raise SpotcheckError("cannot decode a dry-run fixture")
-    width, height = AUSTIN_FRAME_SIZE
+    width, height = frame_size
     scale = min(1.5, width / photo.shape[1], height / photo.shape[0])
     size = (int(photo.shape[1] * scale), int(photo.shape[0] * scale))
     photo = cv2.resize(photo, size, interpolation=cv2.INTER_LINEAR)
@@ -700,10 +789,26 @@ def dry_run_austin_pipeline(
 ) -> Pipeline:
     """A local fake Austin: a camera list and stills served on 127.0.0.1, the stills made
     from the licensed fixture photos, every third one a 320x176 placeholder; no network."""
+    return _dry_run_city_pipeline(pilot_heights.AUSTIN_CITY, model, bbox, opener)
+
+
+def dry_run_calgary_pipeline(
+    model: str, bbox: pilot_heights.BBox, opener: DetectorOpener
+) -> Pipeline:
+    """A local fake Calgary: as the fake Austin, with 840x630 stills."""
+    return _dry_run_city_pipeline(pilot_heights.CALGARY_CITY, model, bbox, opener)
+
+
+def _dry_run_city_pipeline(
+    city: pilot_heights.City, model: str, bbox: pilot_heights.BBox, opener: DetectorOpener
+) -> Pipeline:
     from wearreport.testing.fake_cameras import FakeCameraServer
 
     try:
-        stills = [_hd_still((FIXTURE_DIR / name).read_bytes()) for name in DRY_RUN_FIXTURES]
+        stills = [
+            _hd_still((FIXTURE_DIR / name).read_bytes(), city.frame_size)
+            for name in DRY_RUN_FIXTURES
+        ]
     except OSError as exc:
         raise SpotcheckError(f"cannot read the dry-run fixtures: {exc.strerror}") from None
     width, height = DRY_RUN_PLACEHOLDER
@@ -716,15 +821,21 @@ def dry_run_austin_pipeline(
         with FakeCameraServer() as server:
             records = []
             for i in range(DRY_RUN_AUSTIN_CAMERAS):
-                camera = f"austin-{i}"
+                camera = f"{city.name}-{i}"
                 body = placeholder if i % 3 == 2 else stills[i % len(stills)]
                 server.serve_body(camera, body)
                 location = {"type": "Point", "coordinates": where}
-                records.append({"screenshot_address": server.url(camera), "location": location})
+                records.append({city.url_field: server.url(camera), city.point_field: location})
             server.serve_body("cameras", json.dumps(records).encode())
             policy = pilot_heights.UrlPolicy("http", urllib.parse.urlsplit(server.base_url).netloc)
-            endpoints = AustinEndpoints(server.url("cameras"), policy, policy)
-            yield from austin_frames(endpoints, bbox)
+            if city is pilot_heights.CALGARY_CITY:
+                yield from calgary_frames(
+                    CalgaryEndpoints(server.url("cameras"), policy, policy), bbox
+                )
+            else:
+                yield from austin_frames(
+                    AustinEndpoints(server.url("cameras"), policy, policy), bbox
+                )
 
     return Pipeline(frames=frames, detector=detector, info=info)
 
@@ -2349,12 +2460,14 @@ def attribute_record(
 def sourced_record(
     record: dict[str, object], source: Source, started_at: datetime.datetime
 ) -> dict[str, object]:
-    """The attribute record of a `source` session: a London one as it is; an Austin one
-    with the light over Austin at the start of the sweep and `"source": "austin"` last."""
+    """The attribute record of a `source` session: a London one as it is; an Austin (or
+    Calgary) one with the light over Austin (Calgary) at the start of the sweep and
+    `"source": "austin"` (`"calgary"`) last."""
     if source == "london":
         return record
     minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
-    return {**record, "light": light_at(minute, AUSTIN), "source": source}
+    where = CALGARY if source == "calgary" else AUSTIN
+    return {**record, "light": light_at(minute, where), "source": source}
 
 
 # The light ----------------------------------------------------------------------------
@@ -2448,12 +2561,13 @@ def write_attributes(
     record: Mapping[str, object], out_dir: Path, day: datetime.date, source: Source = "london"
 ) -> Path:
     """Write `record` to a new `<out-dir>/attributes/<day>.json` (or `<day>-2.json`, ...),
-    or for Austin `<day>-austin.json` (or `<day>-austin-2.json`, ...); never overwrite.
-    Raises SpotcheckError, with the record in the message so it is not lost, if it cannot
-    be written."""
+    or for Austin `<day>-austin.json` (or `<day>-austin-2.json`, ...), for Calgary
+    `<day>-calgary.json` (...); never overwrite. Raises SpotcheckError, with the record in
+    the message so it is not lost, if it cannot be written."""
     directory = out_dir / ATTRIBUTES_DIR
     text = json.dumps(record, ensure_ascii=True) + "\n"
-    stem = day.isoformat() + (AUSTIN_FILE_SUFFIX if source == "austin" else "")
+    suffix = {"austin": AUSTIN_FILE_SUFFIX, "calgary": CALGARY_FILE_SUFFIX}.get(source, "")
+    stem = day.isoformat() + suffix
     try:
         return directory / _write_new([(directory, text)], day, stem)
     except OSError as exc:
@@ -2618,27 +2732,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SOURCES,
         default="london",
         help="with --attributes: austin labels crops of the City of Austin's 1920x1080 "
-        "traffic cameras instead of London's (default london)",
+        "traffic cameras instead of London's, calgary those of the City of Calgary's 840x630 "
+        "ones (default london)",
     )
     ap.add_argument(
         "--bbox",
         type=pilot_heights.parse_bbox,
         default=None,
         metavar="S,W,N,E",
-        help="with --source austin: the cameras inside this box, degrees (default: downtown "
-        "Austin)",
+        help="with --source austin or calgary: the cameras inside this box, degrees "
+        "(default: that city's downtown)",
     )
     return ap
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """The command line, checked. `--source austin` outside an attribute session and
-    `--bbox` without it are usage errors: exit 2 with the usage, as argparse's own."""
+    """The command line, checked. `--source austin` (or calgary) outside an attribute
+    session and `--bbox` without either are usage errors: exit 2 with the usage, as
+    argparse's own."""
     ap = build_parser()
     args = ap.parse_args(argv)
     if args.source == "austin" and not args.attributes:
         ap.error(AUSTIN_ATTRIBUTES_ONLY)
-    if args.bbox is not None and args.source != "austin":
+    if args.source == "calgary" and not args.attributes:
+        ap.error(CALGARY_ATTRIBUTES_ONLY)
+    if args.bbox is not None and args.source == "london":
         ap.error(BBOX_AUSTIN_ONLY)
     return args
 
@@ -2660,7 +2778,12 @@ AUSTIN_DARK_REFUSAL = (
     "it is dark in Austin now (sun below -6°); attribute sessions need daylight. "
     "Use --allow-dark to run anyway."
 )
+CALGARY_DARK_REFUSAL = (
+    "it is dark in Calgary now (sun below -6°); attribute sessions need daylight. "
+    "Use --allow-dark to run anyway."
+)
 AUSTIN_ATTRIBUTES_ONLY = "--source austin works in attribute sessions only; add --attributes"
+CALGARY_ATTRIBUTES_ONLY = "--source calgary works in attribute sessions only; add --attributes"
 BBOX_AUSTIN_ONLY = "--bbox selects Austin cameras; it needs --source austin"
 ATTRIBUTES_KEYBOARD_REFUSAL = (
     "--attributes takes its answers in the window (--view window) or from a JSON file "
@@ -2849,6 +2972,7 @@ def _run(
     clock: Callable[[], datetime.datetime] | None = None,
     austin: AustinEndpoints | None = None,
     opener: DetectorOpener | None = None,
+    calgary: CalgaryEndpoints | None = None,
 ) -> int:
     mode: Mode = args.mode
     clock = clock or _utcnow
@@ -2869,6 +2993,7 @@ def _run(
                 clock,
                 austin or AustinEndpoints(),
                 opener or _open_detector,
+                calgary,
             )
         finally:
             if attribute_judge is not None:
@@ -2905,13 +3030,18 @@ def _confirming[T](args: argparse.Namespace, view: View, reviewer: T) -> T:
 def check_light(args: argparse.Namespace, clock: Callable[[], datetime.datetime]) -> None:
     """Refuse an attribute session whose answers are taken live (not from --judgements)
     when it is dark at `clock()` where its frames come from (London, or Austin with
-    `--source austin`), unless --allow-dark is given: after dark most near-field crops
-    cannot be judged. Raises SpotcheckError before anything else happens."""
+    `--source austin`, or Calgary with `--source calgary`), unless --allow-dark is given:
+    after dark most near-field crops cannot be judged. Raises SpotcheckError before
+    anything else happens."""
     if args.judgements is not None or args.allow_dark:
         return
-    if getattr(args, "source", "london") == "austin":
+    source = getattr(args, "source", "london")
+    if source == "austin":
         if light_at(clock(), AUSTIN) == "dark":
             raise SpotcheckError(AUSTIN_DARK_REFUSAL)
+    elif source == "calgary":
+        if light_at(clock(), CALGARY) == "dark":
+            raise SpotcheckError(CALGARY_DARK_REFUSAL)
     elif light_at(clock()) == "dark":
         raise SpotcheckError(DARK_REFUSAL)
 
@@ -2953,10 +3083,12 @@ def _open_pipeline(
     guard: _SignalGuard,
     austin: AustinEndpoints | None = None,
     opener: DetectorOpener | None = None,
+    calgary: CalgaryEndpoints | None = None,
 ) -> Pipeline:
     """Delete what earlier runs left behind, then open the pipeline (unless given): with
     `--source austin`, Austin's stills from `austin` (a local fake one with --dry-run),
-    detected by the detector `opener` opens."""
+    with `--source calgary`, Calgary's from `calgary` (likewise), detected by the detector
+    `opener` opens."""
     removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
     if removed:
         print(f"Deleted {removed} review directories left by earlier runs.")
@@ -2968,6 +3100,12 @@ def _open_pipeline(
         if args.dry_run:
             return dry_run_austin_pipeline(args.model, bbox, opener)
         return austin_pipeline(args.model, bbox, austin or AustinEndpoints(), opener)
+    if getattr(args, "source", "london") == "calgary":
+        opener = opener or _open_detector
+        bbox = pilot_heights.CALGARY_BBOX if args.bbox is None else args.bbox
+        if args.dry_run:
+            return dry_run_calgary_pipeline(args.model, bbox, opener)
+        return calgary_pipeline(args.model, bbox, calgary or CalgaryEndpoints(), opener)
     return dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
 
 
@@ -3088,17 +3226,19 @@ def _attribute_session(
     clock: Callable[[], datetime.datetime],
     austin: AustinEndpoints | None = None,
     opener: DetectorOpener | None = None,
+    calgary: CalgaryEndpoints | None = None,
 ) -> int:
     """Label the near-field crops of one sweep, then (with a judge) ask the model the same
     questions about the crops the reviewer did not reject; write the attribute file. With
-    `--source austin`, the sweep is one pass over Austin's 1920x1080 stills."""
+    `--source austin`, the sweep is one pass over Austin's 1920x1080 stills; with
+    `--source calgary`, over Calgary's 840x630 stills."""
     out_dir = _prepare(args)
     source: Source = getattr(args, "source", "london")
     labeller: AttributeReviewer
     if reviewer is None:
         if args.judgements is not None:
             labeller = _judgements_reviewer(args.judgements)
-        elif source == "austin":
+        elif source != "london":
             labeller = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop, fit_screen=True)
         else:
             labeller = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop)
@@ -3106,7 +3246,7 @@ def _attribute_session(
         labeller = reviewer
     else:
         raise SpotcheckError("the reviewer given cannot answer the attribute questions")
-    pipeline = _open_pipeline(args, pipeline, guard, austin, opener)
+    pipeline = _open_pipeline(args, pipeline, guard, austin, opener, calgary)
 
     min_height = NEAR_FIELD_MIN_HEIGHT_PX if args.min_height is None else args.min_height
     started_at = clock()
@@ -3184,14 +3324,16 @@ def main(
     clock: Callable[[], datetime.datetime] | None = None,
     austin: AustinEndpoints | None = None,
     open_detector: DetectorOpener | None = None,
+    calgary: CalgaryEndpoints | None = None,
 ) -> int:
     """Run one spot-check (or, with `--attributes`, one attribute session). `pipeline` and
     `reviewer` replace the live ones (an attribute session needs an AttributeReviewer),
     `judge_endpoint`, `judge_timeout` and `judge_sleep` the judge's origin, request timeout
     and wait between retries (tests: a fake judge on this machine), and `clock` the UTC
     clock that dates the start of the sweep. With `--source austin`, `austin` replaces
-    Austin's camera list and stills (tests: a server on this machine) and `open_detector`
-    the detector (`model` -> detector and its DetectorInfo)."""
+    Austin's camera list and stills (tests: a server on this machine), with
+    `--source calgary`, `calgary` Calgary's, and `open_detector` the detector (`model` ->
+    detector and its DetectorInfo)."""
     ci = _ci_variables()
     if ci:
         print(
@@ -3207,7 +3349,9 @@ def main(
             guard.install()
             setup = JudgeSetup(judge_endpoint, judge_timeout, judge_sleep)
             day = today or datetime.date.today()
-            return _run(args, pipeline, reviewer, day, guard, setup, clock, austin, open_detector)
+            return _run(
+                args, pipeline, reviewer, day, guard, setup, clock, austin, open_detector, calgary
+            )
         finally:
             # Nothing may interrupt the handlers below. A signal that lands before
             # stop() is raised here, is the last one raised, and is caught below.
