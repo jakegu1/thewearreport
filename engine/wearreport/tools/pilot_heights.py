@@ -8,6 +8,15 @@ counts to stdout: frames, resolutions, persons and umbrellas, and person box hei
 bands. Nothing else is stored, logged or published. It is a measurement only: no
 workflow runs it, and nothing it prints reaches the data branch.
 
+`--source calgary` runs the same pass on the City of Calgary's traffic cameras (one
+keyless request to its open-data portal, the cameras inside downtown Calgary by default,
+their 840x630 stills from the one host the list uses) with Calgary's sun. The output has
+the same keys in the same order and `"source": "calgary"`, except that the bands counted
+on frames of exactly 840x630 replace those of 1920x1080, under
+`persons_by_height_band_840x630`. Calgary's list gives its stills' URLs as `http://`;
+such a URL on the pinned host is fetched as `https://`, and only so. `--source austin`
+is the default, and its output is unchanged.
+
 Privacy (AGENTS.md INV-1): frames exist only in memory and are dropped after detection.
 No image bytes, camera ids, URLs, coordinates or boxes are written, logged or printed;
 the output holds counts only.
@@ -35,9 +44,9 @@ Safety:
   frame to 640x640 anyway (a 1920x1080 frame to 640x360), and box heights are scaled back
   to pixels of the original frame, whose size is read from the JPEG header.
 
-The spot-check tool's Austin attribute sessions (`--attributes --source austin`) reuse the
-camera list, the selection, the URL policies, the download (`download_within`), the
-header reader and the decoder from here.
+The spot-check tool's Austin and Calgary attribute sessions (`--attributes --source
+austin|calgary`) reuse the camera lists, the selection, the URL policies, the download
+(`download_within`), the header reader and the decoder from here.
 """
 
 from __future__ import annotations
@@ -67,7 +76,7 @@ from wearreport._cv import MAX_IMAGE_PIXELS, cv2
 from wearreport.fetch import JPEG_SOS as JPEG_SOS
 from wearreport.fetch import MAX_SCANS as MAX_SCANS
 
-SOURCE = "austin"
+SOURCE = "austin"  # the default --source
 DATASET_HOST = "data.austintexas.gov"
 DATASET_URL = f"https://{DATASET_HOST}/resource/b4k4-adkb.json?camera_status=TURNED_ON&$limit=2000"
 # Every screenshot_address in the dataset was https on this host when the tool was written.
@@ -82,6 +91,15 @@ MAX_INT_DIGITS = 30
 
 AUSTIN = (30.2672, -97.7431)  # central Austin: latitude and longitude, degrees
 DEFAULT_BBOX = (30.260, -97.755, 30.285, -97.735)  # south, west, north, east
+
+# Calgary (--source calgary). About 216 cameras, every still 840x630.
+CALGARY_DATASET_HOST = "data.calgary.ca"
+CALGARY_DATASET_URL = f"https://{CALGARY_DATASET_HOST}/resource/k7p9-kppz.json"
+# The list gives each still as http:// on this host; the same path is served over https.
+CALGARY_IMAGE_HOST = "trafficcam.calgary.ca"
+CALGARY = (51.0447, -114.0719)  # central Calgary: latitude and longitude, degrees
+CALGARY_BBOX = (51.040, -114.095, 51.056, -114.045)  # downtown: south, west, north, east
+CALGARY_FRAME_SIZE = (840, 630)  # width, height
 DEFAULT_MAX_CAMERAS = 100
 MAX_CAMERAS = 1000
 DEFAULT_TIMEOUT_S = 600
@@ -137,10 +155,12 @@ class FrameDetector(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class UrlPolicy:
-    """The one scheme and network location a URL may have."""
+    """The one scheme and network location a URL may have, and optionally one other
+    scheme (`upgrade`) whose URLs are fetched with `scheme` instead."""
 
     scheme: str
     netloc: str
+    upgrade: str | None = None
 
     def allows(self, url: str) -> bool:
         """True for a printable-ASCII URL without spaces or backslashes whose scheme and
@@ -160,9 +180,71 @@ class UrlPolicy:
             and parts.path.startswith("/")
         )
 
+    def resolve(self, url: str) -> str | None:
+        """The URL to fetch for `url`: `url` itself if the policy allows it; with an
+        `upgrade` scheme, a URL of that scheme with its scheme replaced by `scheme`, if
+        the policy allows the result; otherwise None."""
+        if self.allows(url):
+            return url
+        if self.upgrade is None or url[: len(self.upgrade) + 1].lower() != self.upgrade + ":":
+            return None
+        upgraded = self.scheme + url[len(self.upgrade) :]
+        return upgraded if self.allows(upgraded) else None
+
 
 DATASET_POLICY = UrlPolicy("https", DATASET_HOST)
 SCREENSHOT_POLICY = UrlPolicy("https", SCREENSHOT_HOST)
+CALGARY_DATASET_POLICY = UrlPolicy("https", CALGARY_DATASET_HOST)
+CALGARY_IMAGE_POLICY = UrlPolicy("https", CALGARY_IMAGE_HOST, upgrade="http")
+
+
+@dataclass(frozen=True, slots=True)
+class City:
+    """One source of camera stills: its camera list, the record fields that hold a
+    still's URL and position, its URL policies, its default box, the frame size whose
+    bands are reported apart, and the point whose sun decides daylight."""
+
+    name: str
+    title: str
+    dataset_url: str
+    dataset_policy: UrlPolicy
+    image_policy: UrlPolicy
+    url_field: str
+    point_field: str
+    bbox: BBox
+    frame_size: tuple[int, int]  # width, height
+    bands_field: str  # the output key of the bands counted on frames of exactly that size
+    centre: tuple[float, float]
+
+
+AUSTIN_CITY = City(
+    name="austin",
+    title="Austin",
+    dataset_url=DATASET_URL,
+    dataset_policy=DATASET_POLICY,
+    image_policy=SCREENSHOT_POLICY,
+    url_field="screenshot_address",
+    point_field="location",
+    bbox=DEFAULT_BBOX,
+    frame_size=HD,
+    bands_field="persons_by_height_band_1080p",
+    centre=AUSTIN,
+)
+CALGARY_CITY = City(
+    name="calgary",
+    title="Calgary",
+    dataset_url=CALGARY_DATASET_URL,
+    dataset_policy=CALGARY_DATASET_POLICY,
+    image_policy=CALGARY_IMAGE_POLICY,
+    url_field="camera_url",
+    point_field="point",
+    bbox=CALGARY_BBOX,
+    frame_size=CALGARY_FRAME_SIZE,
+    bands_field="persons_by_height_band_840x630",
+    centre=CALGARY,
+)
+CITIES = {city.name: city for city in (AUSTIN_CITY, CALGARY_CITY)}
+SOURCES = tuple(CITIES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,11 +289,13 @@ def _coordinate(value: object, limit: float) -> float | None:
     return float(value)
 
 
-def _camera(record: object) -> tuple[float, float, str] | None:
-    """(latitude, longitude, screenshot URL) of a well-formed record, else None."""
+def _camera(record: object, fields: tuple[str, str]) -> tuple[float, float, str] | None:
+    """(latitude, longitude, still URL) of a well-formed record, else None. `fields`
+    names the record's URL field and its GeoJSON point field."""
     if not isinstance(record, dict):
         return None
-    url, location = record.get("screenshot_address"), record.get("location")
+    url_field, point_field = fields
+    url, location = record.get(url_field), record.get(point_field)
     if not isinstance(url, str) or not isinstance(location, dict):
         return None
     coordinates = location.get("coordinates")  # GeoJSON: longitude, then latitude
@@ -231,22 +315,25 @@ def select_cameras(
     *,
     policy: UrlPolicy = SCREENSHOT_POLICY,
     max_cameras: int = DEFAULT_MAX_CAMERAS,
+    fields: tuple[str, str] = (AUSTIN_CITY.url_field, AUSTIN_CITY.point_field),
 ) -> Selection:
-    """The screenshot URLs of the first `max_cameras` cameras inside `bbox` (inclusive)
-    whose URL `policy` allows, in list order. Malformed records are counted as skipped,
-    and cameras inside the box with any other URL as refused."""
+    """The still URLs of the first `max_cameras` cameras inside `bbox` (inclusive) that
+    `policy` resolves, as resolved, in list order. `fields` names the records' URL and
+    point fields (Austin's by default). Malformed records are counted as skipped, and
+    cameras inside the box with any other URL as refused."""
     south, west, north, east = bbox
     urls: list[str] = []
     skipped = refused = 0
     for record in records:
-        camera = _camera(record)
+        camera = _camera(record, fields)
         if camera is None:
             skipped += 1
             continue
-        lat, lon, url = camera
+        lat, lon, listed = camera
         if not (south <= lat <= north and west <= lon <= east):
             continue
-        if not policy.allows(url):
+        url = policy.resolve(listed)
+        if url is None:
             refused += 1
         elif len(urls) < max_cameras:
             urls.append(url)
@@ -421,12 +508,13 @@ class Tally:
     failed: Counter[FailureKind] = field(default_factory=Counter)
     resolutions: Counter[str] = field(default_factory=Counter)
     bands: Counter[str] = field(default_factory=Counter)
-    bands_hd: Counter[str] = field(default_factory=Counter)
+    bands_hd: Counter[str] = field(default_factory=Counter)  # frames of exactly frame_size
+    frame_size: tuple[int, int] = HD
 
     def add(self, decoded: _Decoded, found: Sequence[detect.Detection]) -> None:
         scale_x = decoded.width / decoded.frame.shape[1]
         scale_y = decoded.height / decoded.frame.shape[0]
-        is_hd = (decoded.width, decoded.height) == HD
+        is_hd = (decoded.width, decoded.height) == self.frame_size
         self.frames_ok += 1
         self.resolutions[f"{decoded.width}x{decoded.height}"] += 1
         for d in found:
@@ -507,10 +595,12 @@ def report(
     model: str,
     selection: Selection,
     tally: Tally,
+    city: City = AUSTIN_CITY,
 ) -> dict[str, object]:
-    """The pass's output: exactly the keys below, counts only."""
+    """The pass's output: exactly the keys below, counts only; the last one is the
+    city's `bands_field`."""
     return {
-        "source": SOURCE,
+        "source": city.name,
         "started_at": started_at.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%MZ"),
         "sun_elevation_deg": round(sun_elevation, 1),
         "model": model,
@@ -524,7 +614,7 @@ def report(
         "persons_total": tally.persons,
         "umbrellas_total": tally.umbrellas,
         "persons_by_height_band": _bands(tally.bands),
-        "persons_by_height_band_1080p": _bands(tally.bands_hd),
+        city.bands_field: _bands(tally.bands_hd),
     }
 
 
@@ -618,15 +708,22 @@ def _timeout(text: str) -> float:
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m wearreport.tools.pilot_heights",
-        description="Measure person box heights on Austin's HD camera stills; print counts.",
+        description="Measure person box heights on Austin's HD camera stills (or Calgary's); "
+        "print counts.",
     )
     ap.add_argument("--live", action="store_true", help="required: run one pass (network)")
     ap.add_argument(
+        "--source",
+        choices=SOURCES,
+        default=SOURCE,
+        help=f"the city whose cameras are measured (default {SOURCE})",
+    )
+    ap.add_argument(
         "--bbox",
         type=parse_bbox,
-        default=DEFAULT_BBOX,
+        default=None,
         metavar="S,W,N,E",
-        help="cameras inside this box, degrees (default: downtown Austin)",
+        help="cameras inside this box, degrees (default: the source's downtown)",
     )
     ap.add_argument(
         "--max-cameras",
@@ -660,10 +757,12 @@ def main(
     *,
     now: Callable[[], datetime.datetime] = _utc_now,
     open_detector: Callable[[str], FrameDetector] = open_detector,
-    dataset_url: str = DATASET_URL,
-    dataset_policy: UrlPolicy = DATASET_POLICY,
-    image_policy: UrlPolicy = SCREENSHOT_POLICY,
+    dataset_url: str | None = None,
+    dataset_policy: UrlPolicy | None = None,
+    image_policy: UrlPolicy | None = None,
 ) -> int:
+    """One pass. `dataset_url`, `dataset_policy` and `image_policy` replace the source's
+    own (tests: a server on this machine)."""
     ap = _parser()
     try:
         args = ap.parse_args(argv)
@@ -677,14 +776,20 @@ def main(
         )
         return 2
 
+    city = CITIES[args.source]
+    dataset_url = city.dataset_url if dataset_url is None else dataset_url
+    dataset_policy = city.dataset_policy if dataset_policy is None else dataset_policy
+    image_policy = city.image_policy if image_policy is None else image_policy
+    bbox = city.bbox if args.bbox is None else args.bbox
+
     started = time.monotonic()
     end = started + args.timeout
     started_at = now()
-    elevation = solar_elevation(started_at, *AUSTIN)
+    elevation = solar_elevation(started_at, *city.centre)
     if elevation < 0:
         print(
-            f"pilot_heights: the sun is below the horizon in Austin ({elevation:.1f} degrees);"
-            " run it in daylight",
+            f"pilot_heights: the sun is below the horizon in {city.title} "
+            f"({elevation:.1f} degrees); run it in daylight",
             file=sys.stderr,
         )
         return 1
@@ -699,10 +804,14 @@ def main(
         print(f"pilot_heights: error: {exc}", file=sys.stderr)
         return 1
     selection = select_cameras(
-        records, args.bbox, policy=image_policy, max_cameras=args.max_cameras
+        records,
+        bbox,
+        policy=image_policy,
+        max_cameras=args.max_cameras,
+        fields=(city.url_field, city.point_field),
     )
     del records
-    tally = Tally()
+    tally = Tally(frame_size=city.frame_size)
     run_frames(selection.urls, detector, scheme=image_policy.scheme, end=end, tally=tally)
     result = report(
         started_at=started_at,
@@ -710,6 +819,7 @@ def main(
         model=args.model,
         selection=selection,
         tally=tally,
+        city=city,
     )
     print(json.dumps(result), flush=True)
     return 0
