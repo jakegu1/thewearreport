@@ -24,15 +24,20 @@ Safety:
   whole pass.
 - Only complete JPEGs reach the decoder (the start- and end-of-image markers are checked
   first, as the sweep does). The engine caps every decoded image at
-  `_cv.MAX_IMAGE_PIXELS` (one megapixel), which a 1920x1080 still exceeds, so a frame
-  over the cap is decoded by the JPEG decoder at 1/2, 1/4 or 1/8 of its size, the
-  smallest reduction that fits under the cap; the cap itself still applies. A header
-  that declares more than four times the cap (`MAX_HEADER_PIXELS`; 2560x1440 still
-  fits) is refused before any decoding, since the decoder holds a progressive frame's
-  coefficients at full size whatever the reduction. The detector letterboxes every
-  frame to 640x640 anyway (a 1920x1080 frame to 640x360, whether it starts at 1920x1080
-  or 960x540), and box heights are scaled back to pixels of the original frame, whose
-  size is read from the JPEG header.
+  `_cv.MAX_IMAGE_PIXELS` (one 1920x1080 frame), so a 1920x1080 still decodes at full
+  size, and a frame over the cap is decoded by the JPEG decoder at 1/2, 1/4 or 1/8 of
+  its size, the smallest reduction that fits under the cap; the cap itself still
+  applies. A header that declares more than `MAX_HEADER_PIXELS` (four million pixels;
+  2560x1440 still fits) is refused before any decoding, since the decoder holds a
+  progressive frame's coefficients at full size whatever the reduction. A body with more
+  than `MAX_SCANS` (32) start-of-scan markers is refused before any decoding too, since
+  each scan costs the decoder a pass over the whole frame. The detector letterboxes every
+  frame to 640x640 anyway (a 1920x1080 frame to 640x360), and box heights are scaled back
+  to pixels of the original frame, whose size is read from the JPEG header.
+
+The spot-check tool's Austin attribute sessions (`--attributes --source austin`) reuse the
+camera list, the selection, the URL policies, the download (`download_within`), the
+header reader and the decoder from here.
 """
 
 from __future__ import annotations
@@ -93,7 +98,13 @@ BANDS: tuple[tuple[str, int], ...] = (
 HD = (1920, 1080)
 # The largest frame area a header may declare. The JPEG decoder holds a progressive or
 # multi-scan frame's coefficients at full size, however much it reduces the output.
-MAX_HEADER_PIXELS = 4 * MAX_IMAGE_PIXELS
+MAX_HEADER_PIXELS = 4_000_000
+# The most start-of-scan markers (FF DA) a body may hold. The decoder's work grows with
+# the number of scans times the declared area, and it cannot be interrupted; a baseline
+# frame has one scan and the engine's progressive encoder writes about ten. Counted over
+# the whole body, so anything that adds markers (a thumbnail) only makes it stricter.
+MAX_SCANS = 32
+JPEG_SOS = b"\xff\xda"
 
 # The JPEG decoder's reduced-size modes, smallest reduction first.
 REDUCTIONS: tuple[tuple[int, int], ...] = (
@@ -276,6 +287,11 @@ class _Failed(Exception):
         self.kind: FailureKind = kind
 
 
+# The names the spot-check tool's Austin sessions catch.
+FrameRefused = _Refused
+FrameFailed = _Failed
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class _Decoded:
     frame: Frame
@@ -345,6 +361,8 @@ def decode_frame(body: bytes) -> _Decoded:
     width, height = size
     if width * height > MAX_HEADER_PIXELS:
         raise _Failed("decode")
+    if body.count(JPEG_SOS) > MAX_SCANS:
+        raise _Failed("decode")  # before decoding: each scan costs a pass over the frame
     fits = [
         (flag, -(-width // factor), -(-height // factor))
         for factor, flag in REDUCTIONS
@@ -364,11 +382,18 @@ def decode_frame(body: bytes) -> _Decoded:
     return _Decoded(np.asarray(frame, dtype=np.uint8), width, height)
 
 
-def _fetch_one(url: str, scheme: str, end: float) -> _Decoded:
+def download_within(url: str, scheme: str, end: float) -> bytes:
+    """One GET of an image before the monotonic deadline `end` (at most FRAME_TIMEOUT_S),
+    failures raised as `_download` raises them; `_Failed("timeout")` once `end` has
+    passed."""
     remaining = end - time.monotonic()
     if remaining <= 0:
         raise _Failed("timeout")
-    body = _download(url, scheme, min(FRAME_TIMEOUT_S, remaining))
+    return _download(url, scheme, min(FRAME_TIMEOUT_S, remaining))
+
+
+def _fetch_one(url: str, scheme: str, end: float) -> _Decoded:
+    body = download_within(url, scheme, end)
     try:
         return decode_frame(body)
     finally:
@@ -556,7 +581,7 @@ def solar_elevation(moment: datetime.datetime, latitude: float, longitude: float
 # Command line ---------------------------------------------------------------------------
 
 
-def _bbox(text: str) -> BBox:
+def parse_bbox(text: str) -> BBox:
     parts = text.split(",")
     if len(parts) != 4:
         raise argparse.ArgumentTypeError("expected S,W,N,E")
@@ -600,7 +625,7 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--live", action="store_true", help="required: run one pass (network)")
     ap.add_argument(
         "--bbox",
-        type=_bbox,
+        type=parse_bbox,
         default=DEFAULT_BBOX,
         metavar="S,W,N,E",
         help="cameras inside this box, degrees (default: downtown Austin)",

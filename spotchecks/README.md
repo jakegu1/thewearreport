@@ -311,6 +311,19 @@ before any network request: `--mode frames`, keyboard entry (`--view files` with
 `--judgements`, which is also the default outside Windows) and `--record-boxes`.
 `--view window` with `--judgements` stays refused, as for a detection check.
 
+`--source austin` (attribute sessions only; anything else exits 2 with the usage) runs the
+same session on the City of Austin's traffic cameras instead of London's: one pass over
+the cameras in `--bbox S,W,N,E` (default downtown Austin), fetched in memory exactly as the
+HD pilot (`wearreport.tools.pilot_heights`) fetches them. Only stills whose header is
+exactly 1920x1080 are shown; the others (the cameras' 320x176 placeholders, for one) are
+skipped and counted in the progress lines. Crops are cut from the full-resolution frame,
+heights are its pixels, and the window fits large crops to the screen. The daylight check
+and the file's `light` use Austin's sun, and the file is
+`<out-dir>/attributes/YYYY-MM-DD-austin.json` (then `-austin-2`, ...) with the fields
+below and `"source": "austin"`; the [attribute summary](#attribute-summary) reports it
+apart from London's, after it, without rain lines. `--dry-run` serves a fake Austin on
+127.0.0.1. `--source london`, the default, is unchanged.
+
 ### Box height (`--min-height`)
 
 In daylight most crops under about 41 px cannot be judged for clothing, so the reviewer

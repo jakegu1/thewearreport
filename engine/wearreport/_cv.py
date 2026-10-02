@@ -8,9 +8,12 @@ before the first `import cv2` in the process:
   Decoders that cannot read from memory (Radiance HDR, for one) make `imdecode` write the
   body to a temporary file first; with this path that write fails and the decode fails,
   so no downloaded bytes reach disk (AGENTS.md INV-1).
-- OPENCV_IO_MAX_IMAGE_PIXELS caps the size of a decoded image. JamCam frames are 352x288
-  (about 0.1 megapixels); a small crafted JPEG can otherwise declare 30000x30000 and
-  decode to gigabytes.
+- OPENCV_IO_MAX_IMAGE_PIXELS caps the size of a decoded image at one 1920x1080 frame
+  (2,073,600 pixels). JamCam frames are 352x288 (about 0.1 megapixels); the Austin stills
+  that the spot-check tool's attribute sessions crop from are 1920x1080, and their crops
+  must come from the full-resolution frame. A small crafted JPEG can otherwise declare
+  30000x30000 and decode to gigabytes; the Austin reader also refuses, before decoding,
+  any header that declares more than `pilot_heights.MAX_HEADER_PIXELS`.
 
 `encode_jpeg` is here, not in its one caller (the fake camera server), because the
 static privacy guard recognises `cv2.imencode` by the name it is imported under.
@@ -24,7 +27,7 @@ from __future__ import annotations
 import os
 import sys
 
-MAX_IMAGE_PIXELS = 1_000_000
+MAX_IMAGE_PIXELS = 2_073_600
 TEMP_PATH = os.path.join(os.devnull, "opencv-temp")
 SETTINGS = {
     "OPENCV_TEMP_PATH": TEMP_PATH,

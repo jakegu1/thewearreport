@@ -54,8 +54,8 @@ def test_cv2_users_take_it_from_the_shim() -> None:
 
 def test_settings_are_in_the_environment() -> None:
     assert os.environ["OPENCV_TEMP_PATH"] == _cv.TEMP_PATH
-    assert os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] == "1000000"
-    assert _cv.MAX_IMAGE_PIXELS == 1_000_000
+    assert os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] == "2073600"
+    assert _cv.MAX_IMAGE_PIXELS == 2_073_600
 
 
 def test_temp_path_can_never_be_created() -> None:

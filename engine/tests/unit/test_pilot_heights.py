@@ -98,7 +98,7 @@ def test_real_1080p_frames_still_decode(progressive: bool, segments: bool) -> No
     body = _with_segments(buf.tobytes()) if segments else buf.tobytes()
     assert ph.jpeg_size(body) == (1920, 1080)
     decoded = ph.decode_frame(body)
-    assert decoded.frame.shape == (540, 960, 3)
+    assert decoded.frame.shape == (1080, 1920, 3)
     assert (decoded.width, decoded.height) == (1920, 1080)
 
 
@@ -135,9 +135,9 @@ def test_small_frames_decode_at_full_size() -> None:
 @pytest.mark.parametrize(
     ("width", "height", "shape"),
     [
-        (1920, 1080, (540, 960, 3)),
+        (1920, 1080, (1080, 1920, 3)),
         (1000, 1000, (1000, 1000, 3)),  # exactly the cap
-        (1001, 1000, (500, 501, 3)),
+        (1001, 1000, (1000, 1001, 3)),
         (2560, 1440, (720, 1280, 3)),
         (2000, 2000, (1000, 1000, 3)),  # exactly the header bound
         (1921, 1081, (541, 961, 3)),  # odd sizes round up
@@ -190,7 +190,7 @@ def _with_sof(body: bytes, marker: int) -> bytes:
 
 
 def test_header_bound_is_four_times_the_cap() -> None:
-    assert ph.MAX_HEADER_PIXELS == 4 * MAX_IMAGE_PIXELS
+    assert ph.MAX_HEADER_PIXELS == 4_000_000
     assert ph.MAX_HEADER_PIXELS >= 2560 * 1440
 
 
@@ -232,6 +232,59 @@ def test_header_bound_holds_for_every_frame_type(
         ph.decode_frame(body)
     assert exc.value.kind == "decode"
     assert calls == []
+
+
+def _scans(body: bytes) -> list[bytes]:
+    """Each scan of a JPEG: its start-of-scan segment and the entropy-coded data after it,
+    up to the next marker (FF 00 is a stuffed zero, FF D0-D7 a restart marker)."""
+    scans = []
+    start = body.find(ph.JPEG_SOS)
+    while start >= 0:
+        end = start + 2 + int.from_bytes(body[start + 2 : start + 4], "big")
+        while not (body[end] == 0xFF and body[end + 1] not in {0x00, *range(0xD0, 0xD8)}):
+            end += 1
+        scans.append(body[start:end])
+        start = body.find(ph.JPEG_SOS, end)
+    return scans
+
+
+def _with_scans(total: int) -> bytes:
+    """A progressive 1920x1080 JPEG made to hold `total` scans, by repeating its smallest
+    scan before the end-of-image marker (the decoder only warns about such a body)."""
+    image = np.random.default_rng(0).integers(0, 256, (1080, 1920, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_PROGRESSIVE, 1])
+    assert ok
+    body = buf.tobytes()
+    scans = _scans(body)
+    assert len(scans) < total and body.endswith(b"\xff\xd9")
+    smallest = min(scans, key=len)
+    body = body[:-2] + smallest * (total - len(scans)) + b"\xff\xd9"
+    assert body.count(ph.JPEG_SOS) == total
+    return body
+
+
+def test_scan_limit_is_32() -> None:
+    assert ph.MAX_SCANS == 32
+    assert ph.JPEG_SOS == b"\xff\xda"
+
+
+def test_decode_refuses_more_than_32_scans_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _with_scans(ph.MAX_SCANS + 1)
+    assert ph.jpeg_size(body) == (1920, 1080)
+    calls: list[object] = []
+    monkeypatch.setattr(cv2, "imdecode", lambda *args: calls.append(args))
+    with pytest.raises(ph._Failed) as exc:
+        ph.decode_frame(body)
+    assert exc.value.kind == "decode"
+    assert calls == []
+
+
+def test_decode_accepts_exactly_32_scans() -> None:
+    decoded = ph.decode_frame(_with_scans(ph.MAX_SCANS))
+    assert decoded.frame.shape == (1080, 1920, 3)
+    assert (decoded.width, decoded.height) == (1920, 1080)
 
 
 def test_decode_reuses_the_sweeps_markers() -> None:
@@ -364,6 +417,22 @@ def test_heights_scale_back_to_the_original_frame() -> None:
     assert tally.bands_hd == tally.bands
     assert (tally.persons, tally.umbrellas, tally.frames_ok) == (2, 1, 1)
     assert tally.resolutions == {"1920x1080": 1}
+
+
+def test_a_reduced_decode_scales_heights_back_to_the_header_size() -> None:
+    assert MAX_IMAGE_PIXELS < 2560 * 1440 <= ph.MAX_HEADER_PIXELS
+    decoded = ph.decode_frame(_jpeg(2560, 1440))
+    assert decoded.frame.shape == (720, 1280, 3)
+    assert (decoded.width, decoded.height) == (2560, 1440)
+    tally = ph.Tally()
+    found = [
+        detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 22.6)),  # 45.2 px -> 45
+        detect.Detection("person", 0.9, (0.0, 0.0, 10.0, 22.8)),  # 45.6 px -> 46
+    ]
+    tally.add(decoded, found)
+    assert tally.bands == {"31-45": 1, "46-79": 1}
+    assert tally.bands_hd == {}
+    assert tally.resolutions == {"2560x1440": 1}
 
 
 def test_report_rounds_and_orders() -> None:

@@ -4,7 +4,7 @@
       [--seed S] [--out-dir DIR] [--reviewer NAME] [--model yolox_m.onnx]
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
-      [--confirm-stop] [--allow-dark]
+      [--confirm-stop] [--allow-dark] [--source london|austin] [--bbox S,W,N,E]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -90,8 +90,20 @@ file, no per-box file). Frames mode, keyboard entry and `--record-boxes` are ref
 the window, the session does not start when it is dark in London (sun below -6°) unless
 `--allow-dark` is given; answers from a JSON file are taken at any light.
 
+With `--source austin` (attribute sessions only; anything else is a usage error, exit 2),
+the frames are one pass over the City of Austin's traffic cameras inside `--bbox` (default
+downtown Austin), fetched in memory with `pilot_heights`' camera list, selection, URL
+policies, single attempt and body cap, and its JPEG header reader and decoder (and so its
+MAX_HEADER_PIXELS bound). Only stills whose header declares 1920x1080 are kept; the
+others are counted in the progress lines and never shown. Crops are cut from the
+full-resolution frame, heights are its pixels, the window fits a large crop to the
+screen (`display_size`), and the daylight check and the record's `light` use Austin's
+sun. The record is `<out-dir>/attributes/YYYY-MM-DD-austin.json` (then `-austin-2`, ...)
+and ends with `"source": "austin"`. `--source london`, the default, is unchanged.
+
 `--dry-run` sweeps a local fake camera server that serves the licensed fixture photos
-in fixtures/detect/ (no network). Its statistics describe those photos, not the
+in fixtures/detect/ (no network); with `--source austin`, a fake Austin camera list and
+1920x1080 stills made from them, and placeholders. Its statistics describe those photos, not the
 cameras, so it needs an `--out-dir` other than spotchecks/.
 """
 
@@ -119,8 +131,19 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Sized
+from collections import Counter
+from collections.abc import (
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    Sized,
+)
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from types import FrameType, ModuleType
 from typing import TYPE_CHECKING, Literal, Protocol, TextIO, get_args, runtime_checkable
@@ -129,9 +152,9 @@ import numpy as np
 import numpy.typing as npt
 
 from wearreport import detect, fetch, registry
-from wearreport._cv import cv2
+from wearreport._cv import cv2, encode_jpeg
 from wearreport.settings import SettingsError, load_settings
-from wearreport.tools import judge_hosted
+from wearreport.tools import judge_hosted, pilot_heights
 
 if sys.platform == "win32":
     import ctypes
@@ -163,6 +186,10 @@ Mode = Literal["crops", "frames"]
 MODES: tuple[Mode, ...] = get_args(Mode)
 View = Literal["files", "window"]
 VIEWS: tuple[View, ...] = get_args(View)
+# Where the frames come from: TfL's JamCams, or (attribute sessions only) the City of
+# Austin's HD traffic cameras, fetched as `pilot_heights` fetches them.
+Source = Literal["london", "austin"]
+SOURCES: tuple[Source, ...] = get_args(Source)
 Frame = npt.NDArray[np.uint8]
 
 TEMP_PREFIX = "wearreport-spotcheck-"
@@ -250,6 +277,10 @@ DRY_RUN_FIXTURES = ("people_street.jpg", "umbrella_rain.jpg")
 WINDOW_TARGET_HEIGHT = 480  # the window enlarges crops by a whole factor up to about this
 WINDOW_MAX_WIDTH = 1200
 MAX_WINDOW_SCALE = 4
+# An Austin crop must fit on the screen with the window's other rows (title bar, header,
+# question and legend) and a margin: these many pixels are kept free.
+WINDOW_CHROME_PX = 220
+WINDOW_SCREEN_MARGIN_PX = 40
 WINDOW_TICK_MS = 100  # Tk hands control back to Python this often, so signals are handled
 # A backstop: the tick ends a window review this long after its deadline, should the
 # review's own timeout callback not have ended it.
@@ -276,6 +307,7 @@ BOXES_DIR = "boxes"  # the per-box files, in the statistics directory
 # "day" at LIGHT_DAY_DEG or above, "twilight" (civil) at LIGHT_TWILIGHT_DEG or above, else
 # "dark".
 LONDON = (51.5074, -0.1278)  # latitude and longitude, degrees (west negative)
+AUSTIN = pilot_heights.AUSTIN  # central Austin, for Austin sessions
 LIGHT_DAY_DEG = 0.0
 LIGHT_TWILIGHT_DEG = -6.0
 
@@ -300,6 +332,15 @@ ATTRIBUTE_LEGEND = (
     "y: yes   n: no   u: cannot tell   x: not a person or nothing can be told   "
     "Backspace: back   q: stop"
 )
+
+# Austin sessions (--source austin). Only frames whose header declares exactly this size
+# are shown (the cameras' 320x176 "no image" placeholders are not), and each pass is
+# bounded by one wall-clock deadline, as the pilot's is.
+AUSTIN_FRAME_SIZE = pilot_heights.HD  # width, height
+AUSTIN_FETCH_TIMEOUT_S = float(pilot_heights.DEFAULT_TIMEOUT_S)
+AUSTIN_FILE_SUFFIX = "-austin"  # the attribute file is <date>-austin.json, then -2, ...
+DRY_RUN_AUSTIN_CAMERAS = 6
+DRY_RUN_PLACEHOLDER = (320, 176)  # width, height
 
 
 class SpotcheckError(RuntimeError):
@@ -498,6 +539,179 @@ def dry_run_pipeline(model: str) -> Pipeline:
                 if i % 3 != 2:  # every third camera serves noise
                     server.serve_body(camera.id, bodies[i % len(bodies)])
             return sweep_frames(cameras)
+
+    return Pipeline(frames=frames, detector=detector, info=info)
+
+
+# Austin -------------------------------------------------------------------------------
+
+DetectorOpener = Callable[[str], tuple[FrameDetector, DetectorInfo]]
+
+
+@dataclass(frozen=True, slots=True)
+class AustinEndpoints:
+    """Where an Austin session's camera list and stills come from, and the URL policies
+    they must meet (tests: a server on 127.0.0.1)."""
+
+    dataset_url: str = pilot_heights.DATASET_URL
+    dataset_policy: pilot_heights.UrlPolicy = pilot_heights.DATASET_POLICY
+    image_policy: pilot_heights.UrlPolicy = pilot_heights.SCREENSHOT_POLICY
+
+
+class _NotHD(Exception):
+    """A still whose header declares a size other than AUSTIN_FRAME_SIZE."""
+
+
+def _austin_still(url: str, scheme: str, end: float) -> Frame:
+    """One Austin still, fetched once and decoded in memory at full resolution. Raises
+    _NotHD for any other declared size (before decoding), and pilot_heights' FrameRefused
+    or FrameFailed as its pass would count them."""
+    body = pilot_heights.download_within(url, scheme, end)
+    try:
+        size = pilot_heights.jpeg_size(body)
+        if size is not None and size != AUSTIN_FRAME_SIZE:
+            raise _NotHD
+        decoded = pilot_heights.decode_frame(body)  # the header allowlist and bound, too
+    finally:
+        del body
+    width, height = AUSTIN_FRAME_SIZE
+    if decoded.frame.shape[:2] != (height, width):
+        raise _NotHD  # never a reduced frame: crops come from full-resolution pixels
+    return decoded.frame
+
+
+def _austin_result(future: Future[Frame], counts: Counter[str]) -> Frame | None:
+    """The still `future` fetched, or None after counting why there is none."""
+    try:
+        return future.result()
+    except _NotHD:
+        counts["not_hd"] += 1
+    except pilot_heights.FrameRefused:
+        counts["refused"] += 1
+    except pilot_heights.FrameFailed:
+        counts["failed"] += 1
+    return None
+
+
+def austin_frames(
+    endpoints: AustinEndpoints,
+    bbox: pilot_heights.BBox,
+    *,
+    timeout_s: float = AUSTIN_FETCH_TIMEOUT_S,
+    concurrency: int = pilot_heights.CONCURRENCY,
+) -> Generator[Frame]:
+    """The 1920x1080 stills of the Austin cameras inside `bbox`, as they arrive. The
+    camera list, the selection (at most pilot_heights.DEFAULT_MAX_CAMERAS cameras), the
+    URL policies, one attempt per camera and the body cap are pilot_heights'. At most
+    `concurrency` stills are being fetched or waiting at a time, and nothing is kept once
+    handed on. Prints counts only: never a URL, a camera or image data."""
+    end = time.monotonic() + timeout_s
+    try:
+        records = pilot_heights.fetch_dataset(
+            endpoints.dataset_url,
+            endpoints.dataset_policy,
+            min(pilot_heights.DATASET_TIMEOUT_S, timeout_s),
+        )
+    except pilot_heights.PilotError as exc:
+        raise SpotcheckError(f"cannot list the Austin cameras: {exc}") from None
+    selection = pilot_heights.select_cameras(
+        records, bbox, policy=endpoints.image_policy, max_cameras=pilot_heights.DEFAULT_MAX_CAMERAS
+    )
+    del records
+    _progress(
+        f"{selection.listed} Austin cameras listed, {len(selection.urls)} selected "
+        f"({selection.skipped} malformed record(s) skipped, {selection.refused} URL(s) refused)"
+    )
+    counts: Counter[str] = Counter(refused=selection.refused)
+    urls = iter(selection.urls)
+    scheme = endpoints.image_policy.scheme
+    pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="austin")
+    pending: set[Future[Frame]] = set()
+
+    def submit() -> None:
+        for url in urls:
+            pending.add(pool.submit(_austin_still, url, scheme, end))
+            return
+
+    try:
+        for _ in range(concurrency):
+            submit()
+        while pending:
+            wait_s = max(0.0, end - time.monotonic()) + 1.0
+            done, _ = wait(pending, timeout=wait_s, return_when=FIRST_COMPLETED)
+            if not done and time.monotonic() > end + 1.0:
+                # Every request is bounded by the deadline; this is a backstop only.
+                counts["failed"] += len(pending) + sum(1 for _url in urls)
+                break
+            for future in done:
+                pending.discard(future)
+                submit()
+                frame = _austin_result(future, counts)
+                if frame is not None:
+                    counts["ok"] += 1
+                    yield frame
+                del frame
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    _progress(
+        f"fetched {counts['ok']} 1920x1080 frame(s) of {len(selection.urls)}: "
+        f"{counts['not_hd']} not 1920x1080 (skipped), {counts['failed']} failed, "
+        f"{counts['refused']} refused"
+    )
+
+
+def austin_pipeline(
+    model: str, bbox: pilot_heights.BBox, endpoints: AustinEndpoints, opener: DetectorOpener
+) -> Pipeline:
+    detector, info = opener(model)
+    return Pipeline(frames=lambda: austin_frames(endpoints, bbox), detector=detector, info=info)
+
+
+def _hd_still(body: bytes) -> bytes:
+    """A licensed fixture photo, enlarged 1.5 times onto a grey 1920x1080 frame, as JPEG."""
+    photo = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if photo is None:
+        raise SpotcheckError("cannot decode a dry-run fixture")
+    width, height = AUSTIN_FRAME_SIZE
+    scale = min(1.5, width / photo.shape[1], height / photo.shape[0])
+    size = (int(photo.shape[1] * scale), int(photo.shape[0] * scale))
+    photo = cv2.resize(photo, size, interpolation=cv2.INTER_LINEAR)
+    frame = np.full((height, width, 3), 128, dtype=np.uint8)
+    top, left = (height - size[1]) // 2, (width - size[0]) // 2
+    frame[top : top + size[1], left : left + size[0]] = photo
+    return encode_jpeg(frame)
+
+
+def dry_run_austin_pipeline(
+    model: str, bbox: pilot_heights.BBox, opener: DetectorOpener
+) -> Pipeline:
+    """A local fake Austin: a camera list and stills served on 127.0.0.1, the stills made
+    from the licensed fixture photos, every third one a 320x176 placeholder; no network."""
+    from wearreport.testing.fake_cameras import FakeCameraServer
+
+    try:
+        stills = [_hd_still((FIXTURE_DIR / name).read_bytes()) for name in DRY_RUN_FIXTURES]
+    except OSError as exc:
+        raise SpotcheckError(f"cannot read the dry-run fixtures: {exc.strerror}") from None
+    width, height = DRY_RUN_PLACEHOLDER
+    placeholder = encode_jpeg(np.full((height, width, 3), 64, dtype=np.uint8))
+    detector, info = opener(model)
+    south, west, north, east = bbox
+    where = [(west + east) / 2, (south + north) / 2]  # GeoJSON: longitude, then latitude
+
+    def frames() -> Iterator[Frame]:
+        with FakeCameraServer() as server:
+            records = []
+            for i in range(DRY_RUN_AUSTIN_CAMERAS):
+                camera = f"austin-{i}"
+                body = placeholder if i % 3 == 2 else stills[i % len(stills)]
+                server.serve_body(camera, body)
+                location = {"type": "Point", "coordinates": where}
+                records.append({"screenshot_address": server.url(camera), "location": location})
+            server.serve_body("cameras", json.dumps(records).encode())
+            policy = pilot_heights.UrlPolicy("http", urllib.parse.urlsplit(server.base_url).netloc)
+            endpoints = AustinEndpoints(server.url("cameras"), policy, policy)
+            yield from austin_frames(endpoints, bbox)
 
     return Pipeline(frames=frames, detector=detector, info=info)
 
@@ -1425,12 +1639,40 @@ def window_scale(height: int, width: int) -> int:
     return max(1, min(MAX_WINDOW_SCALE, by_height, by_width))
 
 
+def display_size(height: int, width: int, max_height: int, max_width: int) -> tuple[int, int]:
+    """The (height, width) at which the window shows an Austin crop of `height` x `width`
+    on a screen with `max_height` x `max_width` pixels free: enlarged by a whole factor,
+    never beyond window_scale's and never beyond what fits; a crop that does not fit at
+    its own size is reduced, keeping its proportions, until it does."""
+    if min(height, width, max_height, max_width) < 1:
+        raise ValueError("sizes must be at least one pixel")
+    fit = min(Fraction(max_height, height), Fraction(max_width, width))
+    scale = Fraction(min(window_scale(height, width), math.floor(fit))) if fit >= 1 else fit
+    return max(1, math.floor(height * scale)), max(1, math.floor(width * scale))
+
+
+def display_image(image: Frame, max_height: int, max_width: int) -> Frame:
+    """`image` at its display_size: enlarged pixel by pixel, or reduced by area."""
+    height, width = image.shape[:2]
+    new_height, new_width = display_size(height, width, max_height, max_width)
+    if (new_height, new_width) == (height, width):
+        return image
+    interpolation = cv2.INTER_NEAREST if new_height > height else cv2.INTER_AREA
+    resized = cv2.resize(image, (new_width, new_height), interpolation=interpolation)
+    return np.asarray(resized, dtype=np.uint8)
+
+
 def _png_data(image: Frame, scale: int) -> str:
     """`image` enlarged `scale` times and encoded as PNG in memory, in base64 for Tk."""
     if scale > 1:
         height, width = image.shape[:2]
         size = (width * scale, height * scale)
         image = np.asarray(cv2.resize(image, size, interpolation=cv2.INTER_NEAREST), np.uint8)
+    return _png_base64(image)
+
+
+def _png_base64(image: Frame) -> str:
+    """`image` encoded as PNG in memory, in base64 for Tk."""
     ok, encoded = cv2.imencode(IMAGE_SUFFIX, image)
     if not ok:
         raise SpotcheckError("cannot encode a review image")
@@ -1460,17 +1702,21 @@ class WindowReviewer:
     Nothing is written: each crop is encoded to PNG in memory and given to a PhotoImage
     as data. `driver`, if given, is called with the window once it shows the first crop
     (tests use it to send key events). With `guard`, the window's teardown is a critical
-    step: a signal that lands during it waits until it is done."""
+    step: a signal that lands during it waits until it is done. With `fit_screen` (Austin
+    sessions), each crop is shown at its display_size for the screen instead of
+    window_scale's whole factor."""
 
     def __init__(
         self,
         driver: Callable[[tkinter.Tk], object] | None = None,
         guard: _SignalGuard | None = None,
         confirm_stop: bool = False,
+        fit_screen: bool = False,
     ) -> None:
         self.driver = driver
         self.guard = guard
         self.confirm_stop = confirm_stop
+        self.fit_screen = fit_screen
 
     def judge(
         self, items: Sequence[ReviewItem], mode: Mode, deadline: float
@@ -1499,6 +1745,7 @@ class WindowReviewer:
         window: _Window[R] | None = None
         try:
             window = kind(tk, root, items, deadline, self.confirm_stop)
+            window.fit_screen = self.fit_screen
             return window.run(self.driver)
         finally:
             # Critical: a signal raised part-way would skip the rest and leave a cycle.
@@ -1524,6 +1771,7 @@ class _Window[R]:
     shows the current crop, and says what the review returns."""
 
     legend = WINDOW_LEGEND
+    fit_screen = False  # show each crop at its display_size for the screen (Austin)
 
     def __init__(
         self,
@@ -1616,7 +1864,12 @@ class _Window[R]:
 
     def _picture(self, item: ReviewItem) -> None:
         height, width = item.image.shape[:2]
-        data = _png_data(item.image, window_scale(height, width))
+        if self.fit_screen:
+            max_height = max(1, self.root.winfo_screenheight() - WINDOW_CHROME_PX)
+            max_width = max(1, self.root.winfo_screenwidth() - WINDOW_SCREEN_MARGIN_PX)
+            data = _png_base64(display_image(item.image, max_height, max_width))
+        else:
+            data = _png_data(item.image, window_scale(height, width))
         self.photo = self.tk.PhotoImage(master=self.root, data=data, format="png")
         self.picture.configure(image=self.photo)
 
@@ -2052,7 +2305,7 @@ def attribute_record(
     reviewer's answers and the model's (`models`, one per such crop in order, from the
     first; None past its end), sorted so that the order says nothing about frames, and
     `min_height`, the smallest box height shown. No position, width, camera id, frame
-    index, image or free text."""
+    index, image or free text. The light is London's (see sourced_record)."""
     minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
     kept = [item for item in items if answers[item.number] is not None]
     crops = []
@@ -2072,6 +2325,17 @@ def attribute_record(
         "crops_rejected": len(items) - len(kept),
         "crops": [list(crop) for crop in crops],
     }
+
+
+def sourced_record(
+    record: dict[str, object], source: Source, started_at: datetime.datetime
+) -> dict[str, object]:
+    """The attribute record of a `source` session: a London one as it is; an Austin one
+    with the light over Austin at the start of the sweep and `"source": "austin"` last."""
+    if source == "london":
+        return record
+    minute = started_at.astimezone(datetime.UTC).replace(second=0, microsecond=0)
+    return {**record, "light": light_at(minute, AUSTIN), "source": source}
 
 
 # The light ----------------------------------------------------------------------------
@@ -2128,9 +2392,10 @@ def light_category(elevation: float) -> Light:
     return "twilight" if elevation >= LIGHT_TWILIGHT_DEG else "dark"
 
 
-def light_at(moment: datetime.datetime) -> Light:
-    """The light over central London at `moment`: day, (civil) twilight or dark."""
-    return light_category(solar_elevation(moment))
+def light_at(moment: datetime.datetime, where: tuple[float, float] = LONDON) -> Light:
+    """The light at `moment` over `where` (latitude, longitude; central London unless
+    given): day, (civil) twilight or dark."""
+    return light_category(solar_elevation(moment, *where))
 
 
 def write_stats(
@@ -2160,14 +2425,18 @@ def write_stats(
         ) from None
 
 
-def write_attributes(record: Mapping[str, object], out_dir: Path, day: datetime.date) -> Path:
-    """Write `record` to a new `<out-dir>/attributes/<day>.json` (or `<day>-2.json`, ...);
-    never overwrite. Raises SpotcheckError, with the record in the message so it is not
-    lost, if it cannot be written."""
+def write_attributes(
+    record: Mapping[str, object], out_dir: Path, day: datetime.date, source: Source = "london"
+) -> Path:
+    """Write `record` to a new `<out-dir>/attributes/<day>.json` (or `<day>-2.json`, ...),
+    or for Austin `<day>-austin.json` (or `<day>-austin-2.json`, ...); never overwrite.
+    Raises SpotcheckError, with the record in the message so it is not lost, if it cannot
+    be written."""
     directory = out_dir / ATTRIBUTES_DIR
     text = json.dumps(record, ensure_ascii=True) + "\n"
+    stem = day.isoformat() + (AUSTIN_FILE_SUFFIX if source == "austin" else "")
     try:
-        return directory / _write_new([(directory, text)], day)
+        return directory / _write_new([(directory, text)], day, stem)
     except OSError as exc:
         raise SpotcheckError(
             f"cannot write the attribute file into {directory} ({exc.strerror}); it was: "
@@ -2175,13 +2444,17 @@ def write_attributes(record: Mapping[str, object], out_dir: Path, day: datetime.
         ) from None
 
 
-def _write_new(texts: Sequence[tuple[Path, str]], day: datetime.date) -> str:
-    """Each text into its directory, under one new name, the first free in all of them;
-    returns the name."""
+def _write_new(
+    texts: Sequence[tuple[Path, str]], day: datetime.date, stem: str | None = None
+) -> str:
+    """Each text into its directory, under one new name, the first free in all of them:
+    `<stem>.json`, then `<stem>-2.json`, ... (`stem` is the day unless given); returns the
+    name."""
+    stem = day.isoformat() if stem is None else stem
     for directory, _text in texts:
         directory.mkdir(parents=True, exist_ok=True)
     for k in range(1, MAX_FILES_PER_DAY + 1):
-        name = f"{day.isoformat()}.json" if k == 1 else f"{day.isoformat()}-{k}.json"
+        name = f"{stem}.json" if k == 1 else f"{stem}-{k}.json"
         created: list[Path] = []
         try:
             for directory, text in texts:
@@ -2321,7 +2594,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --attributes: start the session even when it is dark in London (refused "
         "otherwise when the answers are taken in the window)",
     )
+    ap.add_argument(
+        "--source",
+        choices=SOURCES,
+        default="london",
+        help="with --attributes: austin labels crops of the City of Austin's 1920x1080 "
+        "traffic cameras instead of London's (default london)",
+    )
+    ap.add_argument(
+        "--bbox",
+        type=pilot_heights.parse_bbox,
+        default=None,
+        metavar="S,W,N,E",
+        help="with --source austin: the cameras inside this box, degrees (default: downtown "
+        "Austin)",
+    )
     return ap
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """The command line, checked. `--source austin` outside an attribute session and
+    `--bbox` without it are usage errors: exit 2 with the usage, as argparse's own."""
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.source == "austin" and not args.attributes:
+        ap.error(AUSTIN_ATTRIBUTES_ONLY)
+    if args.bbox is not None and args.source != "austin":
+        ap.error(BBOX_AUSTIN_ONLY)
+    return args
 
 
 WINDOW_FRAMES_REFUSAL = "--view window shows crops only; frames mode needs --view files"
@@ -2337,6 +2637,12 @@ DARK_REFUSAL = (
     "it is dark in London now (sun below -6°); attribute sessions need daylight. "
     "Use --allow-dark to run anyway."
 )
+AUSTIN_DARK_REFUSAL = (
+    "it is dark in Austin now (sun below -6°); attribute sessions need daylight. "
+    "Use --allow-dark to run anyway."
+)
+AUSTIN_ATTRIBUTES_ONLY = "--source austin works in attribute sessions only; add --attributes"
+BBOX_AUSTIN_ONLY = "--bbox selects Austin cameras; it needs --source austin"
 ATTRIBUTES_KEYBOARD_REFUSAL = (
     "--attributes takes its answers in the window (--view window) or from a JSON file "
     "(--judgements PATH), not from the keyboard"
@@ -2522,6 +2828,8 @@ def _run(
     guard: _SignalGuard,
     setup: JudgeSetup | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
+    austin: AustinEndpoints | None = None,
+    opener: DetectorOpener | None = None,
 ) -> int:
     mode: Mode = args.mode
     clock = clock or _utcnow
@@ -2532,7 +2840,16 @@ def _run(
         attribute_judge = open_attribute_judge(args, setup or JudgeSetup())
         try:
             return _attribute_session(
-                args, pipeline, reviewer, day, guard, view, attribute_judge, clock
+                args,
+                pipeline,
+                reviewer,
+                day,
+                guard,
+                view,
+                attribute_judge,
+                clock,
+                austin or AustinEndpoints(),
+                opener or _open_detector,
             )
         finally:
             if attribute_judge is not None:
@@ -2568,9 +2885,15 @@ def _confirming[T](args: argparse.Namespace, view: View, reviewer: T) -> T:
 
 def check_light(args: argparse.Namespace, clock: Callable[[], datetime.datetime]) -> None:
     """Refuse an attribute session whose answers are taken live (not from --judgements)
-    when it is dark in London at `clock()`, unless --allow-dark is given: after dark most
-    near-field crops cannot be judged. Raises SpotcheckError before anything else happens."""
-    if args.judgements is None and not args.allow_dark and light_at(clock()) == "dark":
+    when it is dark at `clock()` where its frames come from (London, or Austin with
+    `--source austin`), unless --allow-dark is given: after dark most near-field crops
+    cannot be judged. Raises SpotcheckError before anything else happens."""
+    if args.judgements is not None or args.allow_dark:
+        return
+    if getattr(args, "source", "london") == "austin":
+        if light_at(clock(), AUSTIN) == "dark":
+            raise SpotcheckError(AUSTIN_DARK_REFUSAL)
+    elif light_at(clock()) == "dark":
         raise SpotcheckError(DARK_REFUSAL)
 
 
@@ -2606,21 +2929,34 @@ def _judgements_reviewer(text: str) -> JsonFileReviewer:
 
 
 def _open_pipeline(
-    args: argparse.Namespace, pipeline: Pipeline | None, guard: _SignalGuard
+    args: argparse.Namespace,
+    pipeline: Pipeline | None,
+    guard: _SignalGuard,
+    austin: AustinEndpoints | None = None,
+    opener: DetectorOpener | None = None,
 ) -> Pipeline:
-    """Delete what earlier runs left behind, then open the pipeline (unless given)."""
+    """Delete what earlier runs left behind, then open the pipeline (unless given): with
+    `--source austin`, Austin's stills from `austin` (a local fake one with --dry-run),
+    detected by the detector `opener` opens."""
     removed = remove_stale(Path(tempfile.gettempdir()), args.timeout, guard=guard)
     if removed:
         print(f"Deleted {removed} review directories left by earlier runs.")
-    if pipeline is None:
-        pipeline = dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
-    return pipeline
+    if pipeline is not None:
+        return pipeline
+    if getattr(args, "source", "london") == "austin":
+        opener = opener or _open_detector
+        bbox = pilot_heights.DEFAULT_BBOX if args.bbox is None else args.bbox
+        if args.dry_run:
+            return dry_run_austin_pipeline(args.model, bbox, opener)
+        return austin_pipeline(args.model, bbox, austin or AustinEndpoints(), opener)
+    return dry_run_pipeline(args.model) if args.dry_run else live_pipeline(args.model)
 
 
 def _sample_sweep(
     args: argparse.Namespace, pipeline: Pipeline, min_height: int = 0
 ) -> list[Sample]:
-    """Sweep, detect and sample, printing progress."""
+    """Sweep, detect and sample, printing progress. Frames that come from a generator
+    (Austin's) are closed after it, however it ends, which stops their fetching."""
     frames = pipeline.frames()
     total = len(frames) if isinstance(frames, Sized) else None
 
@@ -2628,15 +2964,20 @@ def _sample_sweep(
         if _due(done, total):
             _progress(f"detected {done} of {total}" if total is not None else f"detected {done}")
 
-    return sample(
-        frames,
-        pipeline.detector,
-        n=args.n,
-        min_persons=args.min_persons,
-        seed=args.seed,
-        progress=detected,
-        min_height=min_height,
-    )
+    try:
+        return sample(
+            frames,
+            pipeline.detector,
+            n=args.n,
+            min_persons=args.min_persons,
+            seed=args.seed,
+            progress=detected,
+            min_height=min_height,
+        )
+    finally:
+        close = getattr(frames, "close", None)
+        if callable(close):
+            close()
 
 
 def _check(
@@ -2726,21 +3067,27 @@ def _attribute_session(
     view: View,
     judge: judge_hosted.LiveAttributeJudge | None,
     clock: Callable[[], datetime.datetime],
+    austin: AustinEndpoints | None = None,
+    opener: DetectorOpener | None = None,
 ) -> int:
     """Label the near-field crops of one sweep, then (with a judge) ask the model the same
-    questions about the crops the reviewer did not reject; write the attribute file."""
+    questions about the crops the reviewer did not reject; write the attribute file. With
+    `--source austin`, the sweep is one pass over Austin's 1920x1080 stills."""
     out_dir = _prepare(args)
+    source: Source = getattr(args, "source", "london")
     labeller: AttributeReviewer
     if reviewer is None:
         if args.judgements is not None:
             labeller = _judgements_reviewer(args.judgements)
+        elif source == "austin":
+            labeller = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop, fit_screen=True)
         else:
             labeller = WindowReviewer(guard=guard, confirm_stop=args.confirm_stop)
     elif isinstance(reviewer, AttributeReviewer):
         labeller = reviewer
     else:
         raise SpotcheckError("the reviewer given cannot answer the attribute questions")
-    pipeline = _open_pipeline(args, pipeline, guard)
+    pipeline = _open_pipeline(args, pipeline, guard, austin, opener)
 
     min_height = NEAR_FIELD_MIN_HEIGHT_PX if args.min_height is None else args.min_height
     started_at = clock()
@@ -2792,8 +3139,9 @@ def _attribute_session(
         judge=args.judge,
         min_height=min_height,
     )
+    record = sourced_record(record, source, started_at)
     del items
-    path = write_attributes(record, out_dir, day)
+    path = write_attributes(record, out_dir, day, source)
     print(
         f"Attribute labels written to {path}: {record['crops_shown']} crop(s) shown, "
         f"{record['crops_rejected']} rejected"
@@ -2815,12 +3163,16 @@ def main(
     judge_timeout: float = judge_hosted.REQUEST_TIMEOUT,
     judge_sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], datetime.datetime] | None = None,
+    austin: AustinEndpoints | None = None,
+    open_detector: DetectorOpener | None = None,
 ) -> int:
     """Run one spot-check (or, with `--attributes`, one attribute session). `pipeline` and
     `reviewer` replace the live ones (an attribute session needs an AttributeReviewer),
     `judge_endpoint`, `judge_timeout` and `judge_sleep` the judge's origin, request timeout
     and wait between retries (tests: a fake judge on this machine), and `clock` the UTC
-    clock that dates the start of the sweep."""
+    clock that dates the start of the sweep. With `--source austin`, `austin` replaces
+    Austin's camera list and stills (tests: a server on this machine) and `open_detector`
+    the detector (`model` -> detector and its DetectorInfo)."""
     ci = _ci_variables()
     if ci:
         print(
@@ -2829,14 +3181,14 @@ def main(
             file=sys.stderr,
         )
         return 2
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     guard = _SignalGuard()
     try:
         try:
             guard.install()
             setup = JudgeSetup(judge_endpoint, judge_timeout, judge_sleep)
             day = today or datetime.date.today()
-            return _run(args, pipeline, reviewer, day, guard, setup, clock)
+            return _run(args, pipeline, reviewer, day, guard, setup, clock, austin, open_detector)
         finally:
             # Nothing may interrupt the handlers below. A signal that lands before
             # stop() is raised here, is the last one raised, and is caught below.
