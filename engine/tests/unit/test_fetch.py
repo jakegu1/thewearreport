@@ -356,6 +356,68 @@ def test_end_marker_too_far_from_the_end_is_a_decode_error(server: FakeCameraSer
     assert result.error == "decode"
 
 
+def _progressive_with_scans(total: int) -> bytes:
+    """A progressive 352x288 JPEG with `total` scans: its last scan repeated before the
+    end-of-image marker (the decoder only warns about such a body)."""
+    image = np.random.default_rng(0).integers(0, 256, (288, 352, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_PROGRESSIVE, 1])
+    assert ok
+    body = buf.tobytes()
+    last = body[body.rfind(fetch.JPEG_SOS) : -2]
+    body = body[:-2] + last * (total - fetch.count_scans(body)) + fetch.JPEG_EOI
+    assert fetch.count_scans(body) == total
+    return body
+
+
+def test_scan_limit_and_marker() -> None:
+    assert fetch.MAX_SCANS == 32
+    assert fetch.JPEG_SOS == b"\xff\xda"
+
+
+def test_count_scans_counts_every_marker_in_the_body() -> None:
+    body = _jpeg()
+    comment = b"\xff\xfe" + (2 + 4).to_bytes(2, "big") + fetch.JPEG_SOS * 2
+    assert fetch.count_scans(body) == 1
+    assert fetch.count_scans(body[:2] + comment + body[2:]) == 3
+    assert fetch.count_scans(b"") == 0
+
+
+def test_body_over_the_scan_limit_is_a_decode_error_without_decoding(
+    server: FakeCameraServer, imdecode_calls: list[int]
+) -> None:
+    (cam,) = server.cameras(1)
+    server.serve_body(cam.id, _progressive_with_scans(fetch.MAX_SCANS + 1))
+    (result,) = fetch.fetch_sweep([cam])
+    assert (result.error, result.frame) == ("decode", None)
+    assert imdecode_calls == []
+    assert server.requests(cam.id) == 1
+
+
+def test_body_at_the_scan_limit_is_decoded(
+    server: FakeCameraServer, imdecode_calls: list[int]
+) -> None:
+    (cam,) = server.cameras(1)
+    body = _progressive_with_scans(fetch.MAX_SCANS)
+    server.serve_body(cam.id, body)
+    (result,) = fetch.fetch_sweep([cam])
+    assert result.error is None and result.frame is not None
+    assert result.frame.shape == (288, 352, 3)
+    assert imdecode_calls == [len(body)]
+
+
+def test_scan_markers_hidden_in_a_comment_still_count(
+    server: FakeCameraServer, imdecode_calls: list[int]
+) -> None:
+    body = _jpeg()
+    payload = fetch.JPEG_SOS * fetch.MAX_SCANS
+    comment = b"\xff\xfe" + (2 + len(payload)).to_bytes(2, "big") + payload
+    (cam,) = server.cameras(1)
+    server.serve_body(cam.id, body[:2] + comment + body[2:])
+    (result,) = fetch.fetch_sweep([cam])
+    assert result.error == "decode"
+    assert imdecode_calls == []
+
+
 # A mix of everything in one sweep ------------------------------------------------------
 
 

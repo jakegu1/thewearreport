@@ -8,7 +8,10 @@ duration stay bounded.
 
 Only complete JPEGs reach the decoder: a body must start with the JPEG start-of-image
 marker and end with the end-of-image marker. Other formats are refused before decoding,
-because some of OpenCV's decoders go through a temporary file (see `wearreport._cv`).
+because some of OpenCV's decoders go through a temporary file (see `wearreport._cv`). A
+body with more than `MAX_SCANS` start-of-scan markers is refused before decoding too,
+since each scan costs the decoder a pass over the whole frame and the decode cannot be
+interrupted.
 
 Run `python -m wearreport.fetch --live` for one sweep of the real JamCams, or
 `python -m wearreport.fetch --dry-run` for one sweep of a local fake server (no network).
@@ -44,6 +47,12 @@ JPEG_SOI = b"\xff\xd8\xff"  # start-of-image marker and the first byte of the ne
 JPEG_EOI = b"\xff\xd9"
 # Encoders may pad after the end-of-image marker; it must appear this close to the end.
 EOI_WINDOW = 16
+# The most start-of-scan markers (FF DA) a body may hold. The decoder's work grows with
+# the number of scans times the declared area, and it cannot be interrupted; a baseline
+# frame has one scan and the engine's progressive encoder writes about ten. Counted over
+# the whole body, so anything that adds markers (a thumbnail) only makes it stricter.
+MAX_SCANS = 32
+JPEG_SOS = b"\xff\xda"
 
 ErrorKind = Literal["timeout", "http", "decode", "network"]
 ERROR_KINDS: tuple[ErrorKind, ...] = get_args(ErrorKind)
@@ -131,10 +140,17 @@ def _download(url: str, timeout_s: float) -> bytes:
         raise _FetchError("network") from None
 
 
+def count_scans(body: bytes) -> int:
+    """The start-of-scan markers anywhere in `body`, inside other segments included."""
+    return body.count(JPEG_SOS)
+
+
 def _decode(body: bytes) -> npt.NDArray[np.uint8]:
     # Never hand the decoder anything but a complete JPEG (see the module docstring).
     if not body.startswith(JPEG_SOI) or JPEG_EOI not in body[-EOI_WINDOW:]:
         raise _FetchError("decode")
+    if count_scans(body) > MAX_SCANS:
+        raise _FetchError("decode")  # before decoding: each scan costs a pass over the frame
     try:
         frame = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
     except cv2.error:  # includes images over wearreport._cv.MAX_IMAGE_PIXELS
