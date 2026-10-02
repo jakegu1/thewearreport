@@ -54,6 +54,7 @@ jobs:
           engine/tests/unit/test_spotcheck_window.py
           engine/tests/acceptance/test_t_036.py
           engine/tests/acceptance/test_t_037.py
+          engine/tests/acceptance/test_t_061.py
       - name: Dry-run spot-check through the window reviewer
         run: >-
           uv run --no-sync pytest -v -s

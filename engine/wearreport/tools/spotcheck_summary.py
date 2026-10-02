@@ -183,6 +183,21 @@ class Record:
     confusion: Confusion | None
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"the key {key[:20]!r} appears twice in one object")
+        seen[key] = value
+    return seen
+
+
+def _json(raw: bytes) -> object:
+    """A file's JSON, refusing a duplicate key in any object: a reader that kept the
+    last value would silently drop the first."""
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+
+
 def _count(value: object, what: str) -> int:
     if type(value) is not int or not 0 <= value <= MAX_COUNT:
         raise ValueError(f"{what} is not a count")
@@ -207,7 +222,7 @@ def parse_record(raw: bytes) -> Record:
     """One statistics file; raises ValueError (or a subclass) when it is malformed."""
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
-    data = json.loads(raw.decode("utf-8"))
+    data = _json(raw)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     day = data.get("date")
@@ -417,7 +432,7 @@ def parse_session(raw: bytes) -> Session:
     """One per-box file; raises ValueError (or a subclass) when it is malformed."""
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
-    data = json.loads(raw.decode("utf-8"))
+    data = _json(raw)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     if set(data) != BOX_FIELDS:
@@ -474,7 +489,7 @@ def parse_sweep(raw: bytes) -> tuple[datetime.datetime, float | None]:
     raises ValueError (or a subclass) when it is malformed."""
     if len(raw) > MAX_RECORD_BYTES:
         raise ValueError(f"larger than {MAX_RECORD_BYTES} bytes")
-    data = json.loads(raw.decode("utf-8"))
+    data = _json(raw)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     started = data.get("started_at")
@@ -760,7 +775,7 @@ def parse_labelling(raw: bytes) -> Labelling:
     """One attribute file; raises ValueError (or a subclass) when it is malformed."""
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
-    data = json.loads(raw.decode("utf-8"))
+    data = _json(raw)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     fields = set(data)
