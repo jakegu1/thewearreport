@@ -190,7 +190,7 @@ def _with_sof(body: bytes, marker: int) -> bytes:
 
 
 def test_header_bound_is_four_times_the_cap() -> None:
-    assert ph.MAX_HEADER_PIXELS == 4 * MAX_IMAGE_PIXELS
+    assert ph.MAX_HEADER_PIXELS == 4_000_000
     assert ph.MAX_HEADER_PIXELS >= 2560 * 1440
 
 

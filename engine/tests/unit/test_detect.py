@@ -301,7 +301,7 @@ def test_detector_accepts_non_contiguous_frames() -> None:
         np.zeros((0, 0, 3), dtype=np.uint8),
         np.zeros(0, dtype=np.uint8),
         np.zeros((), dtype=np.uint8),
-        np.zeros((1001, 1000, 3), dtype=np.uint8),  # over MAX_IMAGE_PIXELS
+        np.zeros((1081, 1920, 3), dtype=np.uint8),  # over MAX_IMAGE_PIXELS
         [[[0, 0, 0]]],
         None,
         b"\xff\xd8\xff",
@@ -317,7 +317,7 @@ def test_detector_rejects_invalid_frames(frame: Any) -> None:
 
 def test_pixel_cap_matches_the_decoder_cap() -> None:
     stub_detector().detect(np.zeros((1000, 1000, 3), dtype=np.uint8))
-    assert MAX_IMAGE_PIXELS == 1000 * 1000
+    assert MAX_IMAGE_PIXELS == 1920 * 1080
 
 
 def test_invalid_frame_errors_carry_no_pixel_values() -> None:

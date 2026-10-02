@@ -61,6 +61,13 @@ only), and prints, for each attribute (outer layer, bare legs, open umbrella):
 - the judgeable share by height: for each band of HEIGHT_BANDS, the crops in it and how
   many the reviewer answered yes or no (not "cannot tell"), over the day and twilight files
   only (dark files are left out). The attribute threshold is chosen from these lines.
+
+Sources are never pooled. A London file has exactly the fields above; an Austin file
+(from an attribute session with `--source austin`) has them and `"source": "austin"`; any other
+source is malformed. The London files are summarised first, exactly as without Austin
+files; then, only if there is an Austin file, the Austin files on their own, after an empty
+line, with their own counts, measures and verdicts. The data branch holds London's weather
+only, so the Austin section has no rain lines, with or without `--data-dir`.
 """
 
 from __future__ import annotations
@@ -136,6 +143,8 @@ ATTRIBUTE_FIELDS = frozenset(
     }
 )
 ATTRIBUTE_NAMES = ("outer_layer", "bare_legs", "umbrella")  # the letters' order
+# Where an attribute file's frames came from: London (no source key) or Austin.
+SOURCES = ("london", "austin")
 MIN_POSITIVES = 30  # reviewer yes, among the crops the model answered
 MIN_NEGATIVES = 30  # reviewer no, among them
 MIN_LABELLED = 200  # reviewer yes or no, among them
@@ -723,6 +732,7 @@ class Labelling:
     rejected: int
     crops: tuple[Crop, ...]
     rain: str = "unknown"
+    source: str = "london"
 
 
 def _crop(value: object, judged: bool, min_height: int) -> Crop:
@@ -750,7 +760,14 @@ def parse_labelling(raw: bytes) -> Labelling:
     data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("not an object")
-    if set(data) != ATTRIBUTE_FIELDS:
+    fields = set(data)
+    source = "london"
+    if "source" in fields:
+        if not isinstance(data["source"], str) or data["source"] != "austin":
+            raise ValueError('source is not "austin" (a London file has no source)')
+        source = "austin"
+        fields.discard("source")
+    if fields != ATTRIBUTE_FIELDS:
         raise ValueError("its fields are not " + ", ".join(sorted(ATTRIBUTE_FIELDS)))
     day = data["date"]
     if not isinstance(day, str) or not _DATE.fullmatch(day):
@@ -786,6 +803,7 @@ def parse_labelling(raw: bytes) -> Labelling:
         shown=shown,
         rejected=rejected,
         crops=tuple(_crop(crop, judge is not None, min_height) for crop in crops),
+        source=source,
     )
 
 
@@ -919,11 +937,15 @@ def band_lines(labellings: Sequence[Labelling], index: int) -> list[str]:
     return lines
 
 
-def attributes_report(labellings: Sequence[Labelling], directory: Path, rain: bool) -> list[str]:
-    """The lines `--attributes` prints. `rain`: whether the rain conditions are known."""
+def attributes_report(
+    labellings: Sequence[Labelling], directory: Path, rain: bool, source: str = "london"
+) -> list[str]:
+    """The lines `--attributes` prints for the files of one source. `rain`: whether the
+    rain conditions are known."""
     crops = [crop for s in labellings for crop in s.crops]
+    where = "" if source == "london" else f"{source.capitalize()} "
     lines = [
-        f"{len(labellings)} attribute file(s) in {directory / ATTRIBUTES_DIR}",
+        f"{len(labellings)} {where}attribute file(s) in {directory / ATTRIBUTES_DIR}",
         f"crops: {sum(s.shown for s in labellings)} shown, "
         f"{sum(s.rejected for s in labellings)} rejected, {len(crops)} labelled, "
         f"{sum(1 for crop in crops if crop[2] is not None)} with a model answer",
@@ -960,14 +982,20 @@ def attributes_report(labellings: Sequence[Labelling], directory: Path, rain: bo
 
 
 def _attributes_main(directory: Path, data_dir: Path | None) -> int:
+    """London's section, then Austin's if there is an Austin file (see the docstring)."""
     try:
         labellings = load_labellings(directory)
+        london = [s for s in labellings if s.source == "london"]
+        austin = [s for s in labellings if s.source == "austin"]
         if data_dir is not None:
-            labellings = with_rain(labellings, data_dir)
+            london = with_rain(london, data_dir)
     except SummaryError as exc:
         print(f"summary: {exc}", file=sys.stderr)
         return 1
-    for line in attributes_report(labellings, directory, data_dir is not None):
+    lines = attributes_report(london, directory, data_dir is not None)
+    if austin:
+        lines += ["", *attributes_report(austin, directory, False, "austin")]
+    for line in lines:
         print(line)
     return 0
 
