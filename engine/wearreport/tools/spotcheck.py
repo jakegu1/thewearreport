@@ -630,12 +630,12 @@ def _austin_result(future: Future[Frame], counts: Counter[str]) -> Frame | None:
 
 
 def _failed_text(counts: Counter[str]) -> str:
-    """`N failed`, then the non-zero counts by kind in fetch.ERROR_KINDS order."""
-    kinds = ", ".join(
-        f"{kind} {counts[f'failed_{kind}']}"
-        for kind in fetch.ERROR_KINDS
-        if counts[f"failed_{kind}"]
-    )
+    """`N failed`, then the non-zero counts by kind in fetch.ERROR_KINDS order, and last
+    those of any other kind as `other`, so that the counts add up to N. Never the other
+    kind's own text."""
+    known = [(kind, counts[f"failed_{kind}"]) for kind in fetch.ERROR_KINDS]
+    other = counts["failed"] - sum(n for _kind, n in known)
+    kinds = ", ".join(f"{kind} {n}" for kind, n in [*known, ("other", other)] if n > 0)
     return f"{counts['failed']} failed" + (f" ({kinds})" if counts["failed"] else "")
 
 
