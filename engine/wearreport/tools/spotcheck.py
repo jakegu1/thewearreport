@@ -588,9 +588,20 @@ def _austin_result(future: Future[Frame], counts: Counter[str]) -> Frame | None:
         counts["not_hd"] += 1
     except pilot_heights.FrameRefused:
         counts["refused"] += 1
-    except pilot_heights.FrameFailed:
+    except pilot_heights.FrameFailed as exc:
         counts["failed"] += 1
+        counts[f"failed_{exc.kind}"] += 1
     return None
+
+
+def _failed_text(counts: Counter[str]) -> str:
+    """`N failed`, then the non-zero counts by kind in fetch.ERROR_KINDS order."""
+    kinds = ", ".join(
+        f"{kind} {counts[f'failed_{kind}']}"
+        for kind in fetch.ERROR_KINDS
+        if counts[f"failed_{kind}"]
+    )
+    return f"{counts['failed']} failed" + (f" ({kinds})" if counts["failed"] else "")
 
 
 def austin_frames(
@@ -641,7 +652,9 @@ def austin_frames(
             done, _ = wait(pending, timeout=wait_s, return_when=FIRST_COMPLETED)
             if not done and time.monotonic() > end + 1.0:
                 # Every request is bounded by the deadline; this is a backstop only.
-                counts["failed"] += len(pending) + sum(1 for _url in urls)
+                stuck = len(pending) + sum(1 for _url in urls)
+                counts["failed"] += stuck
+                counts["failed_timeout"] += stuck
                 break
             for future in done:
                 pending.discard(future)
@@ -655,7 +668,7 @@ def austin_frames(
         pool.shutdown(wait=False, cancel_futures=True)
     _progress(
         f"fetched {counts['ok']} 1920x1080 frame(s) of {len(selection.urls)}: "
-        f"{counts['not_hd']} not 1920x1080 (skipped), {counts['failed']} failed, "
+        f"{counts['not_hd']} not 1920x1080 (skipped), {_failed_text(counts)}, "
         f"{counts['refused']} refused"
     )
 
