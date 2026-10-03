@@ -1,7 +1,7 @@
 name: windows
 
 # The spot-check on native Windows (T-037). Kept out of ci.yml, whose jobs all run on
-# ubuntu-24.04. Read-only, no secrets.
+# ubuntu-24.04. Read-only; it uses no secrets at all.
 
 on:
   push:
@@ -19,6 +19,7 @@ jobs:
   windows:
     # The spot-check on native Windows (T-037): its unit and acceptance tests, the
     # window reviewer driven by synthetic key events, and a dry run through the window.
+    # T-067: the labelling launcher (label.cmd, scripts/label.ps1) end to end, offline.
     # The T-008 acceptance tests describe the Unix files view and run on Linux only.
     # llama-cpp-python has no Windows wheel, and the spot-check never imports it.
     runs-on: windows-latest
@@ -55,6 +56,13 @@ jobs:
           engine/tests/acceptance/test_t_036.py
           engine/tests/acceptance/test_t_037.py
           engine/tests/acceptance/test_t_061.py
+      - name: Labelling launcher tests (T-067)
+        # Windows PowerShell runs label.ps1 with spotcheck's dry run, a test reviewer, a
+        # fake judge on 127.0.0.1, fake git and uv, and a file in place of the clipboard.
+        run: >-
+          uv run --no-sync pytest -v -rs --capture=sys
+          engine/tests/acceptance/test_t_067.py
+          engine/tests/unit/test_label_window.py
       - name: Dry-run spot-check through the window reviewer
         run: >-
           uv run --no-sync pytest -v -s
