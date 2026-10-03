@@ -14,8 +14,9 @@ their 840x630 stills from the one host the list uses) with Calgary's sun. The ou
 the same keys in the same order and `"source": "calgary"`, except that the bands counted
 on frames of exactly 840x630 replace those of 1920x1080, under
 `persons_by_height_band_840x630`. Calgary's list gives its stills' URLs as `http://`;
-such a URL on the pinned host is fetched as `https://`, and only so. `--source austin`
-is the default, and its output is unchanged.
+such a URL on the pinned host is fetched as `https://`, and only so. The live list gives
+each still URL as an object; its string member `"url"` is read, and its other members
+are ignored. `--source austin` is the default, and its output is unchanged.
 
 Privacy (AGENTS.md INV-1): frames exist only in memory and are dropped after detection.
 No image bytes, camera ids, URLs, coordinates or boxes are written, logged or printed;
@@ -289,14 +290,22 @@ def _coordinate(value: object, limit: float) -> float | None:
     return float(value)
 
 
+def _still_url(value: object) -> str | None:
+    """The still URL a record's URL field gives: the string itself, or an object's string
+    member `"url"` (Calgary's live list); other members are ignored. Else None."""
+    if isinstance(value, dict):
+        value = value.get("url")
+    return value if isinstance(value, str) else None
+
+
 def _camera(record: object, fields: tuple[str, str]) -> tuple[float, float, str] | None:
     """(latitude, longitude, still URL) of a well-formed record, else None. `fields`
     names the record's URL field and its GeoJSON point field."""
     if not isinstance(record, dict):
         return None
     url_field, point_field = fields
-    url, location = record.get(url_field), record.get(point_field)
-    if not isinstance(url, str) or not isinstance(location, dict):
+    url, location = _still_url(record.get(url_field)), record.get(point_field)
+    if url is None or not isinstance(location, dict):
         return None
     coordinates = location.get("coordinates")  # GeoJSON: longitude, then latitude
     if location.get("type") != "Point" or not isinstance(coordinates, list):
