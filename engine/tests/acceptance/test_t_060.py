@@ -257,7 +257,7 @@ def test_ac4_sweep_records_keep_their_keys_and_count_the_refusal(
         conditions=no_weather,
     )
     aggregate.check_record(record)
-    assert set(record) - {aggregate.HEIGHTS} == aggregate.RECORD_KEYS
+    assert set(record) - {aggregate.HEIGHTS, aggregate.UMBRELLA_HEIGHTS} == aggregate.RECORD_KEYS
     assert record["cameras_listed"] == 3
     assert record["frames_ok"] == 2
     assert record["frames_failed"] == {

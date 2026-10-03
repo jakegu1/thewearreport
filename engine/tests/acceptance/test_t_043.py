@@ -115,7 +115,7 @@ def _mixed() -> dict[str, Any]:
 
 
 def _without_field(record: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in record.items() if k != FIELD}
+    return {k: v for k, v in record.items() if k not in (FIELD, "umbrella_persons_by_height")}
 
 
 # AC1: height -----------------------------------------------------------------------

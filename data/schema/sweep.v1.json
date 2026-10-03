@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/jakegu1/thewearreport/blob/main/data/schema/sweep.v1.json",
   "title": "Sweep record (v1)",
-  "description": "Aggregate counts from one sweep of the TfL JamCams. One record per file at sweeps/YYYY/MM/DD/<sweep_id>.json on the data branch. Counts only: no images, boxes or coordinates of people. Rules the schema cannot express, enforced by wearreport.aggregate.check_record: sweep_id is the minute of started_at; finished_at is not before started_at; frames_ok plus every frames_failed count equals cameras_listed; persons_total and umbrellas_total are the sums over per_camera; per_camera has at most frames_ok entries; persons_by_height, when present, adds up to persons_total. check_record is authoritative and stricter than this schema (for example on calendar dates, integer counts written as floats and trailing newlines): a consumer that must reject every invalid record uses it.",
+  "description": "Aggregate counts from one sweep of the TfL JamCams. One record per file at sweeps/YYYY/MM/DD/<sweep_id>.json on the data branch. Counts only: no images, boxes or coordinates of people. Rules the schema cannot express, enforced by wearreport.aggregate.check_record: sweep_id is the minute of started_at; finished_at is not before started_at; frames_ok plus every frames_failed count equals cameras_listed; persons_total and umbrellas_total are the sums over per_camera; per_camera has at most frames_ok entries; persons_by_height, when present, adds up to persons_total; umbrella_persons_by_height, when present, has no count above the persons_by_height count for the same key and adds up to at most umbrellas_total. check_record is authoritative and stricter than this schema (for example on calendar dates, integer counts written as floats and trailing newlines): a consumer that must reject every invalid record uses it.",
   "type": "object",
   "required": [
     "schema",
@@ -23,6 +23,7 @@
     "attribution"
   ],
   "additionalProperties": false,
+  "dependentRequired": { "umbrella_persons_by_height": ["persons_by_height"] },
   "properties": {
     "schema": { "const": "sweep.v1" },
     "sweep_id": {
@@ -59,6 +60,15 @@
     "umbrellas_total": { "$ref": "#/$defs/count" },
     "persons_by_height": {
       "description": "Optional; present in the records published since it was added, absent from earlier ones. How many person boxes had each height: the key is the box's height in source-frame pixels, rounded (round(y2 - y1)), as a decimal without leading zeros from 0 to 119, or 120+ for every height of 120 px or more; the value is that number of boxes. Heights with no box are left out, and a sweep with no person has {}. Umbrellas are not included. Counts per height only: no position, width, score or camera. The counts add up to persons_total, a rule check_record enforces.",
+      "type": "object",
+      "maxProperties": 121,
+      "patternProperties": {
+        "^(0|[1-9][0-9]?|1[01][0-9]|120\\+)$": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "umbrella_persons_by_height": {
+      "description": "Optional; present exactly when persons_by_height is, in the records published since it was added, and absent from earlier ones. How many person boxes had an umbrella box associated with them, by the same height keys as persons_by_height. Rule: for a person box (x1, y1, x2, y2) of height h (as in persons_by_height), an umbrella box whose centre (ux, uy) satisfies x1 <= ux <= x2 and y1 - h <= uy <= y1 + h/2 is a candidate, in the same frame only; candidate pairs are matched greedily by the distance from the umbrella's centre to the person's top centre ((x1 + x2)/2, y1), ties broken by person index then umbrella index in the detector's output order, and each person and each umbrella is used at most once. A matched person counts once, under its height. Heights with no such person are left out, and a sweep where no one qualifies has {}. Counts per height only: no position, width, score or camera. No count exceeds the persons_by_height count for the same key, and the counts add up to at most umbrellas_total, rules check_record enforces.",
       "type": "object",
       "maxProperties": 121,
       "patternProperties": {
