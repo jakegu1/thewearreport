@@ -99,6 +99,22 @@ uv run --no-sync python -m wearreport.tools.spotcheck --n 20 --reviewer NAME
   instead (`%TEMP%`, on `C:` by default; set `TEMP` to a folder elsewhere to move it,
   outside any git clone).
 
+#### Labelling on Windows
+
+Double-click `label.cmd` in the clone for a whole attribute labelling session. It updates
+the clone (`git pull --ff-only`, then the `uv sync` above; a failure is reported in one line
+and the session goes on), sets `TMPDIR` for itself to `D:\spotcheck-tmp` (or
+`spotcheck-tmp` in your profile without a `D:` drive), picks Calgary or London, whichever is
+in daylight (or says when the next window opens), and runs spot-check passes in the window
+with the attribute settings (`--attributes --min-height 46 --min-persons 1 --view window
+--confirm-stop`). After each pass it shows the crops kept against the target and waits five
+minutes: Enter starts the next pass, `q` finishes. It stops by itself at 60 crops, at dusk,
+after six passes or after two failed passes in a row. With `DEEPINFRA_API_KEY` set it adds
+the hosted judge; otherwise it asks for the key once (masked; Enter means no judge). At the
+end it lists the attribute files written and copies their JSON, one per line, to the
+clipboard. Options go after the name, e.g. `label.cmd -Source london -Target 40 -Interval 3
+-MaxPasses 4 -NoJudge -TempDir E:\tmp`.
+
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
 
