@@ -17,6 +17,10 @@ Each record also carries `persons_by_height`: how many person boxes had each hei
 It holds counts per height only, never a position, width, score or camera, and it is
 optional in the schema: records published before it was added stay valid.
 
+Next to it, `umbrella_persons_by_height` counts, by the same height keys, the person
+boxes that an umbrella box is associated with (`match_umbrellas`). A record has it
+exactly when it has `persons_by_height`; records published before it stay valid.
+
 `check_record` enforces the schema (data/schema/sweep.v1.json) and the rules between
 fields that a JSON Schema cannot express. The publisher runs it before writing a record
 and on every record it reads back.
@@ -90,6 +94,9 @@ HEIGHTS: Final = "persons_by_height"
 TALL: Final = 120
 TALL_KEY: Final = f"{TALL}+"
 HEIGHT_KEYS: Final = frozenset({*(str(h) for h in range(TALL)), TALL_KEY})
+HEIGHT_ORDER: Final[tuple[str, ...]] = (*(str(h) for h in range(TALL)), TALL_KEY)
+# Optional, and present exactly when HEIGHTS is: person boxes with an umbrella, by height.
+UMBRELLA_HEIGHTS: Final = "umbrella_persons_by_height"
 WEATHER_KEYS: Final = frozenset({"temp_c", "apparent_c", "precip_mm", "observed_at", "source"})
 COUNT_KEYS: Final = frozenset({"persons", "umbrellas"})
 
@@ -109,13 +116,15 @@ class Observation:
     """What one camera contributed to a sweep: an error category, or two counts and the
     height of each person box (`box_height`), in no particular order. `person_heights`
     is None when the caller did not record heights; the record then has no
-    persons_by_height."""
+    persons_by_height. `umbrella_person_heights` holds the heights of the person boxes
+    that an umbrella box is associated with (`match_umbrellas`), in no particular order."""
 
     camera_id: str
     error: str | None
     persons: int = 0
     umbrellas: int = 0
     person_heights: tuple[int, ...] | None = None
+    umbrella_person_heights: tuple[int, ...] = ()
 
 
 # Formatting and parsing ----------------------------------------------------------------
@@ -170,6 +179,39 @@ def height_key(height: int) -> str:
     return TALL_KEY if height >= TALL else str(height)
 
 
+def match_umbrellas(
+    persons: Sequence[detect.Box], umbrellas: Sequence[detect.Box]
+) -> list[tuple[int, int]]:
+    """Associate umbrella boxes with person boxes: (person index, umbrella index) pairs,
+    in matching order. For a person P = (x1, y1, x2, y2) with h = box_height(P), an
+    umbrella centred on (ux, uy) is a candidate when x1 <= ux <= x2 and
+    y1 - h <= uy <= y1 + h/2. Candidate pairs are matched greedily by the distance from
+    the umbrella's centre to P's top centre ((x1 + x2) / 2, y1), ties broken by person
+    index, then umbrella index; each person and each umbrella is used at most once."""
+    centres = [((u[0] + u[2]) / 2, (u[1] + u[3]) / 2) for u in umbrellas]
+    candidates: list[tuple[float, int, int]] = []
+    for p, (x1, y1, x2, _) in enumerate(persons):
+        h = box_height(persons[p])
+        top_x = (x1 + x2) / 2
+        for u, (ux, uy) in enumerate(centres):
+            if x1 <= ux <= x2 and y1 - h <= uy <= y1 + h / 2:
+                candidates.append((math.hypot(ux - top_x, uy - y1), p, u))
+    candidates.sort()
+    used_persons: set[int] = set()
+    used_umbrellas: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    for _, p, u in candidates:
+        if p not in used_persons and u not in used_umbrellas:
+            used_persons.add(p)
+            used_umbrellas.add(u)
+            pairs.append((p, u))
+    return pairs
+
+
+def _histogram(heights: Counter[str]) -> dict[str, int]:
+    return {key: heights[key] for key in HEIGHT_ORDER if heights[key]}
+
+
 def _heights_histogram(observations: Sequence[Observation]) -> dict[str, int] | None:
     """persons_by_height over the frames that succeeded, keys in height order; None when
     no observation records heights. Raises RecordError when only some do, or when an
@@ -186,8 +228,24 @@ def _heights_histogram(observations: Sequence[Observation]) -> dict[str, int] | 
         if len(heights) != obs.persons:
             raise RecordError("person heights do not match the person count")
         counts.update(height_key(_count(h, "box height")) for h in heights)
-    ordered = [str(h) for h in range(TALL)] + [TALL_KEY]
-    return {key: counts[key] for key in ordered if counts[key]}
+    return _histogram(counts)
+
+
+def _umbrella_histogram(observations: Sequence[Observation]) -> dict[str, int]:
+    """umbrella_persons_by_height over the frames that succeeded. Raises RecordError
+    when an observation's umbrella heights are not among its person heights, or
+    outnumber its umbrellas."""
+    counts: Counter[str] = Counter()
+    for obs in observations:
+        if obs.error is not None:
+            continue
+        matched = Counter(obs.umbrella_person_heights)
+        if matched - Counter(obs.person_heights or ()):
+            raise RecordError("umbrella person heights are not among the person heights")
+        if len(obs.umbrella_person_heights) > obs.umbrellas:
+            raise RecordError("more umbrella persons than umbrellas")
+        counts.update(height_key(h) for h in obs.umbrella_person_heights)
+    return _histogram(counts)
 
 
 def _weather_fields(conditions: weather.Conditions) -> dict[str, Any]:
@@ -255,8 +313,12 @@ def build_record(
         "attribution": attribution,
     }
     histogram = _heights_histogram(observations)
+    umbrella_histogram = _umbrella_histogram(observations)
     if histogram is not None:
         record[HEIGHTS] = histogram
+        record[UMBRELLA_HEIGHTS] = umbrella_histogram
+    elif umbrella_histogram:
+        raise RecordError("umbrella person heights are recorded without person heights")
     check_record(record)
     return record
 
@@ -303,20 +365,33 @@ def _check_frames_failed(value: object) -> int:
     return sum(_count(v, "frames_failed count") for v in fields.values())
 
 
-def _check_heights(value: object, persons: int) -> None:
-    """persons_by_height: keys from HEIGHT_KEYS, positive integer counts summing to
-    `persons`. Never echoes a key or a value (either may be huge)."""
+def _height_counts(value: object, field: str) -> Mapping[str, int]:
+    """A histogram field: keys from HEIGHT_KEYS, positive integer counts. Never echoes a
+    key or a value (either may be huge)."""
     if not isinstance(value, dict) or len(value) > len(HEIGHT_KEYS):
-        raise RecordError(f"{HEIGHTS} is not an object of at most {len(HEIGHT_KEYS)} heights")
-    total = 0
+        raise RecordError(f"{field} is not an object of at most {len(HEIGHT_KEYS)} heights")
     for key, count in value.items():
         if not isinstance(key, str) or key not in HEIGHT_KEYS:
-            raise RecordError(f"{HEIGHTS} has a key that is not a height")
+            raise RecordError(f"{field} has a key that is not a height")
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-            raise RecordError(f"{HEIGHTS} has a count that is not a positive integer")
-        total += count
-    if total != persons:
+            raise RecordError(f"{field} has a count that is not a positive integer")
+    return value
+
+
+def _check_heights(value: object, persons: int) -> None:
+    """persons_by_height: a histogram whose counts sum to `persons`."""
+    if sum(_height_counts(value, HEIGHTS).values()) != persons:
         raise RecordError(f"{HEIGHTS} does not add up to persons_total")
+
+
+def _check_umbrella_heights(value: object, heights: Mapping[str, int], umbrellas: int) -> None:
+    """umbrella_persons_by_height: a histogram with no count above the persons_by_height
+    count for its key, and a total of at most `umbrellas`."""
+    counts = _height_counts(value, UMBRELLA_HEIGHTS)
+    if any(count > heights.get(key, 0) for key, count in counts.items()):
+        raise RecordError(f"{UMBRELLA_HEIGHTS} exceeds {HEIGHTS} for a height")
+    if sum(counts.values()) > umbrellas:
+        raise RecordError(f"{UMBRELLA_HEIGHTS} adds up to more than umbrellas_total")
 
 
 def _check_weather(value: object) -> None:
@@ -347,12 +422,14 @@ def check_record(record: object) -> None:
     started_at, finished_at is not earlier, the counts add up, and the attribution names
     exactly the sources used. frames_failed has the five categories of ERROR_KINDS, and
     also invalid_id when that count is at least 1. persons_by_height is optional; when
-    present, its counts add up to persons_total.
+    present, its counts add up to persons_total. umbrella_persons_by_height is optional
+    and needs persons_by_height; no count exceeds the persons_by_height count for its
+    key, and its counts add up to at most umbrellas_total.
     """
-    if isinstance(record, dict) and HEIGHTS in record:
-        rec = _object(record, RECORD_KEYS | {HEIGHTS}, "record")
-    else:
-        rec = _object(record, RECORD_KEYS, "record")
+    optional = {HEIGHTS, UMBRELLA_HEIGHTS} & set(record) if isinstance(record, dict) else set()
+    if UMBRELLA_HEIGHTS in optional and HEIGHTS not in optional:
+        raise RecordError(f"{UMBRELLA_HEIGHTS} is present without {HEIGHTS}")
+    rec = _object(record, RECORD_KEYS | optional, "record")
     if rec["schema"] != SCHEMA_VERSION or rec["source"] != SOURCE:
         raise RecordError("schema or source is wrong")
     sweep_id = _string(rec["sweep_id"], SWEEP_ID, "sweep_id")
@@ -383,6 +460,8 @@ def check_record(record: object) -> None:
         _check_heights(rec[HEIGHTS], persons)
     if _count(rec["umbrellas_total"], "umbrellas_total") != umbrellas:
         raise RecordError("umbrellas_total is not the sum over per_camera")
+    if UMBRELLA_HEIGHTS in rec:
+        _check_umbrella_heights(rec[UMBRELLA_HEIGHTS], rec[HEIGHTS], umbrellas)
     _check_weather(rec["weather"])
     _string(rec["engine_version"], ENGINE_VERSION, "engine_version")
     _string(rec["model"], MODEL_NAME, "model")
@@ -431,8 +510,8 @@ def usable_cameras(
 
 def detect_counts(detector: detect.Detector, results: list[fetch.FrameResult]) -> list[Observation]:
     """One observation per fetch result, in order. Consumes `results`: each frame is
-    released as soon as the detector has seen it, and only the two counts and the
-    heights of the person boxes are kept."""
+    released as soon as the detector has seen it, and only the two counts, the heights
+    of the person boxes and the heights of those with an umbrella are kept."""
     results.reverse()
     observations: list[Observation] = []
     while results:
@@ -453,10 +532,16 @@ def detect_counts(detector: detect.Detector, results: list[fetch.FrameResult]) -
             continue
         finally:
             del frame
-        heights = tuple(box_height(d.box) for d in found if d.label == "person")
-        umbrellas = sum(d.label == "umbrella" for d in found)
+        persons = [d.box for d in found if d.label == "person"]
+        umbrellas = [d.box for d in found if d.label == "umbrella"]
         del found
-        observations.append(Observation(camera_id, None, len(heights), umbrellas, heights))
+        heights = tuple(box_height(box) for box in persons)
+        sheltered = tuple(heights[p] for p, _ in match_umbrellas(persons, umbrellas))
+        del persons
+        observations.append(
+            Observation(camera_id, None, len(heights), len(umbrellas), heights, sheltered)
+        )
+        del umbrellas
     return observations
 
 
