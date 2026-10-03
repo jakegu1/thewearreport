@@ -78,8 +78,11 @@ def test_selection_reads_the_named_fields_and_resolves() -> None:
         policy=calgary.image_policy,
         fields=(calgary.url_field, calgary.point_field),
     )
-    assert selection.urls == ["https://trafficcam.calgary.ca/loc1.jpg"]
-    assert (selection.listed, selection.skipped, selection.refused) == (4, 2, 1)
+    assert selection.urls == [
+        "https://trafficcam.calgary.ca/loc1.jpg",
+        "https://trafficcam.calgary.ca/loc4.jpg",
+    ]
+    assert (selection.listed, selection.skipped, selection.refused) == (4, 1, 1)
     # Austin's fields stay the default: Calgary's records are malformed there.
     assert ph.select_cameras(records, calgary.bbox, policy=calgary.image_policy).skipped == 3
 
