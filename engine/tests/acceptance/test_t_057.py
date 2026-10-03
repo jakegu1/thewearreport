@@ -171,7 +171,8 @@ def test_ac3_the_committed_directory_still_loads(capsys: pytest.CaptureFixture[s
     assert len(labellings) >= len(REAL_FILES)
     assert spotcheck_summary.main(["--attributes", "--dir", str(REAL_DIR)]) == 0
     out = capsys.readouterr().out
-    assert out.startswith(f"{len(labellings)} attribute file(s) in ")
+    london = [s for s in labellings if s.source == "london"]
+    assert out.startswith(f"{len(london)} attribute file(s) in ")
 
 
 # AC4: the judge module's docstring --------------------------------------------------------
