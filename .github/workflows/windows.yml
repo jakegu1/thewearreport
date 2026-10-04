@@ -60,9 +60,10 @@ jobs:
       - name: Labelling launcher tests (T-067)
         # Windows PowerShell runs label.ps1 with spotcheck's dry run, a test reviewer, a
         # fake judge on 127.0.0.1, fake git and uv, and a file in place of the clipboard.
-        # T-073: label-london.cmd (one London pass, no judge) with the same fakes.
+        # T-073: label-london.cmd (one London pass, no judge) with the same fakes. -rP
+        # prints the passed tests' output: the launcher's lines and spotcheck's arguments.
         run: >-
-          uv run --no-sync pytest -v -rs --capture=sys
+          uv run --no-sync pytest -v -rsP --capture=sys
           engine/tests/acceptance/test_t_067.py
           engine/tests/acceptance/test_t_073.py
           engine/tests/unit/test_label_window.py
