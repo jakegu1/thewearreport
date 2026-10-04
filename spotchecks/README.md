@@ -375,6 +375,18 @@ window shows the crop and the current question above it:
 2. `bare_legs`: "Bare legs (shorts or short skirt)?"
 3. `umbrella`: "Holding an open umbrella?"
 
+The questions are short; the reviewer answers them by this codebook. The outer layer is the
+outermost garment, whatever is worn under it.
+
+- `y`: a coat or jacket with sleeves that opens at the front: coats, down or puffer
+  jackets, rain jackets, blazers and suit jackets, denim or leather jackets, fleece
+  jackets.
+- `n`: a T-shirt, shirt, sweater, cardigan, hoodie (with a hood or a zip) or a sleeveless
+  vest as the outermost layer.
+- `u`: when it cannot be told (hidden, cut off, too small or blurred); do not guess.
+
+Bare legs are shorts or a short skirt. Umbrella means an open umbrella.
+
 | Key | Meaning |
 |---|---|
 | `y` | yes |
