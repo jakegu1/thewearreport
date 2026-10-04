@@ -1,7 +1,5 @@
 # Methodology
 
-By [Jake Gu](/about/) · Updated 4 October 2026
-
 This page explains how every number on The Wear Report is made, how sure it is, and what it does
 not show. The aggregate data is published in the engine repository. Changes are listed at the end.
 
@@ -118,13 +116,6 @@ spot checks were made at each hour of the day.
 CI enforces rule 1 for sweeps: a static check blocks image-writing calls in the engine, and an
 end-to-end test runs a full sweep against a local fake camera server and checks that no image bytes
 are left anywhere. The detector's runtime has its telemetry switched off.
-
-## See the data
-
-- [What to wear by temperature](/what-to-wear/): every temperature band, with people counted and
-  hand-check progress.
-- [London](/london/): the latest sweep and people out by hour.
-- [About the author](/about/).
 
 ## Sources and attribution
 
