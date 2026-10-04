@@ -114,6 +114,10 @@ the hosted judge; otherwise it asks for the key once (masked; Enter means no jud
 end it lists the attribute files written and copies their JSON, one per line, to the
 clipboard. Options go after the name, e.g. `label.cmd -Source london -Target 40 -Interval 3
 -MaxPasses 4 -NoJudge -TempDir E:\tmp`.
+`label-london.cmd` next to it fixes the settings of the daily London sessions: double-click
+it for exactly one pass on London, without the hosted judge (the same as `label.cmd -Source
+london -MaxPasses 1 -NoJudge`; a second pass minutes later would show some of the same
+people again). Other options still go after the name.
 
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.
