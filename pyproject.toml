@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=2.5.3",
     "onnxruntime>=1.30.0",
     "opencv-python-headless>=5.0.0.93",
+    "tzdata>=2025.2",
 ]
 
 [project.scripts]
