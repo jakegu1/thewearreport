@@ -117,7 +117,9 @@ clipboard. Options go after the name, e.g. `label.cmd -Source london -Target 40 
 `label-london.cmd` next to it fixes the settings of the daily London sessions: double-click
 it for exactly one pass on London, without the hosted judge (the same as `label.cmd -Source
 london -MaxPasses 1 -NoJudge`; a second pass minutes later would show some of the same
-people again). Other options still go after the name.
+people again). Other options still go after the name. Either launcher starts a London
+session only in daylight between 09:30 and 15:00 London time (BST or GMT); outside that it
+says when the next London window opens.
 
 Configuration comes from environment variables, listed in [.env.example](./.env.example).
 Copy it to `.env` (never committed) and fill in the values you need.

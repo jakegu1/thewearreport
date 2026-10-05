@@ -65,6 +65,14 @@ def _lit(moment: datetime.datetime, city: str) -> bool:
     return spotcheck.light_at(moment, WHERE[city]) != "dark"
 
 
+def _in_london_window(moment: datetime.datetime) -> bool:
+    """The London labelling window, 09:30-15:00 Europe/London (T-077)."""
+    from zoneinfo import ZoneInfo
+
+    local = moment.astimezone(ZoneInfo("Europe/London"))
+    return 9 * 60 + 30 <= local.hour * 60 + local.minute < 15 * 60
+
+
 def _expected_next(
     now: datetime.datetime, cities: tuple[str, ...]
 ) -> tuple[datetime.datetime, str]:
@@ -76,7 +84,7 @@ def _expected_next(
     for i in range(48 * 60 + 1):
         moment = start + i * MINUTE
         for city in cities:
-            if _lit(moment, city):
+            if _lit(moment, city) and (city != "london" or _in_london_window(moment)):
                 return moment, city
     raise AssertionError("no daylight within 48 hours")
 
@@ -809,7 +817,7 @@ def test_ac2_dark_everywhere_exits_with_the_next_window(launcher: Launcher) -> N
 
 @windows_only
 def test_ac2_forced_source(launcher: Launcher) -> None:
-    session = launcher.run("-Source", "london", "-Target", "1", now="2026-06-21T19:00Z")
+    session = launcher.run("-Source", "london", "-Target", "1", now="2026-06-21T13:00Z")
     assert session.calls and all(
         _value(c["argv"], "--source") == "london"  # type: ignore[arg-type]
         for c in session.calls

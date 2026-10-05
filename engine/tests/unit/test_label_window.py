@@ -35,7 +35,8 @@ def test_no_window_within_the_search_gives_none(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_the_next_window_is_found_to_the_minute(monkeypatch: pytest.MonkeyPatch) -> None:
-    opens = datetime.datetime(2026, 6, 21, 14, 37, tzinfo=UTC)
+    # 14:37 BST, inside the London labelling window (T-077).
+    opens = datetime.datetime(2026, 6, 21, 13, 37, tzinfo=UTC)
 
     def elevation(moment: datetime.datetime, latitude: float, longitude: float) -> float:
         lit = (latitude, longitude) == label_window.CITIES["london"] and moment >= opens

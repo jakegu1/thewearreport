@@ -7,9 +7,11 @@ hold.
 
 `city` prints one line of JSON. With `--source auto` (the default) it is
 `{"city": "calgary"}` when Calgary is in daylight now, else `{"city": "london"}` when London
-is, else `{"city": null, "next_window": "YYYY-MM-DDTHH:MMZ", "next_city": NAME}`: the first
-whole UTC minute, at or after now and within MAX_SEARCH, with daylight in either city
-(Calgary first when both). `--source calgary` or `london` asks about that city only.
+is in daylight and its local time (Europe/London, BST or GMT) is in the daily window
+[09:30, 15:00), else `{"city": null, "next_window": "YYYY-MM-DDTHH:MMZ", "next_city": NAME}`:
+the first whole UTC minute, at or after now and within MAX_SEARCH, when either city may
+start by those rules (Calgary first when both). `--source calgary` or `london` asks about
+that city only.
 Daylight is what the spot-check tool's attribute sessions need: the sun not below
 DARK_BELOW_DEG (civil twilight counts), from the engine's own solar position code
 (`pilot_heights.solar_elevation`). `--now` (an ISO 8601 time with a zone, for tests) fixes
@@ -31,6 +33,7 @@ import argparse
 import datetime
 import json
 import sys
+import zoneinfo
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +51,11 @@ SOURCES = ("auto", *PREFERENCE)
 # The spot-check tool's "dark": an attribute session in the window is refused when the
 # sun is below this (its LIGHT_TWILIGHT_DEG; the acceptance tests assert they are equal).
 DARK_BELOW_DEG = -6.0
+# London sessions must start in this daily window, London local time (BST or GMT):
+# LONDON_OPENS <= time < LONDON_CLOSES.
+LONDON_ZONE = zoneinfo.ZoneInfo("Europe/London")
+LONDON_OPENS = datetime.time(9, 30)
+LONDON_CLOSES = datetime.time(15, 0)
 MAX_SEARCH = datetime.timedelta(hours=48)
 MINUTE = datetime.timedelta(minutes=1)
 MAX_FILE_BYTES = 1024 * 1024
@@ -90,29 +98,44 @@ def in_daylight(city: str, moment: datetime.datetime) -> bool:
     return pilot_heights.solar_elevation(moment, *CITIES[city]) >= DARK_BELOW_DEG
 
 
+def in_window(city: str, moment: datetime.datetime) -> bool:
+    """True if a session in `city` may start at `moment` (aware) by the clock: for London,
+    LONDON_OPENS <= London local time < LONDON_CLOSES; Calgary has no such window."""
+    if city != "london":
+        return True
+    local = moment.astimezone(LONDON_ZONE).time()
+    return LONDON_OPENS <= local < LONDON_CLOSES
+
+
+def can_start(city: str, moment: datetime.datetime) -> bool:
+    """True if `city` may be labelled at `moment`: in daylight and in its window."""
+    return in_window(city, moment) and in_daylight(city, moment)
+
+
 def next_window(
     cities: Sequence[str], now: datetime.datetime
 ) -> tuple[datetime.datetime, str] | None:
     """The first whole UTC minute at or after `now`, within MAX_SEARCH, with daylight in
-    one of `cities` (the earlier in the sequence when several), and that city."""
+    one of `cities` and, for London, its window (the earlier in the sequence when several),
+    and that city."""
     start = now.astimezone(datetime.UTC).replace(second=0, microsecond=0)
     if start < now:
         start += MINUTE
     for i in range(int(MAX_SEARCH / MINUTE) + 1):
         moment = start + i * MINUTE
         for city in cities:
-            if in_daylight(city, moment):
+            if can_start(city, moment):
                 return moment, city
     return None
 
 
 def choose(source: str, now: datetime.datetime) -> Choice:
     """The city to label at `now`: with `source` "auto", Calgary if it is in daylight,
-    else London if it is; otherwise the forced city if it is. Without daylight, when the
-    next window opens."""
+    else London if it is in daylight and its window; otherwise the forced city if it is.
+    Otherwise, when the next window opens."""
     cities = PREFERENCE if source == "auto" else (source,)
     for city in cities:
-        if in_daylight(city, now):
+        if can_start(city, now):
             return Choice(city)
     found = next_window(cities, now)
     if found is None:

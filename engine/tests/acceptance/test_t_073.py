@@ -59,6 +59,14 @@ def _lit(moment: datetime.datetime, where: tuple[float, float]) -> bool:
     return spotcheck.light_at(moment, where) != "dark"
 
 
+def _in_london_window(moment: datetime.datetime) -> bool:
+    """The London labelling window, 09:30-15:00 Europe/London (T-077)."""
+    from zoneinfo import ZoneInfo
+
+    local = moment.astimezone(ZoneInfo("Europe/London"))
+    return 9 * 60 + 30 <= local.hour * 60 + local.minute < 15 * 60
+
+
 # Both cities in daylight: a launcher that chose by itself would pick Calgary.
 BOTH_LIT = _at("2026-06-21T19:00")  # 13:00 in Calgary, 20:00 in London
 LONDON_DARK = _at("2026-12-21T04:00")  # 04:00 in London, 21:00 in Calgary
@@ -70,7 +78,7 @@ def _london_next_window(now: datetime.datetime) -> datetime.datetime:
         start += MINUTE
     for i in range(48 * 60 + 1):
         moment = start + i * MINUTE
-        if _lit(moment, spotcheck.LONDON):
+        if _lit(moment, spotcheck.LONDON) and _in_london_window(moment):
             return moment
     raise AssertionError("no London daylight within 48 hours")
 
@@ -379,7 +387,7 @@ def _value(argv: list[str], flag: str) -> str:
 
 @windows_only
 def test_ac2_one_london_pass_without_the_judge(tmp_path: Path) -> None:
-    session = _run(tmp_path, now="2026-06-21T19:00Z")
+    session = _run(tmp_path, now="2026-06-21T13:00Z")
     assert session.code == 0
     assert len(session.calls) == 1
     argv = session.calls[0]["argv"]
