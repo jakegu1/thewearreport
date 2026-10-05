@@ -1575,7 +1575,8 @@ def test_ac6_no_new_dependency() -> None:
     deps = text.split("dependencies = [", 1)[1].split("]", 1)[0]
     lines = [line.strip().strip('",') for line in deps.splitlines() if line.strip()]
     names = sorted(line.split("=")[0].split(">")[0] for line in lines)
-    assert names == ["llama-cpp-python", "numpy", "onnxruntime", "opencv-python-headless"]
+    # T-077 adds tzdata (zoneinfo on Windows); the list is otherwise unchanged.
+    assert names == ["llama-cpp-python", "numpy", "onnxruntime", "opencv-python-headless", "tzdata"]
 
 
 def test_ac6_the_guide_documents_the_source() -> None:
