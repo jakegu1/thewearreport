@@ -10,7 +10,8 @@ hold.
 is in daylight and its local time (Europe/London, BST or GMT) is in the daily window
 [09:30, 15:00), else `{"city": null, "next_window": "YYYY-MM-DDTHH:MMZ", "next_city": NAME}`:
 the first whole UTC minute, at or after now and within MAX_SEARCH, when either city may
-start by those rules (Calgary first when both). `--source calgary` or `london` asks about that city only.
+start by those rules (Calgary first when both). `--source calgary` or `london` asks about
+that city only.
 Daylight is what the spot-check tool's attribute sessions need: the sun not below
 DARK_BELOW_DEG (civil twilight counts), from the engine's own solar position code
 (`pilot_heights.solar_elevation`). `--now` (an ISO 8601 time with a zone, for tests) fixes
