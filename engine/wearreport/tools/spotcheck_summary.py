@@ -145,6 +145,7 @@ ATTRIBUTE_FIELDS = frozenset(
     }
 )
 ATTRIBUTE_NAMES = ("outer_layer", "bare_legs", "umbrella")  # the letters' order
+CAMERA_YIELD = "camera_yield"  # optional (--record-camera-yield): checked, then not used
 # Where an attribute file's frames came from: London (no source key), Austin or Calgary,
 # in the order the summary reports them.
 SOURCES = ("london", "austin", "calgary")
@@ -196,6 +197,22 @@ def _json(raw: bytes) -> object:
     """A file's JSON, refusing a duplicate key in any object: a reader that kept the
     last value would silently drop the first."""
     return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+
+
+# The names an attribute file's own objects use (the top level and its detector): a
+# duplicate of one of these is named; any other key, a camera id among them, is not.
+LABELLING_NAMES = ATTRIBUTE_FIELDS | {"source", CAMERA_YIELD, "model", "sha256", "conf"}
+
+
+def _no_duplicate_names(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            if key in LABELLING_NAMES:
+                raise ValueError(f"the key {key!r} appears twice in one object")
+            raise ValueError("a key appears twice in one object")
+        seen[key] = value
+    return seen
 
 
 def _count(value: object, what: str) -> int:
@@ -772,10 +789,12 @@ def _crop(value: object, judged: bool, min_height: int) -> Crop:
 
 
 def parse_labelling(raw: bytes) -> Labelling:
-    """One attribute file; raises ValueError (or a subclass) when it is malformed."""
+    """One attribute file; raises ValueError (or a subclass) when it is malformed. A
+    duplicate key is named only when it is one of the file's own field names, never a
+    camera id."""
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
-    data = _json(raw)
+    data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_names)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     fields = set(data)
@@ -785,6 +804,7 @@ def parse_labelling(raw: bytes) -> Labelling:
             raise ValueError('source is not "austin" or "calgary" (a London file has no source)')
         source = data["source"]
         fields.discard("source")
+    fields.discard(CAMERA_YIELD)
     if fields != ATTRIBUTE_FIELDS:
         raise ValueError("its fields are not " + ", ".join(sorted(ATTRIBUTE_FIELDS)))
     day = data["date"]
@@ -815,14 +835,36 @@ def parse_labelling(raw: bytes) -> Labelling:
         raise ValueError("crops is not a list")
     if rejected > shown or len(crops) != shown - rejected:
         raise ValueError("crops_shown, crops_rejected and crops do not agree")
+    parsed = tuple(_crop(crop, judge is not None, min_height) for crop in crops)
+    if CAMERA_YIELD in data:
+        judgeable = sum(1 for crop in parsed if crop[1][0] in "yn")
+        _check_camera_yield(data[CAMERA_YIELD], (shown, rejected, judgeable))
     return Labelling(
         started_at=_utc(started, _STARTED_AT, "%Y-%m-%dT%H:%MZ"),
         light=light,
         shown=shown,
         rejected=rejected,
-        crops=tuple(_crop(crop, judge is not None, min_height) for crop in crops),
+        crops=parsed,
         source=source,
     )
+
+
+def _check_camera_yield(value: object, totals: tuple[int, int, int]) -> None:
+    """An attribute file's camera_yield: per camera, [shown, rejected, judgeable] with
+    shown at least 1, rejected at most shown and judgeable at most the crops kept, adding
+    up to `totals`. Raises ValueError, naming no camera, when it is not."""
+    if not isinstance(value, dict) or not value:
+        raise ValueError("camera_yield is not an object of cameras")
+    sums = [0, 0, 0]
+    for camera, counts in value.items():
+        if not camera or not isinstance(counts, list) or len(counts) != 3:
+            raise ValueError("a camera_yield entry is not [shown, rejected, judgeable]")
+        shown, rejected, judgeable = (_count(c, "a camera_yield count") for c in counts)
+        if shown < 1 or rejected > shown or judgeable > shown - rejected:
+            raise ValueError("a camera_yield entry does not agree with itself")
+        sums = [sums[0] + shown, sums[1] + rejected, sums[2] + judgeable]
+    if tuple(sums) != totals:
+        raise ValueError("camera_yield does not add up to the crops shown, rejected and judgeable")
 
 
 def load_labellings(directory: Path) -> list[Labelling]:

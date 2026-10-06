@@ -5,6 +5,7 @@
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
       [--confirm-stop] [--allow-dark] [--source london|austin|calgary] [--bbox S,W,N,E]
+      [--record-camera-yield]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -46,7 +47,8 @@ with `tempfile.mkdtemp(prefix=TEMP_PREFIX)` (mode 0700) and always deletes:
   locked, so a second instance never deletes it;
 - image files are created with O_EXCL and O_NOFOLLOW (where the platform has it), mode
   0600, and named after their number only (`crop-0001.png`, `frame-0001.png`), never
-  after a camera. Camera ids are dropped as soon as the sweep is fetched.
+  after a camera. Camera ids are dropped as soon as the sweep is fetched (in an attribute
+  session with `--record-camera-yield`, once the per-camera counts are made).
 
 The window view (`--view window`) writes no image and creates no directory: each crop is
 encoded to PNG bytes in memory and handed to a tkinter PhotoImage as data.
@@ -88,7 +90,11 @@ tool writes one file, `<out-dir>/attributes/YYYY-MM-DD.json` (then `-2`, ...): e
 crop's height and the reviewer's and the model's answers, and nothing else (no statistics
 file, no per-box file). Frames mode, keyboard entry and `--record-boxes` are refused. In
 the window, the session does not start when it is dark in London (sun below -6°) unless
-`--allow-dark` is given; answers from a JSON file are taken at any light.
+`--allow-dark` is given; answers from a JSON file are taken at any light. With
+`--record-camera-yield` (attribute sessions only), each frame's camera id stays with it in
+memory until the review is over, and the file gains `camera_yield`: per camera that gave a
+crop shown, [shown, rejected, judgeable on the first question]. Counts only; the crop rows
+are as without it.
 
 With `--source austin` (attribute sessions only; anything else is a usage error, exit 2),
 the frames are one pass over the City of Austin's traffic cameras inside `--bbox` (default
@@ -198,6 +204,7 @@ VIEWS: tuple[View, ...] = get_args(View)
 Source = Literal["london", "austin", "calgary"]
 SOURCES: tuple[Source, ...] = get_args(Source)
 Frame = npt.NDArray[np.uint8]
+CameraFrame = tuple[str, Frame]  # a frame and its camera's id, in memory only
 
 TEMP_PREFIX = "wearreport-spotcheck-"
 NUMBERING_FILE = "numbering.json"
@@ -394,17 +401,23 @@ class DetectorInfo:
 
 @dataclass(frozen=True, slots=True)
 class Pipeline:
-    """Where frames come from and what detects people in them."""
+    """Where frames come from and what detects people in them. `camera_frames`, if
+    given, is the same sweep with each frame's camera id (for --record-camera-yield)."""
 
     frames: Callable[[], Iterable[Frame]]
     detector: FrameDetector
     info: DetectorInfo
+    camera_frames: Callable[[], Iterable[CameraFrame]] | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Sample:
+    """A sampled frame and its person boxes; `camera` is its camera's id when the sweep
+    kept it (sample_cameras), in memory only, else None."""
+
     frame: Frame
     persons: tuple[detect.Detection, ...]
+    camera: str | None = None
 
 
 def sample(
@@ -425,10 +438,38 @@ def sample(
 
     A frame on which the detector raises DetectorError is skipped, and the number skipped
     is printed to stderr: only the count, never a camera id or image data."""
+    pairs = ((None, frame) for frame in frames)
+    return _sample(pairs, detector, n, min_persons, seed, progress, min_height)
+
+
+def sample_cameras(
+    frames: Iterable[CameraFrame],
+    detector: FrameDetector,
+    *,
+    n: int,
+    min_persons: int,
+    seed: int | None,
+    progress: Callable[[int], None] | None = None,
+    min_height: int = 0,
+) -> list[Sample]:
+    """As `sample`, over (camera id, frame) pairs: each Sample keeps its frame's camera id
+    (in memory only), and the same seed chooses the same frames."""
+    return _sample(frames, detector, n, min_persons, seed, progress, min_height)
+
+
+def _sample(
+    frames: Iterable[tuple[str | None, Frame]],
+    detector: FrameDetector,
+    n: int,
+    min_persons: int,
+    seed: int | None,
+    progress: Callable[[int], None] | None,
+    min_height: int,
+) -> list[Sample]:
     rng = random.Random(seed)  # noqa: S311  (sampling, not security)
     kept: list[tuple[int, Sample]] = []
     seen = skipped = done = 0
-    for frame in frames:
+    for camera, frame in frames:
         found: list[detect.Detection] | None = None
         try:
             found = detector.detect(frame)
@@ -443,11 +484,11 @@ def sample(
         if len(persons) < min_persons:
             continue
         if len(kept) < n:
-            kept.append((seen, Sample(frame, persons)))
+            kept.append((seen, Sample(frame, persons, camera)))
         else:
             slot = rng.randint(0, seen)
             if slot < n:
-                kept[slot] = (seen, Sample(frame, persons))
+                kept[slot] = (seen, Sample(frame, persons, camera))
         seen += 1
     if skipped:
         print(
@@ -467,34 +508,53 @@ def _due(done: int, total: int | None) -> bool:
     return done % PROGRESS_EVERY == 0 or done == total
 
 
-class Frames:
-    """A sweep's frames, without their camera ids, in camera order. Iterating hands each
-    frame on once and lets go of it; the length is the number of frames fetched."""
+class _Held[T]:
+    """A sweep's items in camera order. Iterating hands each item on once and lets go of
+    it; the length is the number of frames fetched."""
 
-    def __init__(self, frames: list[Frame]) -> None:
-        self._total = len(frames)
-        self._frames = frames[::-1]
+    def __init__(self, items: list[T]) -> None:
+        self._total = len(items)
+        self._items = items[::-1]
 
     def __len__(self) -> int:
         return self._total
 
-    def __iter__(self) -> Iterator[Frame]:
-        while self._frames:
-            yield self._frames.pop()
+    def __iter__(self) -> Iterator[T]:
+        while self._items:
+            yield self._items.pop()
+
+
+class Frames(_Held[Frame]):
+    """A sweep's frames, without their camera ids, in camera order (see _Held)."""
+
+
+class CameraFrames(_Held[CameraFrame]):
+    """A sweep's frames, each with its camera's id, in camera order (see _Held)."""
 
 
 def sweep_frames(cameras: Sequence[registry.Camera]) -> Frames:
     """Fetch one sweep in memory with `fetch.fetch_sweep`, PROGRESS_EVERY cameras at a
     time, printing the number of cameras, then a progress line after each batch. Camera
     ids are dropped with each result."""
+    return Frames(_swept(cameras, lambda _camera, frame: frame))
+
+
+def sweep_camera_frames(cameras: Sequence[registry.Camera]) -> CameraFrames:
+    """As sweep_frames, keeping each frame's camera id with it, in memory only."""
+    return CameraFrames(_swept(cameras, lambda camera, frame: (camera, frame)))
+
+
+def _swept[T](cameras: Sequence[registry.Camera], keep: Callable[[str, Frame], T]) -> list[T]:
     total = len(cameras)
     _progress(f"{total} cameras listed")
-    frames: list[Frame] = []
+    items: list[T] = []
     for start in range(0, total, PROGRESS_EVERY):
         batch = cameras[start : start + PROGRESS_EVERY]
-        frames += [r.frame for r in fetch.fetch_sweep(batch) if r.frame is not None]
+        items += [
+            keep(r.camera_id, r.frame) for r in fetch.fetch_sweep(batch) if r.frame is not None
+        ]
         _progress(f"fetched {start + len(batch)} of {total}")
-    return Frames(frames)
+    return items
 
 
 _sweep_frames = sweep_frames  # the name child processes in earlier tests call
@@ -523,14 +583,18 @@ def _open_detector(model: str) -> tuple[detect.Detector, DetectorInfo]:
 def live_pipeline(model: str) -> Pipeline:
     detector, info = _open_detector(model)
 
-    def frames() -> Frames:
+    def cameras() -> list[registry.Camera]:
         try:
-            cameras = registry.list_cameras(load_settings().tfl_app_key)
+            return registry.list_cameras(load_settings().tfl_app_key)
         except (registry.RegistryError, SettingsError) as exc:
             raise SpotcheckError(f"cannot list cameras: {exc}") from None
-        return sweep_frames(cameras)
 
-    return Pipeline(frames=frames, detector=detector, info=info)
+    return Pipeline(
+        frames=lambda: sweep_frames(cameras()),
+        detector=detector,
+        info=info,
+        camera_frames=lambda: sweep_camera_frames(cameras()),
+    )
 
 
 def dry_run_pipeline(model: str) -> Pipeline:
@@ -543,15 +607,20 @@ def dry_run_pipeline(model: str) -> Pipeline:
         raise SpotcheckError(f"cannot read the dry-run fixtures: {exc.strerror}") from None
     detector, info = _open_detector(model)
 
-    def frames() -> Frames:
+    def swept[T](sweep: Callable[[Sequence[registry.Camera]], T]) -> T:
         with FakeCameraServer() as server:
             cameras = server.cameras(DRY_RUN_CAMERAS)
             for i, camera in enumerate(cameras):
                 if i % 3 != 2:  # every third camera serves noise
                     server.serve_body(camera.id, bodies[i % len(bodies)])
-            return sweep_frames(cameras)
+            return sweep(cameras)
 
-    return Pipeline(frames=frames, detector=detector, info=info)
+    return Pipeline(
+        frames=lambda: swept(sweep_frames),
+        detector=detector,
+        info=info,
+        camera_frames=lambda: swept(sweep_camera_frames),
+    )
 
 
 # Austin -------------------------------------------------------------------------------
@@ -692,6 +761,33 @@ def city_frames(
     policies, one attempt per camera and the body cap are pilot_heights'. At most
     `concurrency` stills are being fetched or waiting at a time, and nothing is kept once
     handed on. Prints counts only: never a URL, a camera or image data."""
+    stills = city_camera_frames(
+        city, endpoints, bbox, still, timeout_s=timeout_s, concurrency=concurrency
+    )
+    return _frames_only(stills)
+
+
+def _frames_only(stills: Generator[CameraFrame]) -> Generator[Frame]:
+    """The frames of `stills`, without their camera ids; closing this closes `stills`."""
+    try:
+        for _camera, frame in stills:
+            yield frame
+            del frame
+    finally:
+        stills.close()
+
+
+def city_camera_frames(
+    city: pilot_heights.City,
+    endpoints: CityEndpoints,
+    bbox: pilot_heights.BBox,
+    still: StillFetcher,
+    *,
+    timeout_s: float = AUSTIN_FETCH_TIMEOUT_S,
+    concurrency: int = pilot_heights.CONCURRENCY,
+) -> Generator[CameraFrame]:
+    """As city_frames, each still with its camera's id: the still URL the selection
+    resolved, in memory only."""
     end = time.monotonic() + timeout_s
     try:
         records = pilot_heights.fetch_dataset(
@@ -717,11 +813,11 @@ def city_frames(
     urls = iter(selection.urls)
     scheme = endpoints.image_policy.scheme
     pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=city.name)
-    pending: set[Future[Frame]] = set()
+    pending: dict[Future[Frame], str] = {}
 
     def submit() -> None:
         for url in urls:
-            pending.add(pool.submit(still, url, scheme, end))
+            pending[pool.submit(still, url, scheme, end)] = url
             return
 
     try:
@@ -737,12 +833,12 @@ def city_frames(
                 counts["failed_timeout"] += stuck
                 break
             for future in done:
-                pending.discard(future)
+                url = pending.pop(future)
                 submit()
                 frame = _austin_result(future, counts)
                 if frame is not None:
                     counts["ok"] += 1
-                    yield frame
+                    yield url, frame
                 del frame
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -758,14 +854,28 @@ def austin_pipeline(
     model: str, bbox: pilot_heights.BBox, endpoints: AustinEndpoints, opener: DetectorOpener
 ) -> Pipeline:
     detector, info = opener(model)
-    return Pipeline(frames=lambda: austin_frames(endpoints, bbox), detector=detector, info=info)
+    return Pipeline(
+        frames=lambda: austin_frames(endpoints, bbox),
+        detector=detector,
+        info=info,
+        camera_frames=lambda: city_camera_frames(
+            pilot_heights.AUSTIN_CITY, endpoints, bbox, _austin_still
+        ),
+    )
 
 
 def calgary_pipeline(
     model: str, bbox: pilot_heights.BBox, endpoints: CalgaryEndpoints, opener: DetectorOpener
 ) -> Pipeline:
     detector, info = opener(model)
-    return Pipeline(frames=lambda: calgary_frames(endpoints, bbox), detector=detector, info=info)
+    return Pipeline(
+        frames=lambda: calgary_frames(endpoints, bbox),
+        detector=detector,
+        info=info,
+        camera_frames=lambda: city_camera_frames(
+            pilot_heights.CALGARY_CITY, endpoints, bbox, _calgary_still
+        ),
+    )
 
 
 def _hd_still(body: bytes, frame_size: tuple[int, int] = AUSTIN_FRAME_SIZE) -> bytes:
@@ -817,7 +927,7 @@ def _dry_run_city_pipeline(
     south, west, north, east = bbox
     where = [(west + east) / 2, (south + north) / 2]  # GeoJSON: longitude, then latitude
 
-    def frames() -> Iterator[Frame]:
+    def sweep() -> Generator[CameraFrame]:
         with FakeCameraServer() as server:
             records = []
             for i in range(DRY_RUN_AUSTIN_CAMERAS):
@@ -829,15 +939,19 @@ def _dry_run_city_pipeline(
             server.serve_body("cameras", json.dumps(records).encode())
             policy = pilot_heights.UrlPolicy("http", urllib.parse.urlsplit(server.base_url).netloc)
             if city is pilot_heights.CALGARY_CITY:
-                yield from calgary_frames(
-                    CalgaryEndpoints(server.url("cameras"), policy, policy), bbox
-                )
+                endpoints: CityEndpoints = CalgaryEndpoints(server.url("cameras"), policy, policy)
+                still = _calgary_still
             else:
-                yield from austin_frames(
-                    AustinEndpoints(server.url("cameras"), policy, policy), bbox
-                )
+                endpoints = AustinEndpoints(server.url("cameras"), policy, policy)
+                still = _austin_still
+            yield from city_camera_frames(city, endpoints, bbox, still)
 
-    return Pipeline(frames=frames, detector=detector, info=info)
+    return Pipeline(
+        frames=lambda: _frames_only(sweep()),
+        detector=detector,
+        info=info,
+        camera_frames=sweep,
+    )
 
 
 # Rendering ----------------------------------------------------------------------------
@@ -2390,6 +2504,41 @@ def box_heights(samples: Sequence[Sample]) -> dict[int, int]:
     return {number: box_height(box) for number, box in enumerate(boxes, start=1)}
 
 
+def box_cameras(samples: Sequence[Sample]) -> dict[int, str | None]:
+    """Each box's camera id (None when the sweep did not keep it), by box number
+    (numbered as `render` numbers them). In memory only: see camera_yield."""
+    return {
+        number: camera
+        for number, camera in enumerate(
+            (s.camera for s in samples for _person in s.persons), start=1
+        )
+    }
+
+
+def camera_yield(
+    items: Sequence[ReviewItem],
+    answers: Mapping[int, str | None],
+    cameras: Mapping[int, str | None],
+) -> dict[str, list[int]]:
+    """Per camera that gave at least one crop shown, sorted by id: [shown, rejected,
+    judgeable], judgeable being the crops kept whose answer to the first question (the
+    outer layer) is y or n. Counts only: nothing links a camera to a crop's answers."""
+    counts: dict[str, list[int]] = {}
+    for item in items:
+        (box,) = item.boxes  # crops mode: one box per image
+        camera = cameras[box]
+        if camera is None:
+            raise SpotcheckError("the sweep did not keep the camera of every crop")
+        shown = counts.setdefault(camera, [0, 0, 0])
+        given = answers[item.number]
+        shown[0] += 1
+        if given is None:
+            shown[1] += 1
+        elif given[:1] in ("y", "n"):
+            shown[2] += 1
+    return {camera: counts[camera] for camera in sorted(counts)}
+
+
 def box_record(
     items: Sequence[ReviewItem],
     judgements: Mapping[int, Judgement],
@@ -2736,6 +2885,12 @@ def build_parser() -> argparse.ArgumentParser:
         "ones (default london)",
     )
     ap.add_argument(
+        "--record-camera-yield",
+        action="store_true",
+        help="with --attributes: add to the attribute file, per camera that gave a crop "
+        "shown, how many were shown, rejected and judgeable on the outer layer (counts only)",
+    )
+    ap.add_argument(
         "--bbox",
         type=pilot_heights.parse_bbox,
         default=None,
@@ -2770,6 +2925,10 @@ ATTRIBUTES_RECORD_BOXES_REFUSAL = (
 )
 ALLOW_DARK_REFUSAL = "--allow-dark applies to attribute sessions only; add --attributes or drop it"
 MIN_HEIGHT_REFUSAL = "--min-height applies to attribute sessions only; add --attributes or drop it"
+CAMERA_YIELD_REFUSAL = (
+    "--record-camera-yield applies to attribute sessions only; add --attributes or drop it"
+)
+NO_CAMERAS_REFUSAL = "--record-camera-yield needs a sweep that keeps each frame's camera"
 DARK_REFUSAL = (
     "it is dark in London now (sun below -6°); attribute sessions need daylight. "
     "Use --allow-dark to run anyway."
@@ -3002,6 +3161,8 @@ def _run(
         raise SpotcheckError(ALLOW_DARK_REFUSAL)
     if args.min_height is not None:
         raise SpotcheckError(MIN_HEIGHT_REFUSAL)
+    if getattr(args, "record_camera_yield", False):
+        raise SpotcheckError(CAMERA_YIELD_REFUSAL)
     if reviewer is not None and not isinstance(reviewer, Reviewer):
         raise SpotcheckError("the reviewer given cannot judge detections")
     if args.record_boxes and mode == "frames":
@@ -3110,11 +3271,25 @@ def _open_pipeline(
 
 
 def _sample_sweep(
-    args: argparse.Namespace, pipeline: Pipeline, min_height: int = 0
+    args: argparse.Namespace, pipeline: Pipeline, min_height: int = 0, cameras: bool = False
 ) -> list[Sample]:
-    """Sweep, detect and sample, printing progress. Frames that come from a generator
+    """Sweep, detect and sample, printing progress; with `cameras`, from the pipeline's
+    camera_frames, each Sample keeping its camera id. Frames that come from a generator
     (Austin's) are closed after it, however it ends, which stops their fetching."""
-    frames = pipeline.frames()
+    if cameras:
+        if pipeline.camera_frames is None:
+            raise SpotcheckError(NO_CAMERAS_REFUSAL)
+        return _sampled(args, pipeline.camera_frames(), pipeline, min_height, sample_cameras)
+    return _sampled(args, pipeline.frames(), pipeline, min_height, sample)
+
+
+def _sampled[T](
+    args: argparse.Namespace,
+    frames: Iterable[T],
+    pipeline: Pipeline,
+    min_height: int,
+    sampler: Callable[..., list[Sample]],
+) -> list[Sample]:
     total = len(frames) if isinstance(frames, Sized) else None
 
     def detected(done: int) -> None:
@@ -3122,7 +3297,7 @@ def _sample_sweep(
             _progress(f"detected {done} of {total}" if total is not None else f"detected {done}")
 
     try:
-        return sample(
+        return sampler(
             frames,
             pipeline.detector,
             n=args.n,
@@ -3249,8 +3424,9 @@ def _attribute_session(
     pipeline = _open_pipeline(args, pipeline, guard, austin, opener, calgary)
 
     min_height = NEAR_FIELD_MIN_HEIGHT_PX if args.min_height is None else args.min_height
+    record_yield: bool = getattr(args, "record_camera_yield", False)
     started_at = clock()
-    samples = _sample_sweep(args, pipeline, min_height)
+    samples = _sample_sweep(args, pipeline, min_height, cameras=record_yield)
     if not samples:
         raise SpotcheckError(
             f"no frame had at least {args.min_persons} near-field person detections "
@@ -3258,6 +3434,7 @@ def _attribute_session(
         )
     frames_reviewed = len(samples)
     heights = box_heights(samples)
+    cameras = box_cameras(samples) if record_yield else None
     items = render(samples, "crops")
     del samples  # the frames are not needed any more
     _progress(f"opening the review: {len(items)} crop(s)")
@@ -3272,6 +3449,10 @@ def _attribute_session(
             ATTRIBUTE_TEMPLATE_ENTRY,
             functools.partial(_collect_attributes, items, labeller, args.timeout, guard),
         )
+    yields = None
+    if cameras is not None:
+        yields = camera_yield(items, answers, cameras)
+        del cameras  # the camera ids are needed no longer; only the counts go on
     models: list[str] = []
     if judge is not None:
         # Only now, with the labelling over and its answers valid: the crops in memory,
@@ -3298,6 +3479,8 @@ def _attribute_session(
         judge=args.judge,
         min_height=min_height,
     )
+    if yields is not None:
+        record["camera_yield"] = yields  # after `crops`; a source still comes last
     record = sourced_record(record, source, started_at)
     del items
     path = write_attributes(record, out_dir, day, source)

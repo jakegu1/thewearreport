@@ -38,6 +38,7 @@ uv run python -m wearreport.tools.spotcheck --n 20 --reviewer NAME --record-boxe
 | `--confirm-stop` | off | in the window, a first `q` asks before it stops (see below); needs `--view window`, refused otherwise |
 | `--min-height N` | 31 | in an attribute session, show only person boxes at least N px tall (31 to 200; see [Box height](#box-height---min-height)); needs `--attributes`, refused otherwise |
 | `--allow-dark` | off | start an attribute session in the window even when it is dark in London (see [Daylight](#daylight---allow-dark)); needs `--attributes`, refused otherwise |
+| `--record-camera-yield` | off | add `camera_yield`, counts per camera, to the attribute file (see [Attribute file](#attribute-file)); needs `--attributes`, refused otherwise |
 
 The tool lists the cameras, fetches one sweep in memory, runs the detector with its
 default thresholds and picks up to N frames with at least K person detections at random.
@@ -454,12 +455,25 @@ per-box file. It is one line of JSON with exactly these fields:
 | `crops_shown` | integer | crops shown to the reviewer |
 | `crops_rejected` | integer | crops rejected with `x` |
 | `crops` | array | one `[height_px, reviewer, model]` per crop not rejected, sorted |
+| `camera_yield` | object | only with `--record-camera-yield`: `{camera id: [shown, rejected, judgeable]}`, see below |
 
 `reviewer` is three letters, `y`, `n` or `u`, in the question order (for example `"ynn"`:
 an outer layer, no bare legs, no umbrella); `model` is the same form, or `null` when the
 model was not asked or did not answer. The file holds counts and labels only: no box
 position or width, no camera id, no frame index, no image and no free text, and the sorted
 order says nothing about which frame a crop came from.
+
+With `--record-camera-yield` (the launcher, `scripts/label.ps1`, passes it for London and
+Calgary) the file also has `camera_yield`, after `crops`: one entry per camera that gave
+at least one crop shown in the session, keyed by its id (TfL's camera id in London, the
+still's URL in Calgary and Austin), with three counts: the crops shown from it, those of
+them the reviewer rejected, and those kept whose answer to the first question (outer
+layer) is `y` or `n`. The counts add up to `crops_shown`, `crops_rejected` and the crops
+whose reviewer answer starts with `y` or `n`. It is counts only: there is no camera id on
+any crop row, the rows are exactly as without the flag, and nothing in the file says which
+camera a crop or an answer came from. The camera ids are kept in memory with their frames
+only until the counts are made. Without the flag the file is as above, with no
+`camera_yield`.
 
 ### Attribute summary
 
@@ -468,7 +482,8 @@ uv run python -m wearreport.tools.spotcheck_summary --attributes [--dir spotchec
 ```
 
 reads every attribute file in `<dir>/attributes/` (a malformed file is an error that
-names it, exit 1) and prints, for each attribute:
+names it, exit 1; a `camera_yield` is checked to add up, then not used, so the report is the
+same with or without it) and prints, for each attribute:
 
 - the reviewer's answers: yes, no, cannot tell, and the yes share over yes and no with its
   Wilson 95% interval; the same per `light` and, with `--data-dir`, per rain condition
