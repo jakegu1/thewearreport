@@ -505,7 +505,7 @@ def test_ac4_a_consistent_camera_yield_parses() -> None:
         {"Fake_00001": [2, 1, 2], "Fake_00002": [1, 0, -1]},  # judgeable > kept
         {"Fake_00001": [0, 0, 0], "Fake_00002": [3, 1, 1]},  # a camera with nothing shown
         {"Fake_00001": [2, 1, 1]},  # shown does not add up
-        {"Fake_00001": [2, 0, 1], "Fake_00002": [1, 1, 0]},  # judgeable does not add up
+        {"Fake_00001": [2, 1, 0], "Fake_00002": [1, 0, 0]},  # judgeable does not add up
         {"Fake_00001": [2, 1, 1], "Fake_00002": [1, 0, 0], "": [0, 0, 0]},
         {"Fake_00001": [10**400, 1, 1], "Fake_00002": [1, 0, 0]},
         {"Fake_00001": [[[[[2]]]], 1, 1], "Fake_00002": [1, 0, 0]},
