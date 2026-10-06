@@ -59,10 +59,11 @@ $ErrorActionPreference = 'Stop'
 $KeyName = 'DEEPINFRA_API_KEY'
 $JudgeModel = 'di-qwen3-vl-235b'
 # The guide's settings for one pass. --n is spotcheck's largest sample (MAX_N), so that a
-# pass labels every frame of the sweep that has a near-field person.
+# pass labels every frame of the sweep that has a near-field person. Every pass, London's
+# and Calgary's, also records the per-camera yield counts (--record-camera-yield).
 $PassArguments = @(
     '--attributes', '--n', '500', '--min-height', '46', '--min-persons', '1',
-    '--timeout', '3600'
+    '--timeout', '3600', '--record-camera-yield'
 )
 $CityNames = @{ calgary = 'Calgary'; london = 'London' }
 
