@@ -199,6 +199,22 @@ def _json(raw: bytes) -> object:
     return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
 
 
+# The names an attribute file's own objects use (the top level and its detector): a
+# duplicate of one of these is named; any other key, a camera id among them, is not.
+LABELLING_NAMES = ATTRIBUTE_FIELDS | {"source", CAMERA_YIELD, "model", "sha256", "conf"}
+
+
+def _no_duplicate_names(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            if key in LABELLING_NAMES:
+                raise ValueError(f"the key {key!r} appears twice in one object")
+            raise ValueError("a key appears twice in one object")
+        seen[key] = value
+    return seen
+
+
 def _count(value: object, what: str) -> int:
     if type(value) is not int or not 0 <= value <= MAX_COUNT:
         raise ValueError(f"{what} is not a count")
@@ -773,10 +789,12 @@ def _crop(value: object, judged: bool, min_height: int) -> Crop:
 
 
 def parse_labelling(raw: bytes) -> Labelling:
-    """One attribute file; raises ValueError (or a subclass) when it is malformed."""
+    """One attribute file; raises ValueError (or a subclass) when it is malformed. A
+    duplicate key is named only when it is one of the file's own field names, never a
+    camera id."""
     if len(raw) > MAX_FILE_BYTES:
         raise ValueError(f"larger than {MAX_FILE_BYTES} bytes")
-    data = _json(raw)
+    data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_names)
     if not isinstance(data, dict):
         raise ValueError("not an object")
     fields = set(data)
