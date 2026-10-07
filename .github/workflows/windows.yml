@@ -21,6 +21,7 @@ jobs:
     # window reviewer driven by synthetic key events, and a dry run through the window.
     # T-067: the labelling launcher (label.cmd, scripts/label.ps1) end to end, offline.
     # T-073: the London launcher (label-london.cmd) end to end, offline.
+    # T-080: the launcher's default label folder, restart after a pull, version line.
     # The T-008 acceptance tests describe the Unix files view and run on Linux only.
     # llama-cpp-python has no Windows wheel, and the spot-check never imports it.
     runs-on: windows-latest
@@ -60,12 +61,14 @@ jobs:
       - name: Labelling launcher tests (T-067)
         # Windows PowerShell runs label.ps1 with spotcheck's dry run, a test reviewer, a
         # fake judge on 127.0.0.1, fake git and uv, and a file in place of the clipboard.
-        # T-073: label-london.cmd (one London pass, no judge) with the same fakes. -rP
+        # T-073: label-london.cmd (one London pass, no judge) with the same fakes. T-080:
+        # the default label folder, the restart after a pull and the version line. -rP
         # prints the passed tests' output: the launcher's lines and spotcheck's arguments.
         run: >-
           uv run --no-sync pytest -v -rsP --capture=sys
           engine/tests/acceptance/test_t_067.py
           engine/tests/acceptance/test_t_073.py
+          engine/tests/acceptance/test_t_080.py
           engine/tests/unit/test_label_window.py
       - name: Dry-run spot-check through the window reviewer
         run: >-

@@ -9,8 +9,11 @@ Started by label.cmd in the repository root (double-click it). The launcher:
 
 1. changes to the repository it lives in, runs `git pull --ff-only` and
    `uv sync --locked --no-install-package llama-cpp-python` (a failure is reported in one
-   line, and the session goes on with the current version), and sets TMPDIR for its own
-   process only to -TempDir, creating it;
+   line, followed by at most three indented lines of that command's last output, and the
+   session goes on with the current version). If the pull changed this script, it says so
+   and runs the new script once with the same arguments, without the update step, and
+   exits with its exit code. It prints the commit it runs (Version, read from .git), and
+   sets TMPDIR for its own process only to -TempDir, creating it;
 2. picks the city: with -Source auto, Calgary if the sun is up there by the spot-check's
    daylight rule (not below -6 degrees), else London if it is, else it exits and says
    when the next window opens (UTC); -Source calgary or london forces one;
@@ -24,11 +27,17 @@ Started by label.cmd in the repository root (double-click it). The launcher:
 5. prints one line per attribute file written this session, puts exactly those files'
    JSON on the clipboard, one per line, and prints a one-line summary.
 
+The attribute files go to <OutDir>\attributes\. Without -OutDir, OutDir is
+D:\wearreport-labels, or wearreport-labels in the user's profile without a D: drive,
+outside the git work tree, so that a later `git pull` never meets them.
+
 It never opens, saves or copies an image: frames and crops stay inside spotcheck.
 
-The test switches (-DryRun, -Now, -Python, -Spotcheck, -ClipboardFile) are for the
-acceptance tests: spotcheck's dry-run pipeline and --judgements file reviewer, a fixed
-UTC clock, another Python and script, and a file in place of the clipboard.
+The test switches (-DryRun, -Now, -Python, -Spotcheck, -ClipboardFile, -LabelsDrive) are
+for the acceptance tests: spotcheck's dry-run pipeline and --judgements file reviewer, a
+fixed UTC clock, another Python and script, a file in place of the clipboard, and a folder
+tried in place of D:\ for the default OutDir. -Restarted is internal: the launcher passes
+it when it runs its new version after a pull.
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +59,10 @@ param(
     [string] $Now = '',
     [string] $Python = '',
     [string] $Spotcheck = '',
-    [string] $ClipboardFile = ''
+    [string] $ClipboardFile = '',
+    [string] $LabelsDrive = '',
+    # Internal: set when the launcher runs its new version after a pull.
+    [switch] $Restarted
 )
 
 Set-StrictMode -Version 3.0
@@ -68,6 +80,7 @@ $PassArguments = @(
 $CityNames = @{ calgary = 'Calgary'; london = 'London' }
 
 $StartDir = (Get-Location).Path
+$Launcher = $PSCommandPath
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Repo
 
@@ -180,9 +193,25 @@ function Format-Window($Window) {
 
 # 1. Update and the temporary directory. --------------------------------------------------
 
+function Write-OutputTail($Output) {
+    # At most the last three non-empty lines of a failed update command, indented, without
+    # credentials in URLs and without the failure line's own wording.
+    $lines = @(
+        @($Output) | ForEach-Object { "$_" -split "`r?`n" } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -and $_ -notmatch 'git pull failed|uv sync failed' }
+    )
+    foreach ($line in @($lines | Select-Object -Last 3)) {
+        $line = $line -replace '://[^/\s@]+@', '://***@'
+        if ($line.Length -gt 200) { $line = $line.Substring(0, 200) }
+        Write-Host "  $line"
+    }
+}
+
 function Invoke-Update([string] $What, [string] $Command, [string[]] $Arguments) {
     $previous = $ErrorActionPreference
     $ok = $false
+    $output = @()
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         Write-Host "Update: $What failed ($Command not found); continuing with the current version."
         return
@@ -190,7 +219,7 @@ function Invoke-Update([string] $What, [string] $Command, [string[]] $Arguments)
     try {
         $ErrorActionPreference = 'Continue'
         $global:LASTEXITCODE = 0
-        $null = & $Command @Arguments 2>&1
+        $output = @(& $Command @Arguments 2>&1)
         $ok = ($LASTEXITCODE -eq 0)
     } catch {
         $ok = $false
@@ -201,14 +230,70 @@ function Invoke-Update([string] $What, [string] $Command, [string[]] $Arguments)
         Write-Host "Update: $What done."
     } else {
         Write-Host "Update: $What failed; continuing with the current version."
+        Write-OutputTail $output
     }
 }
 
-Write-Host 'The Wear Report: labelling session'
-Write-Host "Repository: $Repo"
-$env:GIT_TERMINAL_PROMPT = '0'
-Invoke-Update 'git pull' 'git' @('pull', '--ff-only')
-Invoke-Update 'uv sync' 'uv' @('sync', '--locked', '--no-install-package', 'llama-cpp-python')
+function Get-LauncherHash {
+    # SHA-256 of this script's file as it is on disk now ('' if it cannot be read).
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Launcher)))
+        } finally {
+            $sha.Dispose()
+        }
+    } catch {
+        return ''
+    }
+}
+
+function Get-Version {
+    # The first 7 hex digits of HEAD, read from .git; 'unknown' if that fails.
+    try {
+        $git = Join-Path $Repo '.git'
+        $head = [IO.File]::ReadAllText((Join-Path $git 'HEAD')).Trim()
+        $sha = $head
+        if ($head -match '^ref: (refs/[A-Za-z0-9._/-]+)$' -and $Matches[1] -notmatch '\.\.') {
+            $ref = $Matches[1]
+            $sha = ''
+            $loose = Join-Path $git $ref
+            if (Test-Path -LiteralPath $loose -PathType Leaf) {
+                $sha = [IO.File]::ReadAllText($loose).Trim()
+            } else {
+                $packed = Join-Path $git 'packed-refs'
+                if (Test-Path -LiteralPath $packed -PathType Leaf) {
+                    foreach ($line in [IO.File]::ReadAllLines($packed)) {
+                        $parts = $line.Trim().Split(' ')
+                        if ($parts.Count -eq 2 -and $parts[1] -eq $ref) { $sha = $parts[0]; break }
+                    }
+                }
+            }
+        }
+        if ($sha -cmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') { return $sha.Substring(0, 7) }
+    } catch {
+        return 'unknown'
+    }
+    return 'unknown'
+}
+
+if (-not $Restarted) {
+    Write-Host 'The Wear Report: labelling session'
+    Write-Host "Repository: $Repo"
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $launcherBefore = Get-LauncherHash
+    Invoke-Update 'git pull' 'git' @('pull', '--ff-only')
+    Invoke-Update 'uv sync' 'uv' @('sync', '--locked', '--no-install-package', 'llama-cpp-python')
+    $launcherAfter = Get-LauncherHash
+    if ($launcherBefore -and $launcherAfter -and $launcherBefore -ne $launcherAfter) {
+        # PowerShell runs the copy it loaded: run the new one, once, from where we started.
+        Write-Host 'Update: the launcher changed; restarting it.'
+        Set-Location -LiteralPath $StartDir
+        & $Launcher @PSBoundParameters -Restarted
+        exit $LASTEXITCODE
+    }
+}
+Write-Host "Version: $(Get-Version)"
 
 if (-not $TempDir) {
     if (Test-Path -LiteralPath 'D:\') {
@@ -221,7 +306,19 @@ $TempDir = Get-FullPath $TempDir
 $null = New-Item -ItemType Directory -Force -Path $TempDir
 $env:TMPDIR = $TempDir  # this process and its children only
 $env:PYTHONUNBUFFERED = '1'
-if ($OutDir) { $OutDir = Get-FullPath $OutDir } else { $OutDir = Join-Path $Repo 'spotchecks' }
+if ($OutDir) {
+    $OutDir = Get-FullPath $OutDir
+} else {
+    # Outside the git work tree: a label file committed upstream must never meet a local
+    # copy under the same name in the clone.
+    if ($LabelsDrive) { $drive = Get-FullPath $LabelsDrive } else { $drive = 'D:\' }
+    if (Test-Path -LiteralPath $drive -PathType Container) {
+        $OutDir = Join-Path $drive 'wearreport-labels'
+    } else {
+        $OutDir = Join-Path $env:USERPROFILE 'wearreport-labels'
+    }
+    $null = New-Item -ItemType Directory -Force -Path $OutDir
+}
 $JudgementsFile = Join-Path $TempDir 'label-judgements.json'
 
 # 2. The city. -------------------------------------------------------------------------------
