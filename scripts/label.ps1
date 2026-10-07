@@ -80,6 +80,7 @@ $PassArguments = @(
 $CityNames = @{ calgary = 'Calgary'; london = 'London' }
 
 $StartDir = (Get-Location).Path
+$Launcher = $PSCommandPath
 $Repo = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $Repo
 
@@ -234,8 +235,14 @@ function Invoke-Update([string] $What, [string] $Command, [string[]] $Arguments)
 }
 
 function Get-LauncherHash {
+    # SHA-256 of this script's file as it is on disk now ('' if it cannot be read).
     try {
-        return (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Launcher)))
+        } finally {
+            $sha.Dispose()
+        }
     } catch {
         return ''
     }
@@ -282,7 +289,7 @@ if (-not $Restarted) {
         # PowerShell runs the copy it loaded: run the new one, once, from where we started.
         Write-Host 'Update: the launcher changed; restarting it.'
         Set-Location -LiteralPath $StartDir
-        & $PSCommandPath @PSBoundParameters -Restarted
+        & $Launcher @PSBoundParameters -Restarted
         exit $LASTEXITCODE
     }
 }
