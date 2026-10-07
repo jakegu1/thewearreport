@@ -111,7 +111,9 @@ spot checks were made at each hour of the day.
    To see a camera, follow the link to TfL's own camera page.
 4. Spot checks run on the checker's own computer. For tests of automatic labels, crops of single
    people may be sent, in memory, to an open-weights vision model at a hosting provider whose terms
-   exclude storing, logging or training on them. The spot-check tool refuses to run in CI.
+   exclude storing, logging or training on them. They may also be passed, in memory, to a small
+   open-weights image model on the checker's computer, which keeps only its answers and running
+   totals, never images or per-person image features. The spot-check tool refuses to run in CI.
 
 CI enforces rule 1 for sweeps: a static check blocks image-writing calls in the engine, and an
 end-to-end test runs a full sweep against a local fake camera server and checks that no image bytes
