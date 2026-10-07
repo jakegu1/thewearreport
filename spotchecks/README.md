@@ -7,7 +7,10 @@ it always deletes, and keeps only the tallies. This directory holds one small JS
 statistics per check and, in `boxes/`, one per-box file per check run with
 `--record-boxes`: each box's height and label, and nothing else about it. In
 `attributes/` it holds one attribute file per attribute session (`--attributes`, below):
-counts and labels only.
+counts and labels only. Attribute files committed here from 2026-10-07 on are named after
+the session's `started_at` (`YYYY-MM-DDTHHMMZ.json`; Calgary `YYYY-MM-DDTHHMMZ-calgary.json`),
+so a committed name never matches a name the tool gives a file on the labelling machine.
+Nothing reads meaning from a file's name: the date, time and source are in the file.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
