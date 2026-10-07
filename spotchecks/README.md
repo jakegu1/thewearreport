@@ -8,6 +8,9 @@ statistics per check and, in `boxes/`, one per-box file per check run with
 `--record-boxes`: each box's height and label, and nothing else about it. In
 `attributes/` it holds one attribute file per attribute session (`--attributes`, below):
 counts and labels only.
+The Windows labelling launcher (`scripts/label.ps1`) writes its attribute files outside the
+clone by default, to `D:\wearreport-labels\attributes\` (or `wearreport-labels\attributes\`
+in your profile without a `D:` drive); `-OutDir` changes that.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
