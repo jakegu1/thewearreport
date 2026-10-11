@@ -55,7 +55,29 @@ try {
             $Stage = 'Save'
             $Link.Save()
         } catch {
-            throw "Cannot save $LinkPath ($Stage; target: $Target): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
+            $Failure = $_.Exception.Message
+            $Details = ''
+            if ($Stage -eq 'TargetPath') {
+                # Inspect in-memory COM objects only; neither probe saves a link.
+                $Requested = ($LinkPath.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ','
+                $Observed = ([string]$Link.FullName).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }
+                $Controls = @()
+                foreach ($Strict in @('Off', '3.0')) {
+                    try {
+                        if ($Strict -eq 'Off') { Set-StrictMode -Off } else { Set-StrictMode -Version 3.0 }
+                        $Probe = $Shell.CreateShortcut($LinkPath)
+                        $Probe.TargetPath = [IO.Path]::Combine($env:SystemRoot, 'System32\cmd.exe')
+                        $Controls += "strict=$Strict ASCII=ok"
+                        try {
+                            $Probe.TargetPath = $Target
+                            $Controls += "strict=$Strict Unicode=ok"
+                        } catch { $Controls += "strict=$Strict Unicode=$($_.Exception.Message)" }
+                    } catch { $Controls += "strict=$Strict ASCII=$($_.Exception.Message)" }
+                }
+                Set-StrictMode -Version 3.0
+                $Details = " ACP=$([Text.Encoding]::Default.CodePage); requested=$Requested; observed=$($Observed -join ','); controls=$($Controls -join ';')."
+            }
+            throw "Cannot save $LinkPath ($Stage; target: $Target): $Failure$Details Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
         }
         Write-Host "Installed: $($Item.Path)"
     }
