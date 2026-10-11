@@ -69,6 +69,7 @@ jobs:
           engine/tests/acceptance/test_t_067.py
           engine/tests/acceptance/test_t_073.py
           engine/tests/acceptance/test_t_080.py
+          engine/tests/acceptance/test_t_087.py
           engine/tests/unit/test_label_window.py
       - name: Dry-run spot-check through the window reviewer
         run: >-

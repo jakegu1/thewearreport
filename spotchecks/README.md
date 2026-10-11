@@ -17,6 +17,30 @@ in your profile without a `D:` drive); `-OutDir` changes that.
 
 Live checks wait for the maintainer's approval. The tool refuses to run in CI.
 
+## Windows desktop shortcuts
+
+Once, update the clone with `git pull --ff-only`, then double-click
+`setup-label-shortcuts.cmd` in the clone. Setup needs no administrator rights and
+creates `The Wear Report - London.lnk` and `The Wear Report - Calgary.lnk` on your
+Windows desktop, including a redirected or OneDrive desktop. It only installs the
+two links; it does not start a session. Keep the setup window open to read any
+error, then press a key to dismiss it.
+
+Double-click the shortcut for the city you want. Each requests a single pass
+through the existing `label.cmd`, retaining its current AI settings and city time gates:
+London's 09:30-15:00 Europe/London window and daylight for both cities.
+The launcher updates itself and copies completed statistics to the clipboard.
+AI answers still depend on the existing configuration and a valid key; setup does
+not configure credentials or guarantee answers. These links do not enforce a
+daily session count or spacing between sessions.
+
+To remove the shortcuts, delete only those two `.lnk` files. After moving the
+clone, delete the two old links and rerun setup from the new location; setup
+refuses existing links that point to another location. Rerunning setup in the same
+location refreshes its own links and leaves unrelated files alone. If setup
+reports a write error, close programs using the link, check directory permissions,
+then rerun it.
+
 ## Running a check
 
 ```bash
