@@ -31,7 +31,7 @@ CITIES = ("london", "calgary")
 POWERSHELL = shutil.which("powershell.exe") or "powershell.exe"
 CMD = shutil.which("cmd.exe") or "cmd.exe"
 WINDOWS_ONLY = pytest.mark.skipif(
-    sys.platform != "win32", reason="real WScript.Shell COM and ShellExecute require native Windows"
+    sys.platform != "win32", reason="real Unicode Shell COM and ShellExecute require native Windows"
 )
 LEGACY_HASHES = {
     "label.cmd": "0fa34d0c1eb33c8951a5a96cfb304fd9c7424dc8167661f0cf02df05c474d748",
@@ -63,7 +63,7 @@ def test_installer_uses_native_desktop_com_and_no_labelling_or_credentials() -> 
     text = INSTALLER.read_text(encoding="ascii")
     assert "DesktopDirectory" in text and "GetFolderPath" in text
     assert "$PSScriptRoot" in text and "ShortcutDir" in text
-    assert "WScript.Shell" in text and "CreateShortcut" in text
+    assert "Shell.Application" in text and "NameSpace" in text and "GetLink" in text
     assert not re.search(
         r"(?i)Set-ExecutionPolicy|Start-Process|Invoke-Expression|Invoke-WebRequest|"
         r"Invoke-RestMethod|\b(?:git|uv)\s|DEEPINFRA|API_KEY|Get-Credential|"
@@ -132,16 +132,21 @@ def _com(link: Path, *, target: Path | None = None) -> dict[str, str]:
     code = (
         "$ErrorActionPreference = 'Stop'; "
         "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; "
-        "$shell = New-Object -ComObject WScript.Shell; "
-        f"$link = $shell.CreateShortcut({_quote(link)}); "
+        "$shell = New-Object -ComObject Shell.Application; "
+        f"$folder = $shell.NameSpace({_quote(link.parent)}); "
+        "if ($null -eq $folder) { throw 'Missing shortcut directory' }; "
+        f"$item = $folder.ParseName({_quote(link.name)}); "
+        "if ($null -eq $item) { throw 'Missing shortcut file' }; "
+        "$link = $item.GetLink; "
     )
     if target is not None:
         code += (
-            f"$link.TargetPath = {_quote(target)}; "
-            "$link.Arguments = 'old arguments'; $link.WorkingDirectory = 'C:\\'; $link.Save(); "
+            f"$link.Path = {_quote(target)}; "
+            "$link.Arguments = 'old arguments'; $link.WorkingDirectory = 'C:\\'; "
+            f"$link.Save({_quote(link)}); "
         )
     code += (
-        "@{target=$link.TargetPath; arguments=$link.Arguments; cwd=$link.WorkingDirectory} "
+        "@{target=$link.Path; arguments=$link.Arguments; cwd=$link.WorkingDirectory} "
         "| ConvertTo-Json -Compress"
     )
     result = _powershell(code)
