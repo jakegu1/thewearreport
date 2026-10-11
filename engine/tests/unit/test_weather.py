@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import urllib.error
-import urllib.request
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from email.message import Message
@@ -15,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from wearreport import settings, weather
+from wearreport import registry, settings, weather
 
 AT = datetime(2026, 3, 2, 9, 40, tzinfo=UTC)
 KEY = "unit-test-placeholder"
@@ -355,29 +353,45 @@ def test_urllib_get_refuses_plain_http() -> None:
         weather.urllib_get("http://example.invalid/", {}, 1.0)
 
 
-class _FakeResponse(io.BytesIO):
-    def __enter__(self) -> _FakeResponse:
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
-
-
 def test_urllib_get_sends_headers_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
 
-    def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
-        seen["headers"] = dict(request.header_items())
-        seen["timeout"] = timeout
-        return _FakeResponse(b"{}")
+    def bounded_get(
+        url: str, *, timeout_s: float, max_bytes: int, headers: Mapping[str, str] | None = None
+    ) -> bytes:
+        seen.update(url=url, headers=headers, timeout=timeout_s, max_bytes=max_bytes)
+        return b"{}"
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(registry, "bounded_get", bounded_get)
     assert weather.urllib_get("https://example.invalid/", {"apikey": "x"}, 10.0) == b"{}"
-    assert seen == {"headers": {"Apikey": "x"}, "timeout": 10.0}
+    assert seen == {
+        "url": "https://example.invalid/",
+        "headers": {"apikey": "x"},
+        "timeout": 10.0,
+        "max_bytes": weather.MAX_BODY_BYTES,
+    }
 
 
 def test_urllib_get_rejects_oversized_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    big = b" " * (weather.MAX_BODY_BYTES + 10)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: _FakeResponse(big))
-    with pytest.raises(weather.WeatherError):
+    def oversized(
+        url: str, *, timeout_s: float, max_bytes: int, headers: Mapping[str, str] | None = None
+    ) -> bytes:
+        assert max_bytes == weather.MAX_BODY_BYTES
+        raise registry.BodyTooLarge("synthetic transport detail")
+
+    monkeypatch.setattr(registry, "bounded_get", oversized)
+    with pytest.raises(weather.WeatherError, match=r"^response body too large$") as info:
         weather.urllib_get("https://example.invalid/", {}, 10.0)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+
+
+def test_urllib_get_normalizes_wrapped_socket_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timeout(
+        url: str, *, timeout_s: float, max_bytes: int, headers: Mapping[str, str] | None = None
+    ) -> bytes:
+        raise urllib.error.URLError(TimeoutError("synthetic transport detail"))
+
+    monkeypatch.setattr(registry, "bounded_get", timeout)
+    with pytest.raises(TimeoutError, match=r"^request deadline passed$") as info:
+        weather.urllib_get("https://example.invalid/", {}, 10.0)
+    assert info.value.__cause__ is None and info.value.__suppress_context__

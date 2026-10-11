@@ -18,13 +18,13 @@ import logging
 import math
 import threading
 import urllib.error
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 from urllib.parse import urlencode
 
+from wearreport import registry
 from wearreport.settings import Environment, Settings, load_settings
 
 logger = logging.getLogger(__name__)
@@ -99,15 +99,23 @@ _PROCESS_BUDGET = RequestBudget(PROCESS_REQUEST_CAP)
 
 
 def urllib_get(url: str, headers: Mapping[str, str], timeout: float) -> bytes:
-    """GET `url` over HTTPS with the standard library; raise on any failure."""
-    if not url.startswith("https://"):
-        raise ValueError("only https URLs are fetched")
-    request = urllib.request.Request(url, headers=dict(headers), method="GET")  # noqa: S310
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        body: bytes = response.read(MAX_BODY_BYTES + 1)
-    if len(body) > MAX_BODY_BYTES:
-        raise WeatherError("response body too large")
-    return body
+    """GET once over HTTPS, with no redirects and one elapsed-time deadline.
+
+    Uses the shared bounded transport's proxy and CA handling. Its documented DNS
+    interruption limit also applies here. Oversized responses raise a constant,
+    credential-free WeatherError. Wrapped socket timeouts become TimeoutError;
+    other transport failures retain their types.
+    """
+    try:
+        return registry.bounded_get(
+            url, timeout_s=timeout, max_bytes=MAX_BODY_BYTES, headers=headers
+        )
+    except registry.BodyTooLarge:
+        raise WeatherError("response body too large") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise TimeoutError("request deadline passed") from None
+        raise
 
 
 def _retryable(exc: BaseException) -> bool:

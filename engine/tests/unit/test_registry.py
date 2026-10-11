@@ -359,6 +359,51 @@ def test_bounded_get_returns_the_body_and_sends_the_user_agent() -> None:
     assert agents[0].startswith("wearreport")
 
 
+@pytest.mark.parametrize("headers", [None, {}, {"apikey": "synthetic-header"}])
+def test_bounded_get_optional_headers_keep_default_caller_behavior(
+    headers: dict[str, str] | None,
+) -> None:
+    received: list[dict[str, str]] = []
+    original = None if headers is None else dict(headers)
+
+    def ok(h: _Handler) -> None:
+        received.append(dict(h.headers.items()))
+        h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(ok) as (url, hits):
+        assert (
+            registry.bounded_get(
+                url, timeout_s=5, max_bytes=1000, schemes=("http",), headers=headers
+            )
+            == b"[]"
+        )
+    assert hits == ["/x"]
+    assert received[0]["User-Agent"] == registry.USER_AGENT
+    assert received[0].get("Apikey") == (headers or {}).get("apikey")
+    assert headers == original
+
+
+def test_bounded_get_caller_user_agent_overrides_the_default() -> None:
+    agents: list[str] = []
+
+    def ok(h: _Handler) -> None:
+        agents.append(h.headers["User-Agent"])
+        h.reply(200, b"[]", **{"Content-Length": "2"})
+
+    with _serve(ok) as (url, _):
+        assert (
+            registry.bounded_get(
+                url,
+                timeout_s=5,
+                max_bytes=1000,
+                schemes=("http",),
+                headers={"user-agent": "synthetic-agent"},
+            )
+            == b"[]"
+        )
+    assert agents == ["synthetic-agent"]
+
+
 @pytest.mark.parametrize(
     "url", ["http://example.test/x", "file:///etc/passwd", "ftp://example.test/x", "data:,x"]
 )
@@ -435,6 +480,27 @@ def test_bounded_get_refuses_a_declared_oversized_body() -> None:
         pytest.raises(registry.BodyTooLarge),
     ):
         _get(url, max_bytes=1000)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["1000000000000000000", "9" * 10_000, "0" * 10_000 + "1000001", "1000001 "],
+    ids=["nineteen-digits", "huge-number", "leading-zeros", "header-whitespace"],
+)
+def test_bounded_get_refuses_long_oversized_content_length(declared: str) -> None:
+    with (
+        _serve(lambda h: h.reply(200, b"{}", **{"Content-Length": declared})) as (url, _),
+        pytest.raises(registry.BodyTooLarge),
+    ):
+        _get(url, max_bytes=1_000_000)
+
+
+def test_bounded_get_normalizes_content_length_before_checking_truncation() -> None:
+    with (
+        _serve(lambda h: h.reply(200, b"{}", **{"Content-Length": "0100 "})) as (url, _),
+        pytest.raises(http.client.IncompleteRead),
+    ):
+        _get(url)
 
 
 def test_bounded_get_stops_reading_past_the_cap() -> None:
