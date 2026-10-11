@@ -49,7 +49,7 @@ try {
             $Link.WorkingDirectory = $Repo
             $Link.Save()
         } catch {
-            throw "Cannot save $($Item.Path). Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
+            throw "Cannot save $($Item.Path): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
         }
         Write-Host "Installed: $($Item.Path)"
     }
