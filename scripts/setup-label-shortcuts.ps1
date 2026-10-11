@@ -6,8 +6,8 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 try {
-    [string]$Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
-    [string]$Target = Join-Path $Repo 'label.cmd'
+    [string]$Repo = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+    [string]$Target = [IO.Path]::Combine($Repo, 'label.cmd')
     if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
         throw "Missing launcher: $Target. Update or restore the repository, then rerun setup."
     }
@@ -19,7 +19,7 @@ try {
         -not (Test-Path -LiteralPath $ShortcutDir -PathType Container)) {
         throw "Shortcut destination must be an existing directory: $ShortcutDir. Select a valid directory and rerun setup."
     }
-    [string]$Destination = (Resolve-Path -LiteralPath $ShortcutDir).ProviderPath
+    [string]$Destination = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ShortcutDir).ProviderPath)
     $Shell = New-Object -ComObject WScript.Shell
     $Links = @()
 
@@ -55,7 +55,7 @@ try {
             $Stage = 'Save'
             $Link.Save()
         } catch {
-            throw "Cannot save $LinkPath ($Stage): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
+            throw "Cannot save $LinkPath ($Stage; target: $Target): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
         }
         Write-Host "Installed: $($Item.Path)"
     }
