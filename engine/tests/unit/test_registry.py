@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 import urllib.error
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -504,12 +504,8 @@ def test_bounded_get_normalizes_content_length_before_checking_truncation() -> N
         _get(url)
 
 
-@pytest.mark.parametrize("declared", ["+1000001", "+10000", "-1", "2.0", "2, 2", "", "garbage"])
-def test_malformed_content_length_is_refused_by_transport_and_weather(
-    declared: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    body = json.dumps(
+def _weather_body() -> bytes:
+    return json.dumps(
         {
             "features": [
                 {
@@ -527,6 +523,9 @@ def test_malformed_content_length_is_refused_by_transport_and_weather(
             ]
         }
     ).encode()
+
+
+def _allow_local_weather(monkeypatch: pytest.MonkeyPatch) -> None:
     real_get = registry.bounded_get
 
     def local_get(
@@ -534,7 +533,7 @@ def test_malformed_content_length_is_refused_by_transport_and_weather(
         *,
         timeout_s: float,
         max_bytes: int,
-        headers: dict[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> bytes:
         return real_get(
             url,
@@ -546,6 +545,15 @@ def test_malformed_content_length_is_refused_by_transport_and_weather(
 
     # Only permit HTTP for this local fixture; retain the real transport and adapter.
     monkeypatch.setattr(registry, "bounded_get", local_get)
+
+
+@pytest.mark.parametrize("declared", ["+1000001", "+10000", "-1", "2.0", "2, 2", "", "garbage"])
+def test_malformed_content_length_is_refused_by_transport_and_weather(
+    declared: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _weather_body()
+    _allow_local_weather(monkeypatch)
     with _serve(lambda h: h.reply(200, body, **{"Content-Length": declared})) as (url, hits):
         with pytest.raises(
             http.client.HTTPException, match=r"^invalid response Content-Length$"
@@ -563,6 +571,95 @@ def test_malformed_content_length_is_refused_by_transport_and_weather(
             is None
         )
     assert len(hits) == 3 and budget.used == 2
+
+
+@pytest.mark.parametrize(
+    ("extra", "oversized"),
+    [
+        ("garbage", False),
+        ("+1000001", False),
+        ("1000001", True),
+        ("9" * 10_000, True),
+        ("conflicting", False),
+    ],
+    ids=["malformed", "signed", "oversized", "huge-number", "conflicting"],
+)
+@pytest.mark.parametrize("reverse", [False, True], ids=["second-field", "first-field"])
+def test_all_content_length_fields_are_checked_before_weather_is_accepted(
+    extra: str,
+    oversized: bool,
+    reverse: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _weather_body()
+    declarations = [str(len(body)), str(len(body) + 100) if extra == "conflicting" else extra]
+    if reverse:
+        declarations.reverse()
+
+    def response(h: _Handler) -> None:
+        h.send_response(200)
+        for declared in declarations:
+            h.send_header("Content-Length", declared)
+        h.end_headers()
+        with contextlib.suppress(OSError):
+            h.wfile.write(body)
+
+    _allow_local_weather(monkeypatch)
+    error: type[Exception] = weather.WeatherError if oversized else http.client.HTTPException
+    message = (
+        "response body too large"
+        if oversized
+        else "conflicting response Content-Length"
+        if extra == "conflicting"
+        else "invalid response Content-Length"
+    )
+    with _serve(response) as (url, hits):
+        with pytest.raises(error) as info:
+            weather.urllib_get(url, {"apikey": "synthetic-header"}, 1)
+        assert str(info.value) == message
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+        monkeypatch.setattr(weather, "METOFFICE_URL", url)
+        budget = weather.RequestBudget(10)
+        assert (
+            weather.current_conditions(
+                datetime(2026, 10, 11, 12, tzinfo=UTC),
+                settings=settings.load_settings({"METOFFICE_API_KEY": "synthetic-header"}),
+                _budget=budget,
+            )
+            is None
+        )
+    assert budget.used == (1 if oversized else 2)
+    assert len(hits) == budget.used + 1
+
+
+@pytest.mark.parametrize("normalize", [False, True], ids=["identical", "leading-zeros-whitespace"])
+def test_identical_normalized_content_length_fields_remain_usable_by_weather(
+    normalize: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _weather_body()
+    length = str(len(body))
+    declarations = [length, f"000{length} " if normalize else length, length]
+
+    def response(h: _Handler) -> None:
+        h.send_response(200)
+        for declared in declarations:
+            h.send_header("Content-Length", declared)
+        h.end_headers()
+        h.wfile.write(body)
+
+    _allow_local_weather(monkeypatch)
+    with _serve(response) as (url, hits):
+        assert weather.urllib_get(url, {"apikey": "synthetic-header"}, 1) == body
+        monkeypatch.setattr(weather, "METOFFICE_URL", url)
+        budget = weather.RequestBudget(10)
+        result = weather.current_conditions(
+            datetime(2026, 10, 11, 12, tzinfo=UTC),
+            settings=settings.load_settings({"METOFFICE_API_KEY": "synthetic-header"}),
+            _budget=budget,
+        )
+    assert result is not None and result.temp_c == 12.0
+    assert len(hits) == 2 and budget.used == 1
 
 
 def test_bounded_get_stops_reading_past_the_cap() -> None:
