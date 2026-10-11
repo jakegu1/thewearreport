@@ -93,7 +93,12 @@ class SchemeNotAllowed(ValueError):
 
 
 def bounded_get(
-    url: str, *, timeout_s: float, max_bytes: int, schemes: tuple[str, ...] = ("https",)
+    url: str,
+    *,
+    timeout_s: float,
+    max_bytes: int,
+    schemes: tuple[str, ...] = ("https",),
+    headers: Mapping[str, str] | None = None,
 ) -> bytes:
     """GET `url` in exactly one request and return its body.
 
@@ -107,6 +112,10 @@ def bounded_get(
       Known limit: DNS resolution happens before the deadline can interrupt it.
     - A body larger than `max_bytes`, declared or counted, raises BodyTooLarge; a body
       shorter than its Content-Length raises http.client.IncompleteRead.
+      Malformed or conflicting Content-Length fields raise a constant
+      http.client.HTTPException; identical normalized duplicate fields are accepted.
+    - Optional request headers supplement the default User-Agent without changing the
+      caller's mapping.
 
     Other failures raise OSError (including urllib.error.URLError) or
     http.client.HTTPException. Exception messages never contain the URL or the body.
@@ -116,7 +125,7 @@ def bounded_get(
         raise SchemeNotAllowed(f"URL scheme {scheme!r} is not allowed")
     with _Deadline(timeout_s) as deadline:
         try:
-            body = _get(url, timeout_s, max_bytes, deadline)
+            body = _get(url, timeout_s, max_bytes, deadline, headers)
         except (OSError, http.client.HTTPException, ValueError):
             if deadline.expired:
                 raise TimeoutError("request deadline passed") from None
@@ -126,7 +135,13 @@ def bounded_get(
     return body
 
 
-def _get(url: str, timeout_s: float, max_bytes: int, deadline: _Deadline) -> bytes:
+def _get(
+    url: str,
+    timeout_s: float,
+    max_bytes: int,
+    deadline: _Deadline,
+    headers: Mapping[str, str] | None,
+) -> bytes:
     opener = urllib.request.OpenerDirector()
     # No HTTPRedirectHandler: a 3xx reaches HTTPDefaultErrorHandler and raises HTTPError.
     for handler in (
@@ -137,12 +152,26 @@ def _get(url: str, timeout_s: float, max_bytes: int, deadline: _Deadline) -> byt
         urllib.request.HTTPErrorProcessor(),
     ):
         opener.add_handler(handler)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers is not None:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, headers=request_headers)  # noqa: S310
     with opener.open(req, timeout=timeout_s) as resp:
-        declared = resp.headers.get("Content-Length", "")
-        length = int(declared) if declared.isdigit() and len(declared) < 19 else None
-        if length is not None and length > max_bytes:
-            raise BodyTooLarge(f"response declares more than {max_bytes} bytes")
+        length = None
+        for declared in resp.headers.get_all("Content-Length", []):
+            declared = declared.strip()
+            if not declared.isascii() or not declared.isdecimal():
+                raise http.client.HTTPException("invalid response Content-Length") from None
+            # Compare significant digits before int(): hostile declarations may contain
+            # thousands of digits, including leading zeros. Only a capped value is parsed.
+            digits = declared.lstrip("0") or "0"
+            cap = str(max_bytes)
+            if (len(digits), digits) > (len(cap), cap):
+                raise BodyTooLarge(f"response declares more than {max_bytes} bytes")
+            declared_length = int(digits)
+            if length is not None and declared_length != length:
+                raise http.client.HTTPException("conflicting response Content-Length") from None
+            length = declared_length
         body = bytearray()
         while chunk := resp.read1(READ_CHUNK):
             body += chunk
