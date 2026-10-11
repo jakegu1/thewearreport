@@ -73,8 +73,19 @@ def test_installer_uses_native_desktop_com_and_no_labelling_or_credentials() -> 
 
 
 def test_existing_launchers_and_city_windows_are_byte_identical() -> None:
+    git = shutil.which("git")
+    assert git is not None
     for name, digest in LEGACY_HASHES.items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, name
+        canonical = subprocess.run(
+            [git, "show", f"HEAD:{name}"],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        ).stdout
+        assert hashlib.sha256(canonical).hexdigest() == digest, name
+        checkout = (ROOT / name).read_bytes()
+        assert checkout in (canonical, canonical.replace(b"\n", b"\r\n")), name
 
 
 def test_windows_workflow_only_adds_the_new_launcher_test_path() -> None:
