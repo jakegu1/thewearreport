@@ -20,66 +20,65 @@ try {
         throw "Shortcut destination must be an existing directory: $ShortcutDir. Select a valid directory and rerun setup."
     }
     [string]$Destination = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ShortcutDir).ProviderPath)
-    $Shell = New-Object -ComObject WScript.Shell
+    $Shell = New-Object -ComObject Shell.Application
+    $Folder = $Shell.NameSpace($Destination)
+    if ($null -eq $Folder) {
+        throw "Cannot read shortcut directory: $Destination. Check your permissions and rerun setup."
+    }
     $Links = @()
 
-    # Check both names before saving either link. Never replace another target.
+    # Check both names before writing either link. Never replace another target.
     foreach ($City in @('London', 'Calgary')) {
-        [string]$Path = Join-Path $Destination ("The Wear Report - {0}.lnk" -f $City)
-        if (Test-Path -LiteralPath $Path) {
+        [string]$Name = 'The Wear Report - {0}.lnk' -f $City
+        [string]$Path = Join-Path $Destination $Name
+        $Exists = Test-Path -LiteralPath $Path
+        if ($Exists) {
             if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
                 throw "Cannot replace $Path because it is not a file. Remove the conflicting item and rerun setup."
             }
-            $Existing = $Shell.CreateShortcut($Path)
-            $SameTarget = -not [string]::IsNullOrWhiteSpace($Existing.TargetPath) -and
-                [string]::Equals([IO.Path]::GetFullPath($Existing.TargetPath), $Target,
+            $Entry = $Folder.ParseName($Name)
+            $Existing = $Entry.GetLink
+            $SameTarget = -not [string]::IsNullOrWhiteSpace($Existing.Path) -and
+                [string]::Equals([IO.Path]::GetFullPath($Existing.Path), $Target,
                     [StringComparison]::OrdinalIgnoreCase)
             if (-not $SameTarget) {
                 throw "Refusing $Path because its target belongs to another location. Delete this conflicting shortcut only if intended, then rerun setup."
             }
         }
-        $Links += [PSCustomObject]@{ Path = $Path; City = $City.ToLowerInvariant() }
+        $Links += [PSCustomObject]@{ Path = $Path; Name = $Name; City = $City.ToLowerInvariant(); Exists = $Exists }
     }
 
     foreach ($Item in $Links) {
         [string]$LinkPath = $Item.Path
-        $Stage = 'CreateShortcut'
+        $Stage = 'Write'
         try {
-            $Link = $Shell.CreateShortcut($LinkPath)
-            $Stage = 'TargetPath'
-            $Link.TargetPath = [string]$Target
+            if (-not $Item.Exists) {
+                # A valid empty Unicode Shell Link header and terminal block.
+                # Seed only this final link path so native COM can open it.
+                [byte[]]$Header = New-Object byte[] 80
+                $Header[0] = 0x4C
+                ([Guid]'00021401-0000-0000-C000-000000000046').ToByteArray().CopyTo($Header, 4)
+                $Header[20] = 0x80
+                $Header[60] = 1
+                [IO.File]::WriteAllBytes($LinkPath, $Header)
+            }
+            $Stage = 'GetLink'
+            $Entry = $Folder.ParseName([string]$Item.Name)
+            $Link = $Entry.GetLink
+            $Stage = 'Path'
+            $Link.Path = $Target
             $Stage = 'Arguments'
             $Link.Arguments = "-Source $($Item.City) -MaxPasses 1"
             $Stage = 'WorkingDirectory'
-            $Link.WorkingDirectory = [string]$Repo
+            $Link.WorkingDirectory = $Repo
             $Stage = 'Save'
-            $Link.Save()
+            $Link.Save($LinkPath)
         } catch {
-            $Failure = $_.Exception.Message
-            $Details = ''
-            if ($Stage -eq 'TargetPath') {
-                # Inspect in-memory COM objects only; neither probe saves a link.
-                $Requested = ($LinkPath.ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ','
-                $Observed = ([string]$Link.FullName).ToCharArray() | ForEach-Object { '{0:X4}' -f [int]$_ }
-                $Controls = @()
-                foreach ($Strict in @('Off', '3.0')) {
-                    try {
-                        if ($Strict -eq 'Off') { Set-StrictMode -Off } else { Set-StrictMode -Version 3.0 }
-                        $Probe = $Shell.CreateShortcut($LinkPath)
-                        $Probe.TargetPath = [IO.Path]::Combine($env:SystemRoot, 'System32\cmd.exe')
-                        $Controls += "strict=$Strict ASCII=ok"
-                        try {
-                            $Probe.TargetPath = $Target
-                            $Controls += "strict=$Strict Unicode=ok"
-                        } catch { $Controls += "strict=$Strict Unicode=$($_.Exception.Message)" }
-                    } catch { $Controls += "strict=$Strict ASCII=$($_.Exception.Message)" }
-                }
-                Set-StrictMode -Version 3.0
-                $Details = " ACP=$([Text.Encoding]::Default.CodePage); requested=$Requested; observed=$($Observed -join ','); controls=$($Controls -join ';')."
-            }
-            throw "Cannot save $LinkPath ($Stage; target: $Target): $Failure$Details Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
+            $Recovery = ''
+            if (-not $Item.Exists) { $Recovery = ' Delete this incomplete link if it exists.' }
+            throw "Cannot save $LinkPath ($Stage): $($_.Exception.Message) Close programs using this link and check that the directory is writable and your permissions allow changes.$Recovery Then rerun setup."
         }
-        Write-Host "Installed: $($Item.Path)"
+        Write-Host "Installed: $LinkPath"
     }
     Write-Host 'Setup complete. Double-click either city shortcut to start one pass.'
 } catch {
