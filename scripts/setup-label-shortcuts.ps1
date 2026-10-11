@@ -6,8 +6,8 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 try {
-    $Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
-    $Target = Join-Path $Repo 'label.cmd'
+    [string]$Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).ProviderPath
+    [string]$Target = Join-Path $Repo 'label.cmd'
     if (-not (Test-Path -LiteralPath $Target -PathType Leaf)) {
         throw "Missing launcher: $Target. Update or restore the repository, then rerun setup."
     }
@@ -19,13 +19,13 @@ try {
         -not (Test-Path -LiteralPath $ShortcutDir -PathType Container)) {
         throw "Shortcut destination must be an existing directory: $ShortcutDir. Select a valid directory and rerun setup."
     }
-    $Destination = (Resolve-Path -LiteralPath $ShortcutDir).ProviderPath
+    [string]$Destination = (Resolve-Path -LiteralPath $ShortcutDir).ProviderPath
     $Shell = New-Object -ComObject WScript.Shell
     $Links = @()
 
     # Check both names before saving either link. Never replace another target.
     foreach ($City in @('London', 'Calgary')) {
-        $Path = Join-Path $Destination ("The Wear Report - {0}.lnk" -f $City)
+        [string]$Path = Join-Path $Destination ("The Wear Report - {0}.lnk" -f $City)
         if (Test-Path -LiteralPath $Path) {
             if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
                 throw "Cannot replace $Path because it is not a file. Remove the conflicting item and rerun setup."
@@ -42,14 +42,20 @@ try {
     }
 
     foreach ($Item in $Links) {
+        [string]$LinkPath = $Item.Path
+        $Stage = 'CreateShortcut'
         try {
-            $Link = $Shell.CreateShortcut($Item.Path)
-            $Link.TargetPath = $Target
+            $Link = $Shell.CreateShortcut($LinkPath)
+            $Stage = 'TargetPath'
+            $Link.TargetPath = [string]$Target
+            $Stage = 'Arguments'
             $Link.Arguments = "-Source $($Item.City) -MaxPasses 1"
-            $Link.WorkingDirectory = $Repo
+            $Stage = 'WorkingDirectory'
+            $Link.WorkingDirectory = [string]$Repo
+            $Stage = 'Save'
             $Link.Save()
         } catch {
-            throw "Cannot save $($Item.Path): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
+            throw "Cannot save $LinkPath ($Stage): $($_.Exception.Message) Close programs using this link, check that the directory is writable and your permissions allow changes, then rerun setup."
         }
         Write-Host "Installed: $($Item.Path)"
     }
