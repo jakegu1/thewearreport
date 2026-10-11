@@ -112,6 +112,7 @@ def bounded_get(
       Known limit: DNS resolution happens before the deadline can interrupt it.
     - A body larger than `max_bytes`, declared or counted, raises BodyTooLarge; a body
       shorter than its Content-Length raises http.client.IncompleteRead.
+      A malformed Content-Length raises a constant http.client.HTTPException.
     - Optional request headers supplement the default User-Agent without changing the
       caller's mapping.
 
@@ -155,9 +156,12 @@ def _get(
         request_headers.update(headers)
     req = urllib.request.Request(url, headers=request_headers)  # noqa: S310
     with opener.open(req, timeout=timeout_s) as resp:
-        declared = resp.headers.get("Content-Length", "").strip()
+        declared = resp.headers.get("Content-Length")
         length = None
-        if declared.isascii() and declared.isdecimal():
+        if declared is not None:
+            declared = declared.strip()
+            if not declared.isascii() or not declared.isdecimal():
+                raise http.client.HTTPException("invalid response Content-Length") from None
             # Compare significant digits before int(): hostile declarations may contain
             # thousands of digits, including leading zeros. Only a capped value is parsed.
             digits = declared.lstrip("0") or "0"

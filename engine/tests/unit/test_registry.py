@@ -9,13 +9,14 @@ import threading
 import time
 import urllib.error
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from wearreport import registry
+from wearreport import registry, settings, weather
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "jamcam_places.json"
 
@@ -501,6 +502,67 @@ def test_bounded_get_normalizes_content_length_before_checking_truncation() -> N
         pytest.raises(http.client.IncompleteRead),
     ):
         _get(url)
+
+
+@pytest.mark.parametrize("declared", ["+1000001", "+10000", "-1", "2.0", "2, 2", "", "garbage"])
+def test_malformed_content_length_is_refused_by_transport_and_weather(
+    declared: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps(
+        {
+            "features": [
+                {
+                    "properties": {
+                        "timeSeries": [
+                            {
+                                "time": "2026-10-11T12:00Z",
+                                "screenTemperature": 12.0,
+                                "feelsLikeTemperature": 10.0,
+                                "totalPrecipAmount": 0.5,
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ).encode()
+    real_get = registry.bounded_get
+
+    def local_get(
+        url: str,
+        *,
+        timeout_s: float,
+        max_bytes: int,
+        headers: dict[str, str] | None = None,
+    ) -> bytes:
+        return real_get(
+            url,
+            timeout_s=timeout_s,
+            max_bytes=max_bytes,
+            headers=headers,
+            schemes=("http",),
+        )
+
+    # Only permit HTTP for this local fixture; retain the real transport and adapter.
+    monkeypatch.setattr(registry, "bounded_get", local_get)
+    with _serve(lambda h: h.reply(200, body, **{"Content-Length": declared})) as (url, hits):
+        with pytest.raises(
+            http.client.HTTPException, match=r"^invalid response Content-Length$"
+        ) as info:
+            weather.urllib_get(url, {"apikey": "synthetic-header"}, 1)
+        assert info.value.__cause__ is None and info.value.__suppress_context__
+        monkeypatch.setattr(weather, "METOFFICE_URL", url)
+        budget = weather.RequestBudget(10)
+        assert (
+            weather.current_conditions(
+                datetime(2026, 10, 11, 12, tzinfo=UTC),
+                settings=settings.load_settings({"METOFFICE_API_KEY": "synthetic-header"}),
+                _budget=budget,
+            )
+            is None
+        )
+    assert len(hits) == 3 and budget.used == 2
 
 
 def test_bounded_get_stops_reading_past_the_cap() -> None:
