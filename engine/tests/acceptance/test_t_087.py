@@ -350,7 +350,7 @@ def test_native_batch_entry_keeps_the_installers_failure_exit_code(
     )
     command = f'"{installation.repo / ENTRY.name}" -ShortcutDir "{installation.destination}"'
     result = subprocess.run(
-        [CMD, "/d", "/s", "/c", '"' + command + '"'],
+        f'"{CMD}" /d /s /c "{command}"',
         input="\n",
         capture_output=True,
         text=True,
