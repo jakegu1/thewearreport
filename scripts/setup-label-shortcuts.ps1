@@ -36,11 +36,18 @@ try {
             if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
                 throw "Cannot replace $Path because it is not a file. Remove the conflicting item and rerun setup."
             }
-            $Entry = $Folder.ParseName($Name)
-            $Existing = $Entry.GetLink
-            $SameTarget = -not [string]::IsNullOrWhiteSpace($Existing.Path) -and
-                [string]::Equals([IO.Path]::GetFullPath($Existing.Path), $Target,
-                    [StringComparison]::OrdinalIgnoreCase)
+            try {
+                $Entry = $Folder.ParseName($Name)
+                if ($null -eq $Entry) { throw 'Cannot locate the existing shortcut.' }
+                $Existing = $Entry.GetLink
+                if ($null -eq $Existing) { throw 'Cannot read the existing shortcut.' }
+                [string]$ExistingTarget = $Existing.Path
+                $SameTarget = -not [string]::IsNullOrWhiteSpace($ExistingTarget) -and
+                    [string]::Equals([IO.Path]::GetFullPath($ExistingTarget), $Target,
+                        [StringComparison]::OrdinalIgnoreCase)
+            } catch {
+                throw "Cannot read or save $Path because ownership could not be verified: $($_.Exception.Message) Close programs using this link, check directory access and permissions, then rerun setup."
+            }
             if (-not $SameTarget) {
                 throw "Refusing $Path because its target belongs to another location. Delete this conflicting shortcut only if intended, then rerun setup."
             }
