@@ -204,13 +204,13 @@ def _oracle(previous: Vector, answers: Sequence[str], current: Vector) -> list[l
                             for value in centered
                         ]
                     )
-                    query = [
+                    query_values = [
                         Fraction.from_float(float(value)) - mean for value in current[:, index]
                     ]
                     queries.append(
                         [
                             float((Decimal(value.numerator) / Decimal(value.denominator)) / scale)
-                            for value in query
+                            for value in query_values
                         ]
                     )
             standardized = (
