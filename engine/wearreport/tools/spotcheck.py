@@ -3035,15 +3035,23 @@ def _active_window_guard(
     reviewer: Reviewer | AttributeReviewer, guard: _SignalGuard
 ) -> Iterator[None]:
     """Bind an injected window's teardown to this collection, then restore it."""
-    if not isinstance(reviewer, WindowReviewer) or reviewer.guard is not None:
+    if not isinstance(reviewer, WindowReviewer):
         yield
         return
-    previous = reviewer.guard
+    missing = object()
+    previous = getattr(reviewer, "guard", missing)
+    if previous is not missing and previous is not None:
+        yield
+        return
     try:
         reviewer.guard = guard
         yield
     finally:
-        reviewer.guard = previous
+        if previous is missing:
+            with contextlib.suppress(AttributeError):
+                del reviewer.guard
+        else:
+            reviewer.guard = None
 
 
 def _collect(
