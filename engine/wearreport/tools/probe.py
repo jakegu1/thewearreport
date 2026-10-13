@@ -382,12 +382,16 @@ def _head(group: Cohort, target_count: int, target_total: Array, current: Array)
     if target_count in (0, group.count):
         return [np.full(len(current), mean_y) for _ in LAMBDAS]
     mean = group.total / group.count
-    variance = np.maximum(np.diag(group.cross) / group.count - mean * mean, 0)
-    active = variance > 1e-20
-    scale = np.sqrt(variance[active])
-    centered = group.cross[np.ix_(active, active)] - group.count * np.outer(
-        mean[active], mean[active]
-    )
+    diagonal = np.diag(group.cross)
+    mean_cross = group.total * mean
+    centered_diagonal = np.maximum(diagonal - mean_cross, 0)
+    # Constant nonzero columns can leave positive cancellation residue. Bound
+    # raw-moment accumulation/subtraction error by count and each column's scale,
+    # preserving genuinely small varying columns and the original std > 1e-10.
+    roundoff = np.finfo(np.float64).eps * (group.count + 2) * (diagonal + mean_cross)
+    active = (centered_diagonal > group.count * 1e-20) & (centered_diagonal > roundoff)
+    scale = np.sqrt(centered_diagonal[active] / group.count)
+    centered = group.cross[np.ix_(active, active)] - np.outer(group.total[active], mean[active])
     standardized = centered / scale[:, None] / scale[None, :]
     xy = (target_total[active] - group.total[active] * mean_y) / scale
     query = (current[:, active] - mean[active]) / scale
