@@ -252,8 +252,9 @@ def test_ac2_ac3_prior_only_numpy_oracle_every_crop_and_sorted_scores(
         run_id = _json(_control(out))["run_id"]
         assert str(uuid.UUID(run_id)) == run_id
         _assert_metadata(record, session, run_id)
-        current = np.array(env.seen[start:])
-        assert current.shape == (6, DIM)  # x is never embedded; u is embedded
+        candidates = np.array(env.seen[start:])
+        assert candidates.shape == (7, DIM)  # scores precede answers; x is discarded afterward
+        current = candidates[[i for i, answer in enumerate(answers) if answer is not None]]
         kept = [(h, a, None) for h, a in zip(HEIGHTS, answers, strict=True) if a is not None]
         order = sorted(range(len(kept)), key=lambda k: (kept[k][0], kept[k][1], ""))
         assert record["crops"] == [list(kept[k]) for k in order]
@@ -413,6 +414,8 @@ def test_ac4_pending_precedes_work_human_label_precedes_stats_and_accepted_is_la
     out, directory = tmp_path / "out", tmp_path / "stats"
     events: list[str] = []
     atomic = probe.atomic_json
+    score_features = probe.score_features
+    session = 0
 
     def observe(path: Path, value: Mapping[str, object]) -> None:
         if path == _control(out):
@@ -429,21 +432,41 @@ def test_ac4_pending_precedes_work_human_label_precedes_stats_and_accepted_is_la
 
     def during() -> None:
         control = _json(_control(out))
-        assert control["state"] == "pending" and control["accepted_sessions"] == 0
-        assert env.seen == []
+        assert control["state"] == "pending" and control["accepted_sessions"] == session
+        assert len(env.seen) == (session + 1) * 7
+        assert events == ["pending", *(["feature"] * 7), "scores"]
         events.append("answers")
 
     embed = env.embed
 
     def feature(image: Frame) -> Vector:
-        assert _last(out)["probe_run"]["state"] == "incomplete"
+        assert len(_labels(out)) == session
+        assert _json(_control(out))["state"] == "pending"
         events.append("feature")
         return embed(image)
 
+    def predictions(*args: Any, **kwargs: Any) -> Any:
+        assert len(_labels(out)) == session
+        assert "answers" not in events
+        events.append("scores")
+        return score_features(*args, **kwargs)
+
     monkeypatch.setattr(probe, "atomic_json", observe)
     monkeypatch.setattr(env, "embed", feature)
-    assert _invoke(out, directory, during=during) == 0
-    assert events == ["pending", "answers", *(["feature"] * 6), "aggregate", "active", "accepted"]
+    monkeypatch.setattr(probe, "score_features", predictions)
+    for session in range(2):
+        events.clear()
+        assert _invoke(out, directory, during=during) == 0
+        assert _json(_control(out))["accepted_sessions"] == session + 1
+        assert events == [
+            "pending",
+            *(["feature"] * 7),
+            "scores",
+            "answers",
+            "aggregate",
+            "active",
+            "accepted",
+        ]
 
 
 @pytest.mark.parametrize("stage", ["arm", "human_sync", "aggregate", "terminal", "accepted"])
@@ -497,7 +520,7 @@ def test_ac4_every_commit_interruption_preserves_human_labels_and_stops_continua
     assert len(env.seen) == before and _last(out)["probe_run"]["state"] == "stopped"
 
 
-def test_ac4_ordinary_label_write_failure_prevents_all_feature_work(
+def test_ac4_ordinary_label_write_failure_never_persists_feature_work(
     env: NumericEncoder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     out, directory = tmp_path / "out", tmp_path / "stats"
@@ -507,7 +530,7 @@ def test_ac4_ordinary_label_write_failure_prevents_all_feature_work(
 
     monkeypatch.setattr(spotcheck, "write_attributes", fail)
     assert _invoke(out, directory) == 1
-    assert env.seen == [] and not _state(directory).exists()
+    assert len(env.seen) == 7 and not _state(directory).exists()
     assert _json(_control(out))["state"] == "pending"
 
 
@@ -1092,8 +1115,12 @@ def test_ac8_native_launcher_both_cities_fetches_once_and_all_passes_continue(
         "encoder = ns['NumericEncoder']()\n"
         "def fail(): raise probe.ProbeError('model_missing')\n"
         "probe.open_encoder = fail if os.environ['T081_FAILED'] == '1' else lambda: encoder\n"
-        "raise SystemExit(spotcheck.main(argv, pipeline=ns['_pipeline'](), "
-        "reviewer=ns['Answers'](), today=ns['DAY'], clock=lambda:ns['NOON']))\n",
+        "base = ns['_pipeline']()\n"
+        "pipeline = spotcheck.Pipeline(base.frames, base.detector, base.info, "
+        "camera_frames=lambda:[('synthetic-'+str(i), frame) "
+        "for i, frame in enumerate(base.frames())])\n"
+        "raise SystemExit(spotcheck.main(argv, pipeline=pipeline, "
+        "reviewer=ns['Answers'](['ynn'] * 7), today=ns['DAY'], clock=lambda:ns['NOON']))\n",
         encoding="utf-8",
     )
     fakes = tmp_path / "fakebin"
