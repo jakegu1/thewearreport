@@ -227,7 +227,7 @@ def test_ac1_unflagged_records_and_file_counts_are_identical(
     assert _invoke(flagged, flagged / "probe") == 0
     record = _last(flagged)
     del record["probe"], record["probe_run"]
-    assert (json.dumps(record, ensure_ascii=True) + "\n").encode() == raw
+    assert (json.dumps(record, ensure_ascii=True) + os.linesep).encode() == raw
 
 
 def test_ac1_flag_is_attribute_only(env: NumericEncoder, tmp_path: Path) -> None:
@@ -704,6 +704,19 @@ def test_ac6_encoder_failures_are_one_sanitized_line_per_pass_and_keep_prior_byt
         b"\xff",
         b" " * (64 * 1024 * 1024 + 1),
     ],
+    ids=[
+        "malformed",
+        "array",
+        "null",
+        "deep-nesting",
+        "nan",
+        "infinity",
+        "overflow",
+        "boolean-version",
+        "duplicate-key",
+        "invalid-utf8",
+        "over-64mib",
+    ],
 )
 def test_ac6_hostile_state_input_is_always_typed_and_sanitized(raw: bytes) -> None:
     with pytest.raises(probe.ProbeError) as failure:
@@ -1148,7 +1161,7 @@ def test_ac8_native_launcher_both_cities_fetches_once_and_all_passes_continue(
             "-NoJudge",
             "-DryRun",
             "-Now",
-            "2026-06-21T19:00Z",
+            "2026-06-21T12:00Z" if source == "london" else "2026-06-21T19:00Z",
             "-Python",
             sys.executable,
             "-Spotcheck",
