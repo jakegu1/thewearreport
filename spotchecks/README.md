@@ -566,6 +566,103 @@ each judge model:
 The last line says whether the condition holds: the two latest weeks with a corrected
 estimate are both within 3 points of the reviewer's precision.
 
+## Local probe (`--probe DIR`)
+
+An attribute pass can opt into local prequential scores with `--probe DIR`. The Windows
+launcher passes `--probe <OutDir>\probe` for both cities, keeping its existing external
+label folder, questions, judge settings and city selection. It tries the model fetcher
+once at session start if the encoder is missing. A failed fetch prints one launcher line;
+each flagged pass still labels normally and prints its own fixed probe reason if stopped.
+Without the flag, label records and file counts are unchanged.
+
+Fetch the encoder with `make probe-model`, or on Windows:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_probe_model.ps1
+```
+
+The model provenance and verification pins are:
+
+| Item | Value |
+|---|---|
+| Upstream model | Google [SigLIP 2 base patch16-224](https://huggingface.co/google/siglip2-base-patch16-224), Apache-2.0 |
+| ONNX conversion | [onnx-community/siglip2-base-patch16-224-ONNX](https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX), revision `ba1f3b0843f24bc5417d38e19c37b287d719b2f4` |
+| Conversion artifact | `onnx/vision_model_int8.onnx` (94,553,333 bytes) |
+| Local target | `.models/siglip2-base-patch16-224-int8.onnx` (ignored by git) |
+| SHA-256 | `0dd31785a2713f1113ef2272472165c69d580473dae38d7b47568ac587795e70` |
+
+Both fetchers try huggingface.co, hf-mirror.com and modelscope.cn in that order, with
+120-second attempt timeouts and one retry per endpoint. An exhausted fetch prints the
+public pinned URL, target and checksum for manual download. Inference hashes the exact
+bytes loaded, uses the CPU int8 model, and never substitutes a different conversion.
+The existing ONNX Runtime telemetry, profiling and optimized-model file restrictions
+apply. There are no new runtime dependencies.
+
+Before asking the human any questions, the probe pads each candidate crop to a black
+square, converts BGR to RGB, resizes with bilinear interpolation to 224 by 224, rescales
+float32 pixels by 1/255 and normalizes with mean/std 0.5/0.5. `pixel_values` has shape
+`[1,3,224,224]`; `pooler_output` supplies 768 values. Features and predictions remain in
+memory. Rejected (`x`) candidates are discarded after the human answers; `u` crops are
+kept. All features are discarded when the pass ends.
+
+Only earlier accepted sessions of the same source train the two ridge heads: judgeable
+(outer `y`/`n` versus `u`, over all kept crops) and coat (outer `y` versus `n`, over
+judgeable crops). Features are standardized using prior moments and the intercept is
+unpenalized. The fixed lambdas are `[1,10,100,1000]`. An accepted label adds:
+
+- `probe`: `encoder` (`siglip2-base-patch16-224-int8@0dd31785a271`), `lambdas`,
+  `trained_sessions` (session minus one), and `scores` aligned with the unchanged sorted
+  three-column crop rows. Each score is null in session 1, then four
+  `[judgeable,coat]` pairs clipped to `[0,1]` and rounded to three decimals.
+- `probe_run`: `version:1`, `run_id` (UUID), `session`, `state` and `reason`. Acceptance
+  uses `state:"accepted"` and `reason:null`. Failed or stopped human-only labels omit
+  `probe`; stopped passes use `session:null`. Unrecoverable identities use both
+  `run_id:null` and `session:null`. Reasons are fixed codes, never exception text.
+
+`DIR/<source>.json` stores version 1, UUID, source, encoder, accepted-session count and
+three cumulative cohorts `y`, `n`, `u`. Each cohort contains only `count`, `sum` (768
+numbers) and `cross` (768 by 768 numbers). Counts encode the target sums: `N=y+n+u`,
+`J=y+n`, `Y=y`; feature-target sums are the corresponding cohort sums. Counts are bounded
+by 1,000,000,000, numeric moments by absolute 1e21, and the JSON body by 64 MiB. No entry
+is retained per crop or per session; there is no feature delta, debug output, checkpoint
+or feature backup. Prior state, current increment and complete candidate must each have
+`N>=2`, `J>=2`, and every nonempty U/Y/C cohort at least two crops. Zero cohorts require
+zero sums and cross-products. The fresh empty baseline exists in memory before the first
+admissible increment. These checks do not establish mathematical irreversibility or
+anonymity.
+
+Metadata-only run control lives outside the aggregate directory at
+`<OutDir>/probe-runs/<source>.json`: version, UUID, source, encoder, state
+(`active`, `pending`, `incomplete`, `sealed`), accepted count and fixed reason/null.
+A stable metadata-only lock file lives at
+`<canonical-DIR.parent>/<canonical-DIR.name>.locks/<source>.json`, containing only
+`{"version":1,"kind":"probe_source_lock"}`. Its nonblocking kernel lock is shared by
+different OutDirs and alternate spellings of the same aggregate directory. The lock is
+held before admission reads through final publication; it is never replaced or unlinked.
+Crash release leaves pending/incomplete records stopped. Contention does no model or
+aggregate/control work and records `source_busy` in human-only labels.
+
+Admission checks the complete contiguous accepted label history `1..K`, identities,
+encoder and counts. Missing, duplicate, mismatching or incomplete trial history stops
+the source. Unknown-identity stop labels also stop it. Unsafe or unverifiable input stays
+untouched, with no automatic reset, selected-subset continuation or reconciliation.
+
+The successful commit order is: durable pending control at K before feature work;
+after answers, durable human label without `probe`, marked incomplete with
+`unfinished_session`; validated cumulative aggregate; active control at K+1 (sealed at
+12); replacement of that same label with accepted metadata and scores, last. No state
+write follows successful acceptance. Failure before aggregate replacement preserves old
+aggregate bytes. Later failures freeze the observed aggregate without certifying rollback
+or acceptance; surviving incomplete human labels override active or sealed control.
+
+Each source seals at exactly 12 accepted sessions. Later flagged human-only labels use
+`collection_complete`, validated UUID and null session only after verifying the complete
+accepted trial; they do no encoder work or aggregate/control updates. A stopped trial has
+no such exception. The ordinary summary validates optional metadata but uses only its
+existing human-label calculations. Complete label history, including failures, is the
+commit authority; aggregate/control uploads are unnecessary. Sealing does not establish
+analysis or model success. This tool adds no evaluation algorithm or production estimate.
+
 ## Privacy and cleanup
 
 With `--view window`, rendered images exist only in memory and in the window, and
