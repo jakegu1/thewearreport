@@ -68,6 +68,7 @@ REASONS = frozenset(
     }
 )
 LOCK_TEXT = '{"version":1,"kind":"probe_source_lock"}\n'
+LOCK_BYTE_OFFSET = 1 << 20
 Array = npt.NDArray[np.float64]
 Frame = npt.NDArray[np.uint8]
 Score = list[list[float]] | None
@@ -603,6 +604,9 @@ class SourceLock:
         try:
             stream.seek(0)
             if sys.platform == "win32":
+                # Windows byte locks also deny reads. Reserve a byte beyond the
+                # bounded metadata and read buffer; seeking never extends the file.
+                stream.seek(LOCK_BYTE_OFFSET)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -640,6 +644,7 @@ class ProbePass:
         self.run_id: str | None = None
         self.session: int | None = None
         self.reason: str | None = None
+        self.failure_stop: tuple[bool, bool] | None = None
         self.enabled = False
         self.armed = False
         self.arm_failed = False
@@ -699,6 +704,14 @@ class ProbePass:
         if self.reason is None or self._notified:
             return None
         self._notified = True
+        if self.failure_stop is not None:
+            label_durable, control_durable = self.failure_stop
+            notice = self.reason + "; analysis blocked"
+            if not label_durable:
+                notice += "; failure-label durability unknown"
+            if not label_durable and not control_durable:
+                notice += "; no durable source stop was saved"
+            return notice
         return self.reason
 
     def metadata(self) -> dict[str, object]:
@@ -880,6 +893,48 @@ class ProbePass:
         self._features = self._features[kept]
         self._scores = [self._scores[i] for i in kept]
 
+    def _freeze_partial_publication(
+        self,
+        path: Path,
+        ordinary: Mapping[str, object],
+        final: Mapping[str, object],
+        terminal_control: Mapping[str, object],
+    ) -> None:
+        """Failure-only metadata writes; content read-back cannot prove durability."""
+        try:
+            current = _decode(_read(path, MAX_LABEL_BYTES), MAX_LABEL_BYTES)
+            if not isinstance(current, dict):
+                raise ProbeError("invalid_history")
+            validate_label_metadata(current)
+        except Exception:
+            current = None
+        if current == ordinary:
+            # The already-durable incomplete label survived a pre-replace failure.
+            return
+        label_durable = False
+        if current == final:
+            try:
+                atomic_json(path, ordinary)
+            except Exception:
+                label_durable = False
+            else:
+                label_durable = True
+        # Unreadable/mismatching bytes are preserved, including an unknown label
+        # outcome. Only this pass's verified terminal control may be replaced.
+        control_durable = False
+        try:
+            current_control = _control(_read(self.control_path, MAX_CONTROL_BYTES))
+            if current_control == terminal_control and self.state is not None:
+                stopped = self._control_document("incomplete", self.state.accepted_sessions)
+                stopped["reason"] = "persistence_failed"
+                atomic_json(self.control_path, stopped)
+                control_durable = True
+        except Exception:
+            control_durable = False
+        # A successful durable publisher is required for each true value; even
+        # valid bytes observed after a failed repair do not certify the sink.
+        self.failure_stop = (label_durable, control_durable)
+
     def finish(
         self,
         path: Path,
@@ -946,10 +1001,13 @@ class ProbePass:
             # No per-crop serialization precedes all three privacy validations.
             atomic_json(self.state_path, candidate.document())
             terminal = "sealed" if candidate.accepted_sessions == 12 else "active"
-            atomic_json(
-                self.control_path, self._control_document(terminal, candidate.accepted_sessions)
-            )
-            atomic_json(path, final)  # acceptance authority, LAST; close only unlocks
+            terminal_control = self._control_document(terminal, candidate.accepted_sessions)
+            atomic_json(self.control_path, terminal_control)
+            try:
+                atomic_json(path, final)  # acceptance authority, LAST; close only unlocks
+            except Exception:
+                self._freeze_partial_publication(path, record, final, terminal_control)
+                raise
             record.update(final)
         except ProbeError as exc:
             self._stop(exc.reason)

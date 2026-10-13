@@ -639,6 +639,8 @@ A stable metadata-only lock file lives at
 `{"version":1,"kind":"probe_source_lock"}`. Its nonblocking kernel lock is shared by
 different OutDirs and alternate spellings of the same aggregate directory. The lock is
 held before admission reads through final publication; it is never replaced or unlinked.
+On Windows the mandatory byte lock occupies a fixed reserved byte beyond the bounded
+JSON and read buffer, without writing or extending the file, so metadata remains readable.
 Crash release leaves pending/incomplete records stopped. Contention does no model or
 aggregate/control work and records `source_busy` in human-only labels.
 
@@ -654,6 +656,16 @@ after answers, durable human label without `probe`, marked incomplete with
 write follows successful acceptance. Failure before aggregate replacement preserves old
 aggregate bytes. Later failures freeze the observed aggregate without certifying rollback
 or acceptance; surviving incomplete human labels override active or sealed control.
+
+Acceptance requires the final durable publisher to complete. If its rename becomes
+visible but required synchronization fails, verified partial publication is replaced
+with the already-held ordinary incomplete human record, and an incomplete metadata-only
+control is attempted with the true prior accepted count. Advanced aggregate bytes stay
+unchanged. Unreadable or mismatching bytes are preserved; reading back valid JSON does
+not prove durability. A control-only stop blocks local probing but cannot establish
+eligible label history. Unknown failure-label durability explicitly blocks analysis;
+if neither stop sink completes durably, the diagnostic says no durable stop was saved.
+Failed or uncertain runs remain ineligible, with no reset or automatic recovery.
 
 Each source seals at exactly 12 accepted sessions. Later flagged human-only labels use
 `collection_complete`, validated UUID and null session only after verifying the complete
