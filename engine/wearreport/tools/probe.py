@@ -382,7 +382,7 @@ def _head(group: Cohort, target_count: int, target_total: Array, current: Array)
         return [np.full(len(current), mean_y) for _ in LAMBDAS]
     mean = group.total / group.count
     variance = np.maximum(np.diag(group.cross) / group.count - mean * mean, 0)
-    active = variance > 1e-10
+    active = variance > 1e-20
     scale = np.sqrt(variance[active])
     centered = group.cross[np.ix_(active, active)] - group.count * np.outer(
         mean[active], mean[active]
