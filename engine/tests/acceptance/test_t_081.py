@@ -168,23 +168,62 @@ def _probe_lines(capsys: pytest.CaptureFixture[str]) -> list[str]:
 
 
 def _oracle(previous: Vector, answers: Sequence[str], current: Vector) -> list[list[list[float]]]:
-    # Drop constant columns only to make the independent primal solve small. The
-    # production encoder always has 768 columns and the JSON shapes stay fixed.
+    """Independent exact-input centering, followed by the unchanged primal ridge fit."""
+    from decimal import Decimal, localcontext
+    from fractions import Fraction
+
     output: list[list[list[float]]] = [[] for _ in current]
+    judgeable = np.array([answer[0] in "yn" for answer in answers], dtype=np.float64)
     for penalty in GRID:
         heads = []
-        judgeable = np.array([a[0] in "yn" for a in answers], dtype=np.float64)
         for select, target in (
             (np.ones(len(previous), dtype=np.bool_), judgeable),
-            (judgeable.astype(np.bool_), np.array([a[0] == "y" for a in answers], dtype=float)),
+            (
+                judgeable.astype(np.bool_),
+                np.array([answer[0] == "y" for answer in answers], dtype=float),
+            ),
         ):
-            x, y = previous[select], target[select]
-            mean, scale = x.mean(axis=0), x.std(axis=0)
-            active = scale > 1e-10
-            z = (x[:, active] - mean[active]) / scale[active]
-            test = (current[:, active] - mean[active]) / scale[active]
-            weight = np.linalg.solve(z.T @ z + penalty * np.eye(z.shape[1]), z.T @ (y - y.mean()))
-            heads.append(np.round(np.clip(test @ weight + y.mean(), 0, 1), 3))
+            train, target = previous[select], target[select]
+            columns, queries = [], []
+            with localcontext() as context:
+                context.prec = 96
+                for index, column in enumerate(train.T):
+                    # Exact binary64 inputs; constants have zero mathematical variance.
+                    if np.all(column == column[0]):
+                        continue
+                    values = [Fraction.from_float(float(value)) for value in column]
+                    mean = sum(values, Fraction(0)) / len(values)
+                    centered = [value - mean for value in values]
+                    variance = sum((value * value for value in centered), Fraction(0)) / len(values)
+                    scale = (Decimal(variance.numerator) / Decimal(variance.denominator)).sqrt()
+                    if float(scale) <= 1e-10:
+                        continue
+                    columns.append(
+                        [
+                            float((Decimal(value.numerator) / Decimal(value.denominator)) / scale)
+                            for value in centered
+                        ]
+                    )
+                    query = [
+                        Fraction.from_float(float(value)) - mean for value in current[:, index]
+                    ]
+                    queries.append(
+                        [
+                            float((Decimal(value.numerator) / Decimal(value.denominator)) / scale)
+                            for value in query
+                        ]
+                    )
+            standardized = (
+                np.array(columns, dtype=np.float64).T if columns else np.empty((len(train), 0))
+            )
+            query = (
+                np.array(queries, dtype=np.float64).T if queries else np.empty((len(current), 0))
+            )
+            weight = np.linalg.solve(
+                standardized.T @ standardized + penalty * np.eye(standardized.shape[1]),
+                standardized.T @ (target - target.mean()),
+            )
+            heads.append(np.round(np.clip(query @ weight + target.mean(), 0, 1), 3))
         for index, (judge, coat) in enumerate(zip(*heads, strict=True)):
             output[index].append([float(judge), float(coat)])
     return output
@@ -192,7 +231,7 @@ def _oracle(previous: Vector, answers: Sequence[str], current: Vector) -> list[l
 
 def _assert_metadata(record: Mapping[str, Any], session: int, run_id: str) -> None:
     assert record["probe_run"] == {
-        "version": 1,
+        "version": 2,
         "run_id": run_id,
         "session": session,
         "state": "accepted",
@@ -264,15 +303,17 @@ def test_ac2_ac3_prior_only_numpy_oracle_every_crop_and_sorted_scores(
         previous.extend(current)
         labels.extend(a for a in answers if a is not None)
         stored = _json(_state(directory))
-        assert stored["accepted_sessions"] == session
+        assert stored["version"] == 2 and stored["accepted_sessions"] == session
         for cohort in "ynu":
             group = stored["cohorts"][cohort]
             selected = np.array(
                 [x for x, a in zip(previous, labels, strict=True) if a[0] == cohort]
             )
             assert group["count"] == len(selected)
-            assert np.allclose(group["sum"], selected.sum(axis=0))
-            assert np.allclose(group["cross"], selected.T @ selected)
+            mean = np.array(group["mean"])
+            assert np.allclose(mean[:, 0] + mean[:, 1], selected.mean(axis=0))
+            centered = selected - selected.mean(axis=0)
+            assert np.allclose(group["scatter"], centered.T @ centered)
 
 
 def test_ac2_source_histories_are_separate(env: NumericEncoder, tmp_path: Path) -> None:
@@ -339,12 +380,14 @@ def test_ac4_only_cumulative_stats_labels_control_and_stable_lock_persist(
                     "accepted_sessions",
                     "cohorts",
                 }
+                assert value["version"] == 2
                 assert set(value["cohorts"]) == set("ynu")
                 for group in value["cohorts"].values():
-                    assert set(group) == {"count", "sum", "cross"}
-                    assert np.array(group["sum"]).shape == (DIM,)
-                    assert np.array(group["cross"]).shape == (DIM, DIM)
+                    assert set(group) == {"count", "mean", "scatter"}
+                    assert np.array(group["mean"]).shape == (DIM, 2)
+                    assert np.array(group["scatter"]).shape == (DIM, DIM)
             elif path == _control(out):
+                assert value["version"] == 2
                 assert set(value) == {
                     "version",
                     "run_id",
@@ -403,7 +446,7 @@ def test_ac4_zero_cohorts_are_safe_and_have_zero_statistics(
     assert stored["cohorts"]["y"]["count"] == 6
     for name in "nu":
         group = stored["cohorts"][name]
-        assert group["count"] == 0 and not np.any(group["sum"]) and not np.any(group["cross"])
+        assert group["count"] == 0 and not np.any(group["mean"]) and not np.any(group["scatter"])
     assert _invoke(out, directory, answers=["nnu"] * 6 + [None]) == 0
     assert all(pair == [1.0, 1.0] for row in _last(out)["probe"]["scores"] for pair in row)
 
@@ -641,7 +684,7 @@ def test_ac6_seal_twelve_accepts_no_more_work_and_verifies_complete_history(
     for _ in range(2):
         assert _invoke(out, directory) == 0
         assert _last(out)["probe_run"] == {
-            "version": 1,
+            "version": 2,
             "run_id": control["run_id"],
             "session": None,
             "state": "stopped",
@@ -738,11 +781,11 @@ def test_ac6_unsafe_state_is_untouched_and_disables_feature_work(
     value = _json(_state(directory))
     group = value["cohorts"]["u"]
     if fault == "shape":
-        group["sum"] = [0.0]
+        group["mean"] = [0.0]
     elif fault == "type":
-        group["sum"][0] = "sensitive"
+        group["mean"][0][0] = "sensitive"
     elif fault in ("nan", "inf"):
-        group["sum"][0] = float(fault)
+        group["mean"][0][0] = float(fault)
     elif fault == "singleton":
         group["count"] = 1
     elif fault == "zero":
@@ -750,7 +793,7 @@ def test_ac6_unsafe_state_is_untouched_and_disables_feature_work(
     elif fault == "count":
         value["cohorts"]["y"]["count"] += 2
     else:
-        group["cross"][0] = [0.0]
+        group["scatter"][0] = [0.0]
     _state(directory).write_text(json.dumps(value), encoding="utf-8")
     old, control, before = _state(directory).read_bytes(), _control(out).read_bytes(), len(env.seen)
     capsys.readouterr()

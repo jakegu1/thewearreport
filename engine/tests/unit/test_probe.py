@@ -23,11 +23,14 @@ Frame = npt.NDArray[np.uint8]
 
 
 def _oracle(previous: Array, outer: Sequence[str], current: Array) -> list[list[list[float]]]:
-    """Fit centered, standardized rows directly, without production moments/helpers."""
-    result: list[list[list[float]]] = [[] for _ in current]
+    """Independent exact-input centering, followed by the unchanged primal ridge fit."""
+    from decimal import Decimal, localcontext
+    from fractions import Fraction
+
+    output: list[list[list[float]]] = [[] for _ in current]
     judgeable = np.array([answer in "yn" for answer in outer], dtype=np.float64)
     for penalty in GRID:
-        predictions = []
+        heads = []
         for select, target in (
             (np.ones(len(previous), dtype=np.bool_), judgeable),
             (
@@ -36,18 +39,49 @@ def _oracle(previous: Array, outer: Sequence[str], current: Array) -> list[list[
             ),
         ):
             train, target = previous[select], target[select]
-            mean, scale = train.mean(axis=0), train.std(axis=0)
-            active = scale > 1e-10
-            standardized = (train[:, active] - mean[active]) / scale[active]
-            query = (current[:, active] - mean[active]) / scale[active]
-            coefficients = np.linalg.solve(
+            columns, queries = [], []
+            with localcontext() as context:
+                context.prec = 96
+                for index, column in enumerate(train.T):
+                    # Exact binary64 inputs; constants have zero mathematical variance.
+                    if np.all(column == column[0]):
+                        continue
+                    values = [Fraction.from_float(float(value)) for value in column]
+                    mean = sum(values, Fraction(0)) / len(values)
+                    centered = [value - mean for value in values]
+                    variance = sum((value * value for value in centered), Fraction(0)) / len(values)
+                    scale = (Decimal(variance.numerator) / Decimal(variance.denominator)).sqrt()
+                    if float(scale) <= 1e-10:
+                        continue
+                    columns.append(
+                        [
+                            float((Decimal(value.numerator) / Decimal(value.denominator)) / scale)
+                            for value in centered
+                        ]
+                    )
+                    query = [
+                        Fraction.from_float(float(value)) - mean for value in current[:, index]
+                    ]
+                    queries.append(
+                        [
+                            float((Decimal(value.numerator) / Decimal(value.denominator)) / scale)
+                            for value in query
+                        ]
+                    )
+            standardized = (
+                np.array(columns, dtype=np.float64).T if columns else np.empty((len(train), 0))
+            )
+            query = (
+                np.array(queries, dtype=np.float64).T if queries else np.empty((len(current), 0))
+            )
+            weight = np.linalg.solve(
                 standardized.T @ standardized + penalty * np.eye(standardized.shape[1]),
                 standardized.T @ (target - target.mean()),
             )
-            predictions.append(np.round(np.clip(query @ coefficients + target.mean(), 0, 1), 3))
-        for row, judge, coat in zip(result, *predictions, strict=True):
-            row.append([float(judge), float(coat)])
-    return result
+            heads.append(np.round(np.clip(query @ weight + target.mean(), 0, 1), 3))
+        for index, (judge, coat) in enumerate(zip(*heads, strict=True)):
+            output[index].append([float(judge), float(coat)])
+    return output
 
 
 def _outer(counts: tuple[int, int, int]) -> list[str]:
