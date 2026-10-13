@@ -1,7 +1,7 @@
-"""Local prequential ridge scores, with cumulative moments and accepted-last commits.
+"""Local prequential ridge scores, with centered aggregates and accepted-last commits.
 
 The encoder, candidate vectors, and fitted heads stay in memory for one pass. Only
-validated cumulative moments, human labels, and bounded run/lock metadata persist.
+validated cumulative centroids/scatter, human labels, and bounded run/lock metadata persist.
 The caller supplies crops before asking questions and publishes human labels before
 calling finish. An interrupted source never automatically starts another history.
 """
@@ -17,6 +17,8 @@ import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, localcontext
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol, TextIO, cast
 
@@ -235,12 +237,11 @@ def _read(path: Path, limit: int) -> bytes:
         return stream.read(limit + 1)
 
 
-def _array(value: object, matrix: bool = False) -> Array:
+def _array(value: object, width: int = DIM) -> Array:
     if not isinstance(value, list) or len(value) != DIM:
         raise ProbeError("invalid_state")
-    rows = value if matrix else [value]
-    for row in rows:
-        if not isinstance(row, list) or len(row) != DIM:
+    for row in value:
+        if not isinstance(row, list) or len(row) != width:
             raise ProbeError("invalid_state")
         if any(type(v) not in (int, float) for v in row):
             raise ProbeError("invalid_state")
@@ -250,59 +251,154 @@ def _array(value: object, matrix: bool = False) -> Array:
     return result
 
 
+def _wide_mean(pair: Array) -> Decimal:
+    """Called inside a 96-digit context, never with platform-specific long double."""
+    return Decimal.from_float(float(pair[0])) + Decimal.from_float(float(pair[1]))
+
+
+def _mean_pair(value: Decimal) -> list[float]:
+    high = float(value)
+    low = float(value - Decimal.from_float(high))
+    # Rounding the residual can itself land on a midpoint. Normalize the encoded
+    # value, using exact arithmetic so even very small low limbs and ties survive.
+    encoded = Fraction.from_float(high) + Fraction.from_float(low)
+    high = float(encoded)
+    low = float(encoded - Fraction.from_float(high))
+    return [high, low]
+
+
+def _normalize_underflow(scatter: Array) -> Array:
+    # A squared deviation can underflow while its cross-product with an ordinary
+    # coordinate survives. Such a binary64 zero-variance coordinate is below the
+    # std boundary; encode its entire scatter row consistently as zero. No positive
+    # diagonal, however small, is truncated by this normalization.
+    zero = np.diag(scatter) == 0
+    scatter[zero, :] = 0
+    scatter[:, zero] = 0
+    return scatter
+
+
 @dataclass(frozen=True)
 class Cohort:
     count: int
-    total: Array
-    cross: Array
+    mean: Array
+    scatter: Array
 
     @classmethod
     def empty(cls) -> Cohort:
-        return cls(0, np.zeros(DIM), np.zeros((DIM, DIM)))
+        return cls(0, np.zeros((DIM, 2)), np.zeros((DIM, DIM)))
 
     @classmethod
     def from_rows(cls, rows: Array) -> Cohort:
-        return cls(len(rows), rows.sum(axis=0), rows.T @ rows)
+        if (
+            rows.ndim != 2
+            or rows.shape[1] != DIM
+            or rows.dtype.kind not in "fiu"
+            or not np.isfinite(rows).all()
+            or np.any(np.abs(rows) > MAX_FEATURE)
+        ):
+            raise ProbeError("encoder_failed")
+        if not len(rows):
+            return cls.empty()
+        rows = np.asarray(rows, dtype=np.float64)
+        anchor = rows[0]  # temporary batch RAM only; never part of the document
+        with localcontext() as context:
+            context.prec = 96
+            means = [
+                Decimal.from_float(float(column[0]))
+                if np.all(column == column[0])
+                else sum((Decimal.from_float(float(value)) for value in column), Decimal(0))
+                / len(rows)
+                for column in rows.T
+            ]
+            mean = np.array([_mean_pair(value) for value in means], dtype=np.float64)
+            shift = np.array(
+                [
+                    float(value - Decimal.from_float(float(a)))
+                    for value, a in zip(means, anchor, strict=True)
+                ],
+                dtype=np.float64,
+            )
+        centered = (rows - anchor) - shift
+        return cls(len(rows), mean, _normalize_underflow(centered.T @ centered))
 
     def validate(self) -> None:
         _integer(self.count)
         if (
-            self.total.shape != (DIM,)
-            or self.cross.shape != (DIM, DIM)
-            or not np.isfinite(self.total).all()
-            or not np.isfinite(self.cross).all()
-            or np.any(np.abs(self.total) > MAX_VALUE)
-            or np.any(np.abs(self.cross) > MAX_VALUE)
+            self.mean.shape != (DIM, 2)
+            or self.scatter.shape != (DIM, DIM)
+            or self.mean.dtype != np.float64
+            or self.scatter.dtype != np.float64
+            or not np.isfinite(self.mean).all()
+            or not np.isfinite(self.scatter).all()
+            or np.any(np.abs(self.mean) > MAX_FEATURE)
+            or np.any(np.abs(self.scatter) > MAX_VALUE)
         ):
             raise ProbeError("invalid_state")
         if self.count == 0:
-            if np.any(self.total) or np.any(self.cross):
+            if np.any(self.mean) or np.any(self.scatter):
                 raise ProbeError("invalid_state")
             return
         if self.count < 2:
             raise ProbeError("unsafe_increment")
-        diagonal = np.diag(self.cross)
-        tolerance = 1e-8 * max(1.0, float(np.max(np.abs(self.cross))))
-        if (
-            np.any(diagonal < 0)
-            or not np.allclose(self.cross, self.cross.T, atol=tolerance)
-            or np.any(self.total * self.total > self.count * diagonal + tolerance)
-        ):
+        for high, low in self.mean:
+            high_float, low_float = float(high), float(low)
+            reconstructed = Fraction.from_float(high_float) + Fraction.from_float(low_float)
+            if (
+                float(reconstructed) != high_float
+                or abs(Fraction.from_float(low_float))
+                > Fraction.from_float(math.ulp(high_float)) / 2
+                or abs(reconstructed) > MAX_FEATURE
+            ):
+                raise ProbeError("invalid_state")
+        diagonal = np.diag(self.scatter)
+        if np.any(diagonal < 0) or not np.array_equal(self.scatter, self.scatter.T):
             raise ProbeError("invalid_state")
-        bounds = np.sqrt(diagonal[:, None] * diagonal[None, :])
-        if np.any(np.abs(self.cross) > bounds + tolerance):
+        if np.any(self.scatter[diagonal == 0]):
             raise ProbeError("invalid_state")
         active = diagonal > 0
-        centered = self.cross[np.ix_(active, active)]
-        centered = centered - np.outer(self.total[active], self.total[active]) / self.count
-        if len(centered) and np.linalg.eigvalsh(centered).min() < -tolerance:
+        scale = np.sqrt(diagonal[active])
+        # Hostile finite entries can overflow normalization. Reject them below
+        # with the fixed typed failure rather than leaking a NumPy warning.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            normalized = self.scatter[np.ix_(active, active)] / scale[:, None] / scale[None, :]
+        # Dimensionless Cauchy/PSD validation: normalization avoids a magnitude
+        # floor hiding impossible tiny matrices. The n^2 factor bounds eigensolver
+        # roundoff for a correlation matrix whose spectral norm is at most n.
+        # This tolerance never selects features or modifies positive variances.
+        tolerance = 64 * np.finfo(np.float64).eps * max(1, len(scale)) ** 2
+        if not np.isfinite(normalized).all() or np.any(np.abs(normalized) > 1 + tolerance):
+            raise ProbeError("invalid_state")
+        if len(normalized) and np.linalg.eigvalsh(normalized).min() < -tolerance:
             raise ProbeError("invalid_state")
 
     def plus(self, other: Cohort) -> Cohort:
-        return Cohort(self.count + other.count, self.total + other.total, self.cross + other.cross)
+        if self.count == 0:
+            return other
+        if other.count == 0:
+            return self
+        count = self.count + other.count
+        with localcontext() as context:
+            context.prec = 96
+            means_a = [_wide_mean(pair) for pair in self.mean]
+            means_b = [_wide_mean(pair) for pair in other.mean]
+            delta = np.array([float(b - a) for a, b in zip(means_a, means_b, strict=True)])
+            mean = np.array(
+                [
+                    _mean_pair((a * self.count + b * other.count) / count)
+                    for a, b in zip(means_a, means_b, strict=True)
+                ],
+                dtype=np.float64,
+            )
+        scatter = (
+            self.scatter
+            + other.scatter
+            + np.outer(delta, delta) * (self.count * (other.count / count))
+        )
+        return Cohort(count, mean, _normalize_underflow(scatter))
 
     def document(self) -> dict[str, object]:
-        return {"count": self.count, "sum": self.total.tolist(), "cross": self.cross.tolist()}
+        return {"count": self.count, "mean": self.mean.tolist(), "scatter": self.scatter.tolist()}
 
 
 @dataclass(frozen=True)
@@ -334,7 +430,7 @@ class State:
     def document(self) -> dict[str, object]:
         self.validate()
         return {
-            "version": 1,
+            "version": 2,
             "run_id": self.run_id,
             "source": self.source,
             "encoder": self.encoder,
@@ -350,7 +446,7 @@ def parse_state(raw: bytes) -> State:
             _decode(raw, MAX_STATE_BYTES),
             {"version", "run_id", "source", "encoder", "accepted_sessions", "cohorts"},
         )
-        if _integer(value["version"], 1) != 1:
+        if _integer(value["version"], 2) != 2:
             raise ProbeError("invalid_state")
         source, encoder = value["source"], value["encoder"]
         if not isinstance(source, str) or not isinstance(encoder, str):
@@ -358,9 +454,9 @@ def parse_state(raw: bytes) -> State:
         groups = _object(value["cohorts"], set("ynu"))
         cohorts = {}
         for name in "ynu":
-            group = _object(groups[name], {"count", "sum", "cross"})
+            group = _object(groups[name], {"count", "mean", "scatter"})
             cohorts[name] = Cohort(
-                _integer(group["count"]), _array(group["sum"]), _array(group["cross"], True)
+                _integer(group["count"]), _array(group["mean"], 2), _array(group["scatter"])
             )
         state = State(
             _uuid(value["run_id"]),
@@ -377,24 +473,27 @@ def parse_state(raw: bytes) -> State:
         raise ProbeError("invalid_state") from None
 
 
-def _head(group: Cohort, target_count: int, target_total: Array, current: Array) -> list[Array]:
-    mean_y = target_count / group.count
-    if target_count in (0, group.count):
+def _head(positive: Cohort, negative: Cohort, current: Array) -> list[Array]:
+    group = positive.plus(negative)
+    mean_y = positive.count / group.count
+    if not positive.count or not negative.count:
         return [np.full(len(current), mean_y) for _ in LAMBDAS]
-    mean = group.total / group.count
-    diagonal = np.diag(group.cross)
-    mean_cross = group.total * mean
-    centered_diagonal = np.maximum(diagonal - mean_cross, 0)
-    # Constant nonzero columns can leave positive cancellation residue. Bound
-    # raw-moment accumulation/subtraction error by count and each column's scale,
-    # preserving genuinely small varying columns and the original std > 1e-10.
-    roundoff = np.finfo(np.float64).eps * (group.count + 2) * (diagonal + mean_cross)
-    active = (centered_diagonal > group.count * 1e-20) & (centered_diagonal > roundoff)
-    scale = np.sqrt(centered_diagonal[active] / group.count)
-    centered = group.cross[np.ix_(active, active)] - np.outer(group.total[active], mean[active])
-    standardized = centered / scale[:, None] / scale[None, :]
-    xy = (target_total[active] - group.total[active] * mean_y) / scale
-    query = (current[:, active] - mean[active]) / scale
+    # Binary64 population std, then the original strict scalar comparison.
+    deviation = np.sqrt(np.diag(group.scatter) / group.count)
+    active = deviation > 1e-10
+    scale = deviation[active]
+    standardized = group.scatter[np.ix_(active, active)] / scale[:, None] / scale[None, :]
+    with localcontext() as context:
+        context.prec = 96
+        delta = np.array(
+            [
+                float(_wide_mean(a) - _wide_mean(b))
+                for a, b in zip(positive.mean[active], negative.mean[active], strict=True)
+            ],
+            dtype=np.float64,
+        )
+    xy = (positive.count * (negative.count / group.count)) * delta / scale
+    query = ((current[:, active] - group.mean[active, 0]) - group.mean[active, 1]) / scale
     identity = np.eye(len(scale))
     return [
         np.round(
@@ -413,9 +512,8 @@ def score_features(state: State, features: Array) -> list[Score]:
         return [None for _ in features]
     y, n, u = (state.cohorts[name] for name in "ynu")
     judgeable = y.plus(n)
-    all_kept = judgeable.plus(u)
-    judges = _head(all_kept, judgeable.count, judgeable.total, features)
-    coats = _head(judgeable, y.count, y.total, features)
+    judges = _head(judgeable, u, features)
+    coats = _head(y, n, features)
     return [
         [[float(j[i]), float(c[i])] for j, c in zip(judges, coats, strict=True)]
         for i in range(len(features))
@@ -430,7 +528,7 @@ def validate_label_metadata(record: Mapping[str, object]) -> dict[str, object] |
         return None
     try:
         run = _object(record["probe_run"], {"version", "run_id", "session", "state", "reason"})
-        if _integer(run["version"], 1) != 1:
+        if _integer(run["version"], 2) not in (1, 2):
             raise ProbeError("invalid_history")
         identity = run["run_id"]
         if identity is not None:
@@ -499,7 +597,8 @@ def _control(raw: bytes) -> dict[str, object]:
         _decode(raw, MAX_CONTROL_BYTES),
         {"version", "run_id", "source", "encoder", "state", "accepted_sessions", "reason"},
     )
-    if _integer(value["version"], 1) != 1:
+    # Legacy control may identify a stopped source, but is never admitted below.
+    if _integer(value["version"], 2) not in (1, 2):
         raise ProbeError("invalid_state")
     _uuid(value["run_id"])
     _integer(value["accepted_sessions"], 12)
@@ -721,7 +820,7 @@ class ProbePass:
     def metadata(self) -> dict[str, object]:
         incomplete = self.armed or self.arm_failed
         return {
-            "version": 1,
+            "version": 2,
             "run_id": self.run_id,
             "session": self.session if incomplete else None,
             "state": "incomplete" if incomplete else "stopped",
@@ -730,7 +829,7 @@ class ProbePass:
 
     def _control_document(self, state: str, count: int) -> dict[str, object]:
         return {
-            "version": 1,
+            "version": 2,
             "run_id": self.run_id,
             "source": self.source,
             "encoder": ENCODER,
@@ -767,6 +866,8 @@ class ProbePass:
             run = validate_label_metadata(record)
             if run is None:
                 continue
+            if run["version"] != 2:
+                raise ProbeError("invalid_history")
             if run["run_id"] is None or state is None or run["run_id"] != state.run_id:
                 raise ProbeError("source_incomplete")
             if run["state"] != "accepted":
@@ -822,6 +923,8 @@ class ProbePass:
         if self.control_path.exists():
             control = _control(_read(self.control_path, MAX_CONTROL_BYTES))
             self.run_id = _uuid(control["run_id"])
+            if control["version"] != 2:
+                raise ProbeError("invalid_state")
             if control["source"] != self.source or control["encoder"] != ENCODER:
                 raise ProbeError("encoder_mismatch")
             if control["state"] in ("pending", "incomplete"):
@@ -986,7 +1089,7 @@ class ProbePass:
             final: dict[str, object] = {
                 **record,
                 "probe_run": {
-                    "version": 1,
+                    "version": 2,
                     "run_id": self.run_id,
                     "session": self.session,
                     "state": "accepted",

@@ -607,32 +607,55 @@ kept. All features are discarded when the pass ends.
 
 Only earlier accepted sessions of the same source train the two ridge heads: judgeable
 (outer `y`/`n` versus `u`, over all kept crops) and coat (outer `y` versus `n`, over
-judgeable crops). Features are standardized using prior moments and the intercept is
-unpenalized. The fixed lambdas are `[1,10,100,1000]`. An accepted label adds:
+judgeable crops). Features are standardized using the prior population standard
+deviation represented as a binary64 scalar; only columns with standard deviation
+strictly greater than `1e-10` participate. The intercept is unpenalized. The fixed
+lambdas are `[1,10,100,1000]`. An accepted label adds:
 
 - `probe`: `encoder` (`siglip2-base-patch16-224-int8@0dd31785a271`), `lambdas`,
   `trained_sessions` (session minus one), and `scores` aligned with the unchanged sorted
   three-column crop rows. Each score is null in session 1, then four
   `[judgeable,coat]` pairs clipped to `[0,1]` and rounded to three decimals.
-- `probe_run`: `version:1`, `run_id` (UUID), `session`, `state` and `reason`. Acceptance
+- `probe_run`: `version:2`, `run_id` (UUID), `session`, `state` and `reason`. Acceptance
   uses `state:"accepted"` and `reason:null`. Failed or stopped human-only labels omit
   `probe`; stopped passes use `session:null`. Unrecoverable identities use both
   `run_id:null` and `session:null`. Reasons are fixed codes, never exception text.
 
-`DIR/<source>.json` stores version 1, UUID, source, encoder, accepted-session count and
-three cumulative cohorts `y`, `n`, `u`. Each cohort contains only `count`, `sum` (768
-numbers) and `cross` (768 by 768 numbers). Counts encode the target sums: `N=y+n+u`,
-`J=y+n`, `Y=y`; feature-target sums are the corresponding cohort sums. Counts are bounded
-by 1,000,000,000, numeric moments by absolute 1e21, and the JSON body by 64 MiB. No entry
-is retained per crop or per session; there is no feature delta, debug output, checkpoint
-or feature backup. Prior state, current increment and complete candidate must each have
-`N>=2`, `J>=2`, and every nonempty U/Y/C cohort at least two crops. Zero cohorts require
-zero sums and cross-products. The fresh empty baseline exists in memory before the first
-admissible increment. These checks do not establish mathematical irreversibility or
-anonymity.
+`DIR/<source>.json` stores version 2, UUID, source, encoder, accepted-session count and
+three cumulative cohorts `y`, `n`, `u`. Each cohort contains exactly `count`, `mean`
+(768 pairs of binary64 high/low precision limbs describing one centroid), and `scatter`
+(768 by 768 binary64 centered sum-of-products). Pairs are normalized and nonoverlapping:
+the high limb is the nearest binary64 to the reconstructed centroid coordinate and the
+low limb its binary64 residual, bounded by half the high limb's ulp. Counts encode the
+targets: `N=y+n+u`, `J=y+n`, `Y=y`. Counts are bounded by 1,000,000,000, reconstructed
+centroid coordinates by absolute 1e6, scatter entries by absolute 1e21, and JSON by
+64 MiB. Prior state, current increment and complete candidate must each have `N>=2`,
+`J>=2`, and every nonempty U/Y/C cohort at least two crops. Zero cohorts require zero
+in both mean limbs and every scatter entry. The fresh empty baseline exists in memory
+before the first admissible increment.
+
+Batch centroids use exact binary64 inputs and portable 96-digit Decimal arithmetic,
+with a temporary in-memory anchor for centered deviations. Chan merges reconstruct
+both mean limbs at that precision and combine centered scatter. Target covariance
+comes from the positive/negative centroid difference. Queries are centered against
+both limbs; constants have zero slope. The scatter parser requires exact symmetry,
+nonnegative diagonals, and zero rows for zero diagonals. Cauchy and PSD checks use a
+dimensionless correlation matrix with numerical tolerance `64 * 2^-52 * m^2`, where
+`m` is the number of positive diagonal coordinates (at most 768). That tolerance is
+only for matrix validation and never selects features. If a computed squared deviation
+underflows to an exactly zero binary64 diagonal, its scatter row/column is normalized
+to zero; no positive diagonal is truncated. The strict standard-deviation threshold
+is unchanged, including wider scales that round to exactly binary64 `1e-10`.
+
+The second centroid limbs add 2304 retained binary64 values over single-limb means.
+They retain more numerical information and are precision limbs of cohort statistics;
+they are not individual features, extra cohort statistics or a guarantee of anonymity
+or irreversibility. No entry is retained per crop or per session. There are no feature
+deltas, feature caches, auxiliary feature files, checkpoints, historical snapshots or
+feature backups. The cohort minimums apply before any aggregate serialization.
 
 Metadata-only run control lives outside the aggregate directory at
-`<OutDir>/probe-runs/<source>.json`: version, UUID, source, encoder, state
+`<OutDir>/probe-runs/<source>.json`: version 2, UUID, source, encoder, state
 (`active`, `pending`, `incomplete`, `sealed`), accepted count and fixed reason/null.
 A stable metadata-only lock file lives at
 `<canonical-DIR.parent>/<canonical-DIR.name>.locks/<source>.json`, containing only
@@ -644,10 +667,15 @@ JSON and read buffer, without writing or extending the file, so metadata remains
 Crash release leaves pending/incomplete records stopped. Contention does no model or
 aggregate/control work and records `source_busy` in human-only labels.
 
-Admission checks the complete contiguous accepted label history `1..K`, identities,
-encoder and counts. Missing, duplicate, mismatching or incomplete trial history stops
-the source. Unknown-identity stop labels also stop it. Unsafe or unverifiable input stays
-untouched, with no automatic reset, selected-subset continuation or reconciliation.
+Admission requires version-2 aggregate/control and complete contiguous version-2
+accepted label history `1..K`, matching identities, encoder and counts. Legacy version-1
+aggregate, control or probe-bearing labels, mixed/unknown versions, and missing,
+duplicate, mismatching or incomplete trial history stop model work before features.
+Human labelling continues with bounded stopped metadata and a fixed diagnostic.
+Unknown-identity stop labels also stop it. Existing aggregate/control bytes stay
+untouched; there is no migration of lossy legacy moments, automatic reset, renumbering,
+selected-subset continuation or reconciliation. Legacy scores are not corrected or
+admitted to a version-2 analysis.
 
 The successful commit order is: durable pending control at K before feature work;
 after answers, durable human label without `probe`, marked incomplete with
@@ -670,8 +698,9 @@ Failed or uncertain runs remain ineligible, with no reset or automatic recovery.
 Each source seals at exactly 12 accepted sessions. Later flagged human-only labels use
 `collection_complete`, validated UUID and null session only after verifying the complete
 accepted trial; they do no encoder work or aggregate/control updates. A stopped trial has
-no such exception. The ordinary summary validates optional metadata but uses only its
-existing human-label calculations. Complete label history, including failures, is the
+no such exception. The ordinary summary accepts structurally valid optional version-1
+or version-2 metadata and uses only its existing human-label calculations, ignoring
+probe scores. Complete label history, including failures, is the
 commit authority; aggregate/control uploads are unnecessary. Sealing does not establish
 analysis or model success. This tool adds no evaluation algorithm or production estimate.
 

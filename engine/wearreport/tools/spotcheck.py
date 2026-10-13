@@ -3030,6 +3030,22 @@ def _print_numbering(workdir: Path, items: Sequence[ReviewItem]) -> None:
     print(f"The numbering and a judgements template are in {NUMBERING_FILE} there.", flush=True)
 
 
+@contextlib.contextmanager
+def _active_window_guard(
+    reviewer: Reviewer | AttributeReviewer, guard: _SignalGuard
+) -> Iterator[None]:
+    """Bind an injected window's teardown to this collection, then restore it."""
+    if not isinstance(reviewer, WindowReviewer) or reviewer.guard is not None:
+        yield
+        return
+    previous = reviewer.guard
+    try:
+        reviewer.guard = guard
+        yield
+    finally:
+        reviewer.guard = previous
+
+
 def _collect(
     items: Sequence[ReviewItem],
     mode: Mode,
@@ -3041,7 +3057,8 @@ def _collect(
     deadline = time.monotonic() + timeout_s
     guard.alarm(timeout_s)
     try:
-        judgements = reviewer.judge(items, mode, deadline)
+        with _active_window_guard(reviewer, guard):
+            judgements = reviewer.judge(items, mode, deadline)
     finally:
         guard.alarm(0)
     try:
@@ -3060,7 +3077,8 @@ def _collect_attributes(
     deadline = time.monotonic() + timeout_s
     guard.alarm(timeout_s)
     try:
-        answers = reviewer.attributes(items, deadline)
+        with _active_window_guard(reviewer, guard):
+            answers = reviewer.attributes(items, deadline)
     finally:
         guard.alarm(0)
     try:
