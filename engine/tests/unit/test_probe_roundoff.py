@@ -1,4 +1,4 @@
-"""Exact-input primal regressions for cumulative v2 scores and history provenance.
+"""Exact-input primal regressions for cumulative v3 scores and history provenance.
 
 All vectors and frames are generated. The reference centers direct rows with exact
 fractions and solves its own Decimal primal system; it uses no scorer helpers.
@@ -383,7 +383,7 @@ def test_twelve_accepted_roundtrips_keep_all_prior_rows_constants_and_tiny_colum
     for session in range(1, 13):
         assert _invoke(out, directory, labels) == 0
         record = _records(out)[-1]
-        assert record["probe_run"]["version"] == 2
+        assert record["probe_run"]["version"] == 3
         assert record["probe_run"]["state"] == "accepted"
         assert record["probe_run"]["session"] == session
         if session == 1:
@@ -398,7 +398,7 @@ def test_twelve_accepted_roundtrips_keep_all_prior_rows_constants_and_tiny_colum
         assert state.counts() == (session * 12, session * 8, session * 4)
         for cohort in state.cohorts.values():
             group = cohort.document()
-            assert set(group) == {"count", "mean", "scatter"}
+            assert set(group) == {"count", "mean", "scatter", "diagonal"}
             assert np.array(group["scatter"])[0, 0] == np.array(group["scatter"])[1, 1] == 0
     frozen = {
         path: path.read_bytes()
@@ -411,33 +411,77 @@ def test_twelve_accepted_roundtrips_keep_all_prior_rows_constants_and_tiny_colum
     assert all(path.read_bytes() == raw for path, raw in frozen.items())
 
 
-def _v2_document() -> dict[str, Any]:
+def _scatter_units(rows: Array, physical: Array | None = None, *, inverse: bool = False) -> Array:
+    """Independent direct-row dyadic fixture conversion, never a score oracle."""
+    from fractions import Fraction
+
+    exact = [[Fraction.from_float(float(value)) for value in row] for row in rows]
+    columns = list(zip(*exact, strict=True))
+    mean = [sum(column, Fraction(0)) / len(rows) for column in columns]
+    variance = [
+        sum(((value - center) ** 2 for value in column), Fraction(0)) / len(rows)
+        for column, center in zip(columns, mean, strict=True)
+    ]
+    exponents = []
+    for value in variance:
+        if value == 0:
+            exponents.append(0)
+            continue
+        power = value.numerator.bit_length() - value.denominator.bit_length()
+        boundary = Fraction(2**power) if power >= 0 else Fraction(1, 2**-power)
+        if value < boundary:
+            power -= 1
+        exponents.append(power // 2)
+    shifts = np.array(exponents, dtype=np.int32)
+    if physical is not None:
+        direction = 1 if inverse else -1
+        converted: Array = np.ldexp(physical, direction * (shifts[:, None] + shifts[None, :]))
+        return converted
+    units = [Fraction(2**-power) if power <= 0 else Fraction(1, 2**power) for power in exponents]
+    centered: Array = np.array(
+        [
+            [
+                float((value - center) * unit)
+                for value, center, unit in zip(row, mean, units, strict=True)
+            ]
+            for row in exact
+        ]
+    )
+    scatter: Array = centered.T @ centered
+    for coordinate, (value, unit) in enumerate(zip(variance, units, strict=True)):
+        scatter[coordinate, coordinate] = float(len(rows) * value * unit * unit)
+    return scatter
+
+
+def _valid_document(y_rows: Array | None = None) -> dict[str, Any]:
     rows = np.zeros((6, DIM))
     rows[:, :2] = [[0.3, 0.6], [0.4, 0.8], [0.5, 1.0], [0.6, 1.2], [0.7, 1.4], [0.8, 1.6]]
-    with localcontext() as context:
-        context.prec = 96
-        groups = {}
-        for index, name in enumerate("ynu"):
-            selected = rows[index * 2 : index * 2 + 2]
-            mean = [
-                (Decimal.from_float(float(a)) + Decimal.from_float(float(b))) / 2
-                for a, b in zip(*selected, strict=True)
-            ]
-            limbs = [
-                [float(value), float(value - Decimal.from_float(float(value)))] for value in mean
-            ]
-            centered = np.array(
-                [
-                    [
-                        float(Decimal.from_float(float(value)) - center)
-                        for value, center in zip(row, mean, strict=True)
-                    ]
-                    for row in selected
-                ]
-            )
-            groups[name] = {"count": 2, "mean": limbs, "scatter": (centered.T @ centered).tolist()}
+    groups = {}
+    for index, name in enumerate("ynu"):
+        selected = y_rows if name == "y" and y_rows is not None else rows[index * 2 : index * 2 + 2]
+        exact = [[Fraction.from_float(float(value)) for value in row] for row in selected]
+        columns = list(zip(*exact, strict=True))
+        mean = [sum(column, Fraction(0)) / len(selected) for column in columns]
+        limbs = []
+        diagonal = []
+        for column, center in zip(columns, mean, strict=True):
+            high = float(center)
+            low = float(center - Fraction.from_float(high))
+            encoded = Fraction.from_float(high) + Fraction.from_float(low)
+            high = float(encoded)
+            low = float(encoded - Fraction.from_float(high))
+            limbs.append([0.0 if high == 0 else high, 0.0 if low == 0 else low])
+            scaled = [int(value * (1 << 1074)) for value in column]
+            diagonal.append([str(sum(scaled)), str(sum(value * value for value in scaled))])
+        scatter = _scatter_units(selected)
+        groups[name] = {
+            "count": len(selected),
+            "mean": limbs,
+            "scatter": scatter.tolist(),
+            "diagonal": diagonal,
+        }
     return {
-        "version": 2,
+        "version": 3,
         "run_id": str(uuid.uuid4()),
         "source": "london",
         "encoder": probe.ENCODER,
@@ -468,9 +512,11 @@ def _v2_document() -> dict[str, Any]:
         "unknown-version",
     ],
 )
-def test_v2_precision_and_centered_scatter_validation(fault: str) -> None:
-    value = _v2_document()
-    # Admission must succeed first; rejecting every v2 document is not a parser pass.
+def test_v3_precision_and_centered_scatter_validation(fault: str) -> None:
+    rows = np.zeros((2, DIM))
+    rows[:, :2] = [[0.3, 0.6], [0.4, 0.8]]
+    value = _valid_document(rows)
+    # Admission must succeed first; rejecting every v3 document is not a parser pass.
     assert probe.parse_state(json.dumps(value).encode()).document() == value
     bad = copy.deepcopy(value)
     group = bad["cohorts"]["y"]
@@ -480,6 +526,11 @@ def test_v2_precision_and_centered_scatter_validation(fault: str) -> None:
         group["mean"][0][1] = math.ulp(group["mean"][0][0])
     elif fault == "tie-high":
         high = math.nextafter(1.0, math.inf)
+        rows = np.zeros((2, DIM))
+        rows[:, 0] = [high, math.nextafter(high, math.inf)]
+        group = _valid_document(rows)["cohorts"]["y"]
+        bad["cohorts"]["y"] = group
+        assert probe.parse_state(json.dumps(bad).encode()).document() == bad
         group["mean"][0] = [high, math.ulp(high) / 2]
     elif fault == "shape":
         group["mean"][0] = [0.3]
@@ -490,16 +541,29 @@ def test_v2_precision_and_centered_scatter_validation(fault: str) -> None:
     elif fault == "boolean-scatter":
         group["scatter"][0][0] = True
     elif fault == "negative-diagonal":
-        group["scatter"][0][0] = -1e-30
+        group["scatter"][0][0] = float(_scatter_units(rows, np.full((DIM, DIM), -1e-30))[0, 0])
     elif fault == "asymmetric":
-        group["scatter"][0][1] = 0.1
+        group["scatter"][0][1] = float(_scatter_units(rows, np.full((DIM, DIM), 0.1))[0, 1])
     elif fault == "cauchy":
-        group["scatter"][0][1] = group["scatter"][1][0] = 1.0
+        group["scatter"][0][1] = group["scatter"][1][0] = float(
+            _scatter_units(rows, np.ones((DIM, DIM)))[0, 1]
+        )
     elif fault == "indefinite":
+        rows = np.zeros((4, DIM))
+        rows[:, :3] = [[0.5] * 3, [0.5] * 3, [-0.5] * 3, [-0.5] * 3]
+        group = _valid_document(rows)["cohorts"]["y"]
+        bad["cohorts"]["y"] = group
+        assert probe.parse_state(json.dumps(bad).encode()).document() == bad
         for i in range(3):
             for j in range(3):
                 group["scatter"][i][j] = 1.0 if i == j else -0.75
+        group["scatter"] = _scatter_units(rows, np.array(group["scatter"])).tolist()
     elif fault.startswith("tiny-"):
+        rows = np.zeros((4, DIM))
+        rows[:, :3] = [[5e-10] * 3, [5e-10] * 3, [-5e-10] * 3, [-5e-10] * 3]
+        group = _valid_document(rows)["cohorts"]["y"]
+        bad["cohorts"]["y"] = group
+        assert probe.parse_state(json.dumps(bad).encode()).document() == bad
         group["scatter"] = np.zeros((DIM, DIM)).tolist()
         for i in range(3):
             group["scatter"][i][i] = 1e-18
@@ -511,12 +575,13 @@ def test_v2_precision_and_centered_scatter_validation(fault: str) -> None:
             for i in range(3):
                 for j in range(i):
                     group["scatter"][i][j] = group["scatter"][j][i] = -7.5e-19
+        group["scatter"] = _scatter_units(rows, np.array(group["scatter"])).tolist()
     elif fault == "zero-cohort":
         group["count"] = 0
     elif fault == "singleton":
         group["count"] = 1
     else:
-        bad["version"] = 3
+        bad["version"] = 4
     raw = json.dumps(bad).encode()
     with pytest.raises(probe.ProbeError) as raised:
         probe.parse_state(raw)
@@ -526,14 +591,16 @@ def test_v2_precision_and_centered_scatter_validation(fault: str) -> None:
 
 @pytest.mark.parametrize("sign", [-1, 1])
 def test_normalized_even_high_half_ulp_ties_are_accepted(sign: int) -> None:
-    value = _v2_document()
     high = sign * 1.0
-    value["cohorts"]["y"]["mean"][0] = [high, sign * math.ulp(high) / 2]
+    rows = np.zeros((2, DIM))
+    rows[:, 0] = [high, math.nextafter(high, sign * math.inf)]
+    value = _valid_document(rows)
+    assert value["cohorts"]["y"]["mean"][0] == [high, sign * math.ulp(high) / 2]
     assert probe.parse_state(json.dumps(value).encode()).document() == value
 
 
-@pytest.mark.parametrize("version", [1, 2])
-def test_generic_human_summary_accepts_both_versions_and_ignores_scores(
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_generic_human_summary_accepts_all_three_versions_and_ignores_scores(
     version: int, human_env: None, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     labels = ["y", "y", "n", "n", "u", "u"]
@@ -576,6 +643,11 @@ def test_generic_human_summary_accepts_both_versions_and_ignores_scores(
         "legacy-history",
         "mixed-history",
         "unknown-history",
+        "v2-all",
+        "v2-control",
+        "v2-aggregate",
+        "v2-history",
+        "v2-mixed-history",
     ],
 )
 def test_legacy_or_mixed_provenance_stops_before_features_and_preserves_bytes(
@@ -602,15 +674,29 @@ def test_legacy_or_mixed_provenance_stops_before_features_and_preserves_bytes(
         "legacy-history": history,
         "mixed-history": history[:1],
         "unknown-history": history[:1],
+        "v2-all": [aggregate, control, *history],
+        "v2-control": [control],
+        "v2-aggregate": [aggregate],
+        "v2-history": history,
+        "v2-mixed-history": history[:1],
     }[fault]
     for path in selected:
         value = json.loads(path.read_bytes())
         if path in history:
-            value["probe_run"]["version"] = 3 if fault == "unknown-history" else 1
+            value["probe_run"]["version"] = (
+                4 if fault == "unknown-history" else 2 if fault.startswith("v2-") else 1
+            )
         else:
-            value["version"] = 1
-            if path == aggregate and "mean" in value["cohorts"]["y"]:
-                # Real legacy shape, not simply a v2 shape bearing a v1 marker.
+            value["version"] = 2 if fault.startswith("v2-") else 1
+            if path == aggregate:
+                # Genuine old shape: v2 keeps mean/scatter, v1 uses sum/cross.
+                for name, group in value["cohorts"].items():
+                    prior = np.tile(rows[np.array([label == name for label in labels])], (2, 1))
+                    group["scatter"] = _scatter_units(
+                        prior, np.array(group["scatter"]), inverse=True
+                    ).tolist()
+                    del group["diagonal"]
+            if path == aggregate and value["version"] == 1:
                 for group in value["cohorts"].values():
                     mean = np.array(group.pop("mean"))
                     center = mean[:, 0] + mean[:, 1]
@@ -627,7 +713,7 @@ def test_legacy_or_mixed_provenance_stops_before_features_and_preserves_bytes(
     failed = _records(out)[-1]
     assert failed["crops"] == _records(out)[0]["crops"]
     assert "probe" not in failed
-    assert failed["probe_run"]["version"] == 2
+    assert failed["probe_run"]["version"] == 3
     assert failed["probe_run"]["state"] == "stopped"
     assert failed["probe_run"]["session"] is None
     lines = [line for line in capsys.readouterr().err.splitlines() if "probe" in line.lower()]

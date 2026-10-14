@@ -229,9 +229,53 @@ def _oracle(previous: Vector, answers: Sequence[str], current: Vector) -> list[l
     return output
 
 
+def _scatter_units(
+    rows: Vector, physical: Vector | None = None, *, inverse: bool = False
+) -> Vector:
+    """Independent direct-row dyadic fixture conversion, never a score oracle."""
+    from fractions import Fraction
+
+    exact = [[Fraction.from_float(float(value)) for value in row] for row in rows]
+    columns = list(zip(*exact, strict=True))
+    mean = [sum(column, Fraction(0)) / len(rows) for column in columns]
+    variance = [
+        sum(((value - center) ** 2 for value in column), Fraction(0)) / len(rows)
+        for column, center in zip(columns, mean, strict=True)
+    ]
+    exponents = []
+    for value in variance:
+        if value == 0:
+            exponents.append(0)
+            continue
+        power = value.numerator.bit_length() - value.denominator.bit_length()
+        boundary = Fraction(2**power) if power >= 0 else Fraction(1, 2**-power)
+        if value < boundary:
+            power -= 1
+        exponents.append(power // 2)
+    shifts = np.array(exponents, dtype=np.int32)
+    if physical is not None:
+        direction = 1 if inverse else -1
+        converted: Vector = np.ldexp(physical, direction * (shifts[:, None] + shifts[None, :]))
+        return converted
+    units = [Fraction(2**-power) if power <= 0 else Fraction(1, 2**power) for power in exponents]
+    centered: Vector = np.array(
+        [
+            [
+                float((value - center) * unit)
+                for value, center, unit in zip(row, mean, units, strict=True)
+            ]
+            for row in exact
+        ]
+    )
+    scatter: Vector = centered.T @ centered
+    for coordinate, (value, unit) in enumerate(zip(variance, units, strict=True)):
+        scatter[coordinate, coordinate] = float(len(rows) * value * unit * unit)
+    return scatter
+
+
 def _assert_metadata(record: Mapping[str, Any], session: int, run_id: str) -> None:
     assert record["probe_run"] == {
-        "version": 2,
+        "version": 3,
         "run_id": run_id,
         "session": session,
         "state": "accepted",
@@ -279,6 +323,8 @@ def test_ac1_flag_is_attribute_only(env: NumericEncoder, tmp_path: Path) -> None
 def test_ac2_ac3_prior_only_numpy_oracle_every_crop_and_sorted_scores(
     env: NumericEncoder, tmp_path: Path
 ) -> None:
+    from fractions import Fraction
+
     out, directory = tmp_path / "out", tmp_path / "stats"
     previous: list[Vector] = []
     labels: list[str] = []
@@ -303,17 +349,28 @@ def test_ac2_ac3_prior_only_numpy_oracle_every_crop_and_sorted_scores(
         previous.extend(current)
         labels.extend(a for a in answers if a is not None)
         stored = _json(_state(directory))
-        assert stored["version"] == 2 and stored["accepted_sessions"] == session
+        assert stored["version"] == 3 and stored["accepted_sessions"] == session
         for cohort in "ynu":
             group = stored["cohorts"][cohort]
             selected = np.array(
                 [x for x, a in zip(previous, labels, strict=True) if a[0] == cohort]
             )
             assert group["count"] == len(selected)
+            scaled = [
+                [int(Fraction.from_float(float(value)) * (1 << 1074)) for value in row]
+                for row in selected
+            ]
+            assert group["diagonal"] == [
+                [str(sum(column)), str(sum(value * value for value in column))]
+                for column in zip(*scaled, strict=True)
+            ]
             mean = np.array(group["mean"])
             assert np.allclose(mean[:, 0] + mean[:, 1], selected.mean(axis=0))
             centered = selected - selected.mean(axis=0)
-            assert np.allclose(group["scatter"], centered.T @ centered)
+            assert np.allclose(
+                _scatter_units(selected, np.array(group["scatter"]), inverse=True),
+                centered.T @ centered,
+            )
 
 
 def test_ac2_source_histories_are_separate(env: NumericEncoder, tmp_path: Path) -> None:
@@ -380,14 +437,16 @@ def test_ac4_only_cumulative_stats_labels_control_and_stable_lock_persist(
                     "accepted_sessions",
                     "cohorts",
                 }
-                assert value["version"] == 2
+                assert value["version"] == 3
                 assert set(value["cohorts"]) == set("ynu")
                 for group in value["cohorts"].values():
-                    assert set(group) == {"count", "mean", "scatter"}
+                    assert set(group) == {"count", "mean", "scatter", "diagonal"}
                     assert np.array(group["mean"]).shape == (DIM, 2)
                     assert np.array(group["scatter"]).shape == (DIM, DIM)
+                    assert np.array(group["diagonal"]).shape == (DIM, 2)
+                    assert all(type(value) is str for pair in group["diagonal"] for value in pair)
             elif path == _control(out):
-                assert value["version"] == 2
+                assert value["version"] == 3
                 assert set(value) == {
                     "version",
                     "run_id",
@@ -447,6 +506,7 @@ def test_ac4_zero_cohorts_are_safe_and_have_zero_statistics(
     for name in "nu":
         group = stored["cohorts"][name]
         assert group["count"] == 0 and not np.any(group["mean"]) and not np.any(group["scatter"])
+        assert group["diagonal"] == [["0", "0"]] * DIM
     assert _invoke(out, directory, answers=["nnu"] * 6 + [None]) == 0
     assert all(pair == [1.0, 1.0] for row in _last(out)["probe"]["scores"] for pair in row)
 
@@ -684,7 +744,7 @@ def test_ac6_seal_twelve_accepts_no_more_work_and_verifies_complete_history(
     for _ in range(2):
         assert _invoke(out, directory) == 0
         assert _last(out)["probe_run"] == {
-            "version": 2,
+            "version": 3,
             "run_id": control["run_id"],
             "session": None,
             "state": "stopped",
@@ -791,7 +851,11 @@ def test_ac6_unsafe_state_is_untouched_and_disables_feature_work(
     elif fault == "zero":
         group["count"] = 0
     elif fault == "count":
-        value["cohorts"]["y"]["count"] += 2
+        judge = value["cohorts"]["y"]
+        judge["count"] += 2  # duplicate both y rows; only history counts are now wrong
+        judge["diagonal"] = [[str(2 * int(s)), str(2 * int(q))] for s, q in judge["diagonal"]]
+        judge["scatter"] = (2 * np.array(judge["scatter"])).tolist()
+        assert probe.parse_state(json.dumps(value).encode()).document() == value
     else:
         group["scatter"][0] = [0.0]
     _state(directory).write_text(json.dumps(value), encoding="utf-8")
