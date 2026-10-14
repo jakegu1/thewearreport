@@ -13,11 +13,11 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
 from fractions import Fraction
 from pathlib import Path
 from typing import Protocol, TextIO, cast
@@ -51,6 +51,10 @@ MAX_CONTROL_BYTES = 1024
 MAX_COUNT = 10**9
 MAX_VALUE = 1e21
 MAX_FEATURE = 1e6
+UNIT_POWER = 1074
+UNIT = 1 << UNIT_POWER
+MAX_UNITS = 1_000_000 * UNIT
+Moments = tuple[tuple[int, int], ...]
 SOURCES = frozenset({"london", "calgary", "austin"})
 REASONS = frozenset(
     {
@@ -251,31 +255,140 @@ def _array(value: object, width: int = DIM) -> Array:
     return result
 
 
-def _wide_mean(pair: Array) -> Decimal:
-    """Called inside a 96-digit context, never with platform-specific long double."""
-    return Decimal.from_float(float(pair[0])) + Decimal.from_float(float(pair[1]))
+def _units(value: float) -> int:
+    """Exact binary64 units of 2^-1074; no floating multiplication."""
+    numerator, denominator = value.as_integer_ratio()
+    return numerator << (UNIT_POWER - (denominator.bit_length() - 1))
 
 
-def _mean_pair(value: Decimal) -> list[float]:
+def _rounded_scaled(numerator: int, denominator: int, exponent: int) -> float:
+    """Round the exact rational times 2^-exponent once, without a float power."""
+    if exponent < 0:
+        numerator <<= -exponent
+    else:
+        denominator <<= exponent
+    return float(Fraction(numerator, denominator))
+
+
+def _mean_pair(summed: int, count: int) -> list[float]:
+    value = Fraction(summed, count * UNIT) if count else Fraction(0)
     high = float(value)
-    low = float(value - Decimal.from_float(high))
+    low = float(value - Fraction(high))
     # Rounding the residual can itself land on a midpoint. Normalize the encoded
     # value, using exact arithmetic so even very small low limbs and ties survive.
-    encoded = Fraction.from_float(high) + Fraction.from_float(low)
+    encoded = Fraction(high) + Fraction(low)
     high = float(encoded)
-    low = float(encoded - Fraction.from_float(high))
-    return [high, low]
+    low = float(encoded - Fraction(high))
+    return [0.0 if high == 0 else high, 0.0 if low == 0 else low]
 
 
-def _normalize_underflow(scatter: Array) -> Array:
-    # A squared deviation can underflow while its cross-product with an ordinary
-    # coordinate survives. Such a binary64 zero-variance coordinate is below the
-    # std boundary; encode its entire scatter row consistently as zero. No positive
-    # diagonal, however small, is truncated by this normalization.
-    zero = np.diag(scatter) == 0
-    scatter[zero, :] = 0
-    scatter[:, zero] = 0
+def _geometry(count: int, diagonal: Moments) -> tuple[npt.NDArray[np.int32], Array]:
+    """Derive implicit dyadic exponents and correctly rounded moment diagonals."""
+    exponents = np.zeros(DIM, dtype=np.int32)
+    scatter = np.zeros(DIM)
+    squared_count = count * count
+    for index, (summed, squares) in enumerate(diagonal):
+        difference = count * squares - summed * summed
+        if not difference:
+            continue
+        power = difference.bit_length() - squared_count.bit_length()
+        below = (
+            difference < squared_count << power
+            if power >= 0
+            else difference << -power < squared_count
+        )
+        if below:
+            power -= 1
+        exponent = power // 2 - UNIT_POWER
+        exponents[index] = exponent
+        scatter[index] = _rounded_scaled(difference, count * UNIT * UNIT, 2 * exponent)
+    return exponents, scatter
+
+
+def _centers(
+    rows: Array,
+    count: int,
+    diagonal: Moments,
+    exponents: npt.NDArray[np.int32],
+    coordinates: Sequence[int],
+) -> Array:
+    """Certified exact scaled centers; offsets never enter the rounding error."""
+    result = np.zeros((len(rows), len(coordinates)))
+    for column, index in enumerate(coordinates):
+        summed, squares = diagonal[index]
+        if count * squares == summed * summed:
+            continue
+        exponent = int(exponents[index])
+        for row, value in enumerate(rows[:, index]):
+            result[row, column] = _rounded_scaled(
+                count * _units(float(value)) - summed, count * UNIT, exponent
+            )
+    return result
+
+
+def _symmetric(scatter: Array, diagonal: Array) -> Array:
+    lower = np.tril_indices(DIM, -1)
+    scatter[lower] = scatter.T[lower]
+    np.fill_diagonal(scatter, diagonal)
     return scatter
+
+
+def _moment_string(value: object, bound: int, *, signed: bool) -> int:
+    # Reject type, size and ASCII syntax before converting any external integer.
+    if not isinstance(value, str) or len(value) > (340 if signed else 668):
+        raise ProbeError("invalid_state")
+    syntax = r"(?:0|-?[1-9][0-9]*)" if signed else r"(?:0|[1-9][0-9]*)"
+    if re.fullmatch(syntax, value) is None:
+        raise ProbeError("invalid_state")
+    magnitude = value.removeprefix("-")
+    maximum = str(bound)
+    if len(magnitude) > len(maximum) or (len(magnitude) == len(maximum) and magnitude > maximum):
+        raise ProbeError("invalid_state")
+    return int(value)
+
+
+def _diagonal(value: object, count: int) -> Moments:
+    if not isinstance(value, list) or len(value) != DIM:
+        raise ProbeError("invalid_state")
+    result = []
+    for pair in value:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ProbeError("invalid_state")
+        result.append(
+            (
+                _moment_string(pair[0], count * MAX_UNITS, signed=True),
+                _moment_string(pair[1], count * MAX_UNITS * MAX_UNITS, signed=False),
+            )
+        )
+    return tuple(result)
+
+
+def _std(count: int, summed: int, squares: int) -> float:
+    """Correctly rounded population sqrt, certified by integer midpoint tests."""
+    difference = count * squares - summed * summed
+    if not difference:
+        return 0.0
+    squared_count = count * count
+    lower = 0
+    upper: int = struct.unpack(">Q", struct.pack(">d", MAX_FEATURE))[0]
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        value: float = struct.unpack(">d", struct.pack(">Q", middle))[0]
+        integer = _units(value)
+        if squared_count * integer * integer <= difference:
+            lower = middle
+        else:
+            upper = middle - 1
+    floor: float = struct.unpack(">d", struct.pack(">Q", lower))[0]
+    floor_integer = _units(floor)
+    if squared_count * floor_integer * floor_integer == difference:
+        return floor
+    ceiling: float = struct.unpack(">d", struct.pack(">Q", lower + 1))[0]
+    midpoint = floor_integer + _units(ceiling)
+    comparison = 4 * difference - squared_count * midpoint * midpoint
+    if comparison < 0 or (comparison == 0 and lower % 2 == 0):
+        return floor
+    return ceiling
 
 
 @dataclass(frozen=True)
@@ -283,10 +396,11 @@ class Cohort:
     count: int
     mean: Array
     scatter: Array
+    diagonal: Moments
 
     @classmethod
     def empty(cls) -> Cohort:
-        return cls(0, np.zeros((DIM, 2)), np.zeros((DIM, DIM)))
+        return cls(0, np.zeros((DIM, 2)), np.zeros((DIM, DIM)), ((0, 0),) * DIM)
 
     @classmethod
     def from_rows(cls, rows: Array) -> Cohort:
@@ -300,30 +414,50 @@ class Cohort:
             raise ProbeError("encoder_failed")
         if not len(rows):
             return cls.empty()
+        _integer(len(rows))
         rows = np.asarray(rows, dtype=np.float64)
-        anchor = rows[0]  # temporary batch RAM only; never part of the document
-        with localcontext() as context:
-            context.prec = 96
-            means = [
-                Decimal.from_float(float(column[0]))
-                if np.all(column == column[0])
-                else sum((Decimal.from_float(float(value)) for value in column), Decimal(0))
-                / len(rows)
-                for column in rows.T
-            ]
-            mean = np.array([_mean_pair(value) for value in means], dtype=np.float64)
-            shift = np.array(
-                [
-                    float(value - Decimal.from_float(float(a)))
-                    for value, a in zip(means, anchor, strict=True)
-                ],
-                dtype=np.float64,
+        moments = []
+        for column in rows.T:
+            if np.all(column == column[0]):
+                integer = _units(float(column[0]))
+                moments.append((len(rows) * integer, len(rows) * integer * integer))
+            else:
+                integers = [_units(float(value)) for value in column]
+                moments.append((sum(integers), sum(value * value for value in integers)))
+        diagonal = tuple(moments)
+        mean = np.array([_mean_pair(summed, len(rows)) for summed, _ in diagonal])
+        exponents, norms = _geometry(len(rows), diagonal)
+        accumulated = np.zeros((DIM, DIM))
+        compensation = np.zeros((DIM, DIM))
+        # A full-length BLAS Gram has an unbounded error at the count cap. Blocks
+        # of at most 32 rows plus TwoSum matrix compensation retain the original
+        # dimensionless PSD budget. All corrections live only in this call's RAM.
+        for start in range(0, len(rows), 32):
+            centered = _centers(
+                rows[start : start + 32], len(rows), diagonal, exponents, range(DIM)
             )
-        centered = (rows - anchor) - shift
-        return cls(len(rows), mean, _normalize_underflow(centered.T @ centered))
+            block = centered.T @ centered
+            total = accumulated + block
+            difference = total - accumulated
+            residual = (accumulated - (total - difference)) + (block - difference)
+            compensation = compensation + residual
+            accumulated = total
+        scatter = _symmetric(accumulated + compensation, norms)
+        return cls(len(rows), mean, scatter, diagonal)
 
     def validate(self) -> None:
         _integer(self.count)
+        if len(self.diagonal) != DIM:
+            raise ProbeError("invalid_state")
+        for summed, squares in self.diagonal:
+            if (
+                type(summed) is not int
+                or type(squares) is not int
+                or abs(summed) > self.count * MAX_UNITS
+                or not 0 <= squares <= self.count * MAX_UNITS * MAX_UNITS
+                or self.count * squares < summed * summed
+            ):
+                raise ProbeError("invalid_state")
         if (
             self.mean.shape != (DIM, 2)
             or self.scatter.shape != (DIM, DIM)
@@ -333,6 +467,11 @@ class Cohort:
             or not np.isfinite(self.scatter).all()
             or np.any(np.abs(self.mean) > MAX_FEATURE)
             or np.any(np.abs(self.scatter) > MAX_VALUE)
+        ):
+            raise ProbeError("invalid_state")
+        canonical = np.array([_mean_pair(summed, self.count) for summed, _ in self.diagonal])
+        if not np.array_equal(self.mean, canonical) or np.any(
+            np.signbit(self.mean[self.mean == 0])
         ):
             raise ProbeError("invalid_state")
         if self.count == 0:
@@ -352,6 +491,9 @@ class Cohort:
             ):
                 raise ProbeError("invalid_state")
         diagonal = np.diag(self.scatter)
+        _exponents, norms = _geometry(self.count, self.diagonal)
+        if not np.array_equal(diagonal, norms):
+            raise ProbeError("invalid_state")
         if np.any(diagonal < 0) or not np.array_equal(self.scatter, self.scatter.T):
             raise ProbeError("invalid_state")
         if np.any(self.scatter[diagonal == 0]):
@@ -378,27 +520,42 @@ class Cohort:
         if other.count == 0:
             return self
         count = self.count + other.count
-        with localcontext() as context:
-            context.prec = 96
-            means_a = [_wide_mean(pair) for pair in self.mean]
-            means_b = [_wide_mean(pair) for pair in other.mean]
-            delta = np.array([float(b - a) for a, b in zip(means_a, means_b, strict=True)])
-            mean = np.array(
-                [
-                    _mean_pair((a * self.count + b * other.count) / count)
-                    for a, b in zip(means_a, means_b, strict=True)
-                ],
-                dtype=np.float64,
-            )
-        scatter = (
-            self.scatter
-            + other.scatter
-            + np.outer(delta, delta) * (self.count * (other.count / count))
+        _integer(count)
+        diagonal = tuple(
+            (a + b, q + r) for (a, q), (b, r) in zip(self.diagonal, other.diagonal, strict=True)
         )
-        return Cohort(count, mean, _normalize_underflow(scatter))
+        mean = np.array([_mean_pair(summed, count) for summed, _ in diagonal])
+        exponents, norms = _geometry(count, diagonal)
+        shifts_a = _geometry(self.count, self.diagonal)[0] - exponents
+        shifts_b = _geometry(other.count, other.diagonal)[0] - exponents
+        delta = np.array(
+            [
+                _rounded_scaled(
+                    b * self.count - a * other.count,
+                    self.count * other.count * UNIT,
+                    int(exponent),
+                )
+                for (a, _), (b, _), exponent in zip(
+                    self.diagonal, other.diagonal, exponents, strict=True
+                )
+            ]
+        )
+        # ldexp acts directly on each value, including zero children with large
+        # nominal shifts; an overflowing standalone power is never materialized.
+        scatter = (
+            np.ldexp(self.scatter, shifts_a[:, None] + shifts_a[None, :])
+            + np.ldexp(other.scatter, shifts_b[:, None] + shifts_b[None, :])
+            + np.outer(delta, delta) * float(Fraction(self.count * other.count, count))
+        )
+        return Cohort(count, mean, _symmetric(scatter, norms), diagonal)
 
     def document(self) -> dict[str, object]:
-        return {"count": self.count, "mean": self.mean.tolist(), "scatter": self.scatter.tolist()}
+        return {
+            "count": self.count,
+            "mean": self.mean.tolist(),
+            "scatter": self.scatter.tolist(),
+            "diagonal": [[str(summed), str(squares)] for summed, squares in self.diagonal],
+        }
 
 
 @dataclass(frozen=True)
@@ -430,7 +587,7 @@ class State:
     def document(self) -> dict[str, object]:
         self.validate()
         return {
-            "version": 2,
+            "version": 3,
             "run_id": self.run_id,
             "source": self.source,
             "encoder": self.encoder,
@@ -446,7 +603,7 @@ def parse_state(raw: bytes) -> State:
             _decode(raw, MAX_STATE_BYTES),
             {"version", "run_id", "source", "encoder", "accepted_sessions", "cohorts"},
         )
-        if _integer(value["version"], 2) != 2:
+        if _integer(value["version"], 3) != 3:
             raise ProbeError("invalid_state")
         source, encoder = value["source"], value["encoder"]
         if not isinstance(source, str) or not isinstance(encoder, str):
@@ -454,9 +611,13 @@ def parse_state(raw: bytes) -> State:
         groups = _object(value["cohorts"], set("ynu"))
         cohorts = {}
         for name in "ynu":
-            group = _object(groups[name], {"count", "mean", "scatter"})
+            group = _object(groups[name], {"count", "mean", "scatter", "diagonal"})
+            count = _integer(group["count"])
             cohorts[name] = Cohort(
-                _integer(group["count"]), _array(group["mean"], 2), _array(group["scatter"])
+                count,
+                _array(group["mean"], 2),
+                _array(group["scatter"]),
+                _diagonal(group["diagonal"], count),
             )
         state = State(
             _uuid(value["run_id"]),
@@ -479,21 +640,25 @@ def _head(positive: Cohort, negative: Cohort, current: Array) -> list[Array]:
     if not positive.count or not negative.count:
         return [np.full(len(current), mean_y) for _ in LAMBDAS]
     # Binary64 population std, then the original strict scalar comparison.
-    deviation = np.sqrt(np.diag(group.scatter) / group.count)
+    deviation = np.array([_std(group.count, summed, squares) for summed, squares in group.diagonal])
     active = deviation > 1e-10
-    scale = deviation[active]
+    coordinates = np.flatnonzero(active).tolist()
+    exponents = _geometry(group.count, group.diagonal)[0]
+    scale = np.ldexp(deviation[active], -exponents[active])
     standardized = group.scatter[np.ix_(active, active)] / scale[:, None] / scale[None, :]
-    with localcontext() as context:
-        context.prec = 96
-        delta = np.array(
-            [
-                float(_wide_mean(a) - _wide_mean(b))
-                for a, b in zip(positive.mean[active], negative.mean[active], strict=True)
-            ],
-            dtype=np.float64,
-        )
-    xy = (positive.count * (negative.count / group.count)) * delta / scale
-    query = ((current[:, active] - group.mean[active, 0]) - group.mean[active, 1]) / scale
+    delta = np.array(
+        [
+            _rounded_scaled(
+                positive.diagonal[index][0] * negative.count
+                - negative.diagonal[index][0] * positive.count,
+                positive.count * negative.count * UNIT,
+                int(exponents[index]),
+            )
+            for index in coordinates
+        ]
+    )
+    xy = float(Fraction(positive.count * negative.count, group.count)) * delta / scale
+    query = _centers(current, group.count, group.diagonal, exponents, coordinates) / scale
     identity = np.eye(len(scale))
     return [
         np.round(
@@ -528,7 +693,7 @@ def validate_label_metadata(record: Mapping[str, object]) -> dict[str, object] |
         return None
     try:
         run = _object(record["probe_run"], {"version", "run_id", "session", "state", "reason"})
-        if _integer(run["version"], 2) not in (1, 2):
+        if _integer(run["version"], 3) not in (1, 2, 3):
             raise ProbeError("invalid_history")
         identity = run["run_id"]
         if identity is not None:
@@ -598,7 +763,7 @@ def _control(raw: bytes) -> dict[str, object]:
         {"version", "run_id", "source", "encoder", "state", "accepted_sessions", "reason"},
     )
     # Legacy control may identify a stopped source, but is never admitted below.
-    if _integer(value["version"], 2) not in (1, 2):
+    if _integer(value["version"], 3) not in (1, 2, 3):
         raise ProbeError("invalid_state")
     _uuid(value["run_id"])
     _integer(value["accepted_sessions"], 12)
@@ -820,7 +985,7 @@ class ProbePass:
     def metadata(self) -> dict[str, object]:
         incomplete = self.armed or self.arm_failed
         return {
-            "version": 2,
+            "version": 3,
             "run_id": self.run_id,
             "session": self.session if incomplete else None,
             "state": "incomplete" if incomplete else "stopped",
@@ -829,7 +994,7 @@ class ProbePass:
 
     def _control_document(self, state: str, count: int) -> dict[str, object]:
         return {
-            "version": 2,
+            "version": 3,
             "run_id": self.run_id,
             "source": self.source,
             "encoder": ENCODER,
@@ -866,7 +1031,7 @@ class ProbePass:
             run = validate_label_metadata(record)
             if run is None:
                 continue
-            if run["version"] != 2:
+            if run["version"] != 3:
                 raise ProbeError("invalid_history")
             if run["run_id"] is None or state is None or run["run_id"] != state.run_id:
                 raise ProbeError("source_incomplete")
@@ -923,7 +1088,7 @@ class ProbePass:
         if self.control_path.exists():
             control = _control(_read(self.control_path, MAX_CONTROL_BYTES))
             self.run_id = _uuid(control["run_id"])
-            if control["version"] != 2:
+            if control["version"] != 3:
                 raise ProbeError("invalid_state")
             if control["source"] != self.source or control["encoder"] != ENCODER:
                 raise ProbeError("encoder_mismatch")
@@ -1089,7 +1254,7 @@ class ProbePass:
             final: dict[str, object] = {
                 **record,
                 "probe_run": {
-                    "version": 2,
+                    "version": 3,
                     "run_id": self.run_id,
                     "session": self.session,
                     "state": "accepted",
