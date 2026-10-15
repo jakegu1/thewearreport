@@ -1311,3 +1311,187 @@ def test_ac8_native_launcher_both_cities_fetches_once_and_all_passes_continue(
         assert len(lines) == 2 and all("probe" not in _json(p) for p in _labels(out))
     else:
         assert not fetch_log.exists() and all("probe" in _json(p) for p in _labels(out))
+
+
+@pytest.mark.parametrize("source", ["london", "calgary"])
+@pytest.mark.parametrize("damage", ["missing-date", "negative-rejected", "negative-height"])
+def test_ac6_malformed_ordinary_probe_history_stops_before_encoder(
+    env: NumericEncoder,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+    damage: str,
+) -> None:
+    out, directory = tmp_path / "out", tmp_path / "stats"
+    assert _invoke(out, directory, source=source) == 0
+    accepted = _labels(out)[0]
+    expected_human = spotcheck_summary.parse_labelling(accepted.read_bytes())
+    record = _json(accepted)
+    run_id = record["probe_run"]["run_id"]
+    if damage == "missing-date":
+        del record["date"]
+    elif damage == "negative-rejected":
+        record["crops_rejected"] = -1
+        record["crops_shown"] = len(record["crops"]) - 1
+    else:
+        record["crops"][0][0] = -1
+    accepted.write_text(json.dumps(record), encoding="utf-8")
+    malformed = accepted.read_bytes()
+    with pytest.raises(ValueError):
+        spotcheck_summary.parse_labelling(malformed)
+    aggregate = _state(directory, source).read_bytes()
+    control = _control(out, source).read_bytes()
+    assert _json(_state(directory, source))["accepted_sessions"] == 1
+    before = len(env.seen)
+    for pass_number in range(2):
+        capsys.readouterr()
+        assert _invoke(out, directory, source=source) == 0
+        current_path = _labels(out)[-1]
+        current = _json(current_path)
+        lines = _probe_lines(capsys)
+        assert len(env.seen) == before
+        assert accepted.read_bytes() == malformed
+        assert _state(directory, source).read_bytes() == aggregate
+        assert _control(out, source).read_bytes() == control
+        assert "probe" not in current
+        assert current["probe_run"] == {
+            "version": 3,
+            "run_id": run_id,
+            "session": None,
+            "state": "stopped",
+            "reason": "invalid_history",
+        }
+        assert spotcheck_summary.parse_labelling(current_path.read_bytes()) == expected_human
+        assert len(_labels(out)) == pass_number + 2
+        assert lines == ["spotcheck: probe stopped (invalid_history); human labels continue"]
+        assert len(lines[0]) <= 200
+
+
+@pytest.mark.parametrize("source", ["london", "calgary"])
+def test_ac6_valid_ordinary_history_keeps_human_and_probe_continuation(
+    env: NumericEncoder,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+) -> None:
+    out, directory = tmp_path / "out", tmp_path / "stats"
+    assert _invoke(out, None, source=source) == 0
+    ordinary = _labels(out)[0]
+    ordinary_bytes = ordinary.read_bytes()
+    expected_human = spotcheck_summary.parse_labelling(ordinary_bytes)
+    assert "probe" not in _json(ordinary) and "probe_run" not in _json(ordinary)
+    assert env.seen == []
+    run_id: str | None = None
+    for session in (1, 2):
+        capsys.readouterr()
+        before = len(env.seen)
+        assert _invoke(out, directory, source=source) == 0
+        current_path = _labels(out)[-1]
+        current = _json(current_path)
+        if run_id is None:
+            run_id = current["probe_run"]["run_id"]
+        assert run_id is not None
+        _assert_metadata(current, session, run_id)
+        assert len(env.seen) == before + len(VALUES)
+        assert spotcheck_summary.parse_labelling(current_path.read_bytes()) == expected_human
+        assert ordinary.read_bytes() == ordinary_bytes
+        assert _json(_state(directory, source))["accepted_sessions"] == session
+        assert _json(_control(out, source)) == {
+            "version": 3,
+            "run_id": run_id,
+            "source": source,
+            "encoder": ENCODER,
+            "state": "active",
+            "accepted_sessions": session,
+            "reason": None,
+        }
+        assert _probe_lines(capsys) == []
+    assert len(_labels(out)) == 3
+
+
+@pytest.mark.parametrize("source", ["london", "calgary"])
+@pytest.mark.parametrize("irrelevant", ["other-source-probe", "same-source-human-only"])
+def test_ac6_irrelevant_ordinary_history_does_not_couple_sources(
+    env: NumericEncoder,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+    irrelevant: str,
+) -> None:
+    out, directory = tmp_path / "out", tmp_path / "stats"
+    other = "calgary" if source == "london" else "london"
+    prior_source = other if irrelevant == "other-source-probe" else source
+    prior_directory = directory if irrelevant == "other-source-probe" else None
+    assert _invoke(out, prior_directory, source=prior_source) == 0
+    prior = _labels(out)[0]
+    record = _json(prior)
+    if irrelevant == "other-source-probe":
+        _assert_metadata(record, 1, record["probe_run"]["run_id"])
+    else:
+        assert "probe" not in record and "probe_run" not in record
+    del record["date"]
+    prior.write_text(json.dumps(record), encoding="utf-8")
+    malformed = prior.read_bytes()
+    with pytest.raises(ValueError):
+        spotcheck_summary.parse_labelling(malformed)
+    old_files = _all_files(directory) | _all_files(out / "probe-runs")
+    before = len(env.seen)
+    capsys.readouterr()
+    assert _invoke(out, directory, source=source) == 0
+    current_path = _labels(out)[-1]
+    current = _json(current_path)
+    _assert_metadata(current, 1, current["probe_run"]["run_id"])
+    assert spotcheck_summary.parse_labelling(current_path.read_bytes()).source == source
+    assert len(env.seen) == before + len(VALUES)
+    assert prior.read_bytes() == malformed
+    assert _json(_state(directory, source))["accepted_sessions"] == 1
+    assert _json(_control(out, source))["accepted_sessions"] == 1
+    assert all(path.read_bytes() == raw for path, raw in old_files.items())
+    assert _probe_lines(capsys) == []
+
+
+@pytest.mark.parametrize("source", ["london", "calgary"])
+def test_ac6_sealed_history_requires_valid_ordinary_accepted_labels(
+    env: NumericEncoder,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+) -> None:
+    out, directory = tmp_path / "out", tmp_path / "stats"
+    for _ in range(12):
+        assert _invoke(out, directory, source=source) == 0
+    accepted = _labels(out)[0]
+    expected_human = spotcheck_summary.parse_labelling(accepted.read_bytes())
+    record = _json(accepted)
+    run_id = record["probe_run"]["run_id"]
+    del record["date"]
+    accepted.write_text(json.dumps(record), encoding="utf-8")
+    malformed = accepted.read_bytes()
+    with pytest.raises(ValueError):
+        spotcheck_summary.parse_labelling(malformed)
+    aggregate = _state(directory, source).read_bytes()
+    control = _control(out, source).read_bytes()
+    assert _json(_state(directory, source))["accepted_sessions"] == 12
+    assert _json(_control(out, source))["state"] == "sealed"
+    before = len(env.seen)
+    capsys.readouterr()
+    assert _invoke(out, directory, source=source) == 0
+    current_path = _labels(out)[-1]
+    current = _json(current_path)
+    lines = _probe_lines(capsys)
+    assert len(env.seen) == before
+    assert accepted.read_bytes() == malformed
+    assert _state(directory, source).read_bytes() == aggregate
+    assert _control(out, source).read_bytes() == control
+    assert "probe" not in current
+    assert current["probe_run"] == {
+        "version": 3,
+        "run_id": run_id,
+        "session": None,
+        "state": "stopped",
+        "reason": "invalid_history",
+    }
+    assert spotcheck_summary.parse_labelling(current_path.read_bytes()) == expected_human
+    assert len(_labels(out)) == 13
+    assert lines == ["spotcheck: probe stopped (invalid_history); human labels continue"]
+    assert len(lines[0]) <= 200
