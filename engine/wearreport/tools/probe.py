@@ -951,7 +951,7 @@ class ProbePass:
         except (OSError, ProbeError):
             pass
         try:
-            for _path, record in self._records():
+            for _path, record, _raw in self._records():
                 run = validate_label_metadata(record)
                 if run is not None and run["run_id"] is not None:
                     identities.add(_uuid(run["run_id"]))
@@ -1003,7 +1003,7 @@ class ProbePass:
             "reason": "unfinished_session" if state == "pending" else None,
         }
 
-    def _records(self) -> list[tuple[Path, dict[str, object]]]:
+    def _records(self) -> list[tuple[Path, dict[str, object], bytes]]:
         folder = self.out_dir / "attributes"
         if not folder.exists():
             return []
@@ -1012,20 +1012,22 @@ class ProbePass:
         if len(paths) > 100_000:
             raise ProbeError("invalid_history")
         for path in paths:
-            value = _decode(_read(path, MAX_LABEL_BYTES), MAX_LABEL_BYTES)
+            raw = _read(path, MAX_LABEL_BYTES)
+            value = _decode(raw, MAX_LABEL_BYTES)
             if not isinstance(value, dict):
                 raise ProbeError("invalid_history")
             source = value.get("source", "london")
             if not isinstance(source, str) or source not in SOURCES:
                 raise ProbeError("invalid_history")
             if source == self.source:
-                result.append((path, cast(dict[str, object], value)))
+                result.append((path, cast(dict[str, object], value), raw))
         return result
 
     def _history(self, state: State | None, exclude: Path | None = None) -> None:
-        accepted: dict[int, tuple[int, int, int]] = {}
-        complete_stops = False
-        for path, record in self._records():
+        from wearreport.tools.spotcheck_summary import parse_labelling
+
+        records = []
+        for path, record, raw in self._records():
             if exclude is not None and path == exclude:
                 continue  # only this pass's already durable human label
             run = validate_label_metadata(record)
@@ -1033,6 +1035,14 @@ class ProbePass:
                 continue
             if run["version"] != 3:
                 raise ProbeError("invalid_history")
+            try:
+                parse_labelling(raw)
+            except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+                raise ProbeError("invalid_history") from None
+            records.append((record, run))
+        accepted: dict[int, tuple[int, int, int]] = {}
+        complete_stops = False
+        for record, run in records:
             if run["run_id"] is None or state is None or run["run_id"] != state.run_id:
                 raise ProbeError("source_incomplete")
             if run["state"] != "accepted":

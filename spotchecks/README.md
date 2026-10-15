@@ -689,6 +689,7 @@ Admission requires version-3 aggregate/control and complete contiguous version-3
 accepted label history `1..K`, matching identities, encoder and counts. Legacy version-1/2
 aggregate, control or probe-bearing labels, mixed/unknown versions, and missing,
 duplicate, mismatching or incomplete trial history stop model work before features.
+Same-source probe-bearing history must also pass the ordinary human-label parser.
 Human labelling continues with bounded stopped metadata and a fixed diagnostic.
 Unknown-identity stop labels also stop it. Existing aggregate/control bytes stay
 untouched; there is no migration of lossy legacy moments, automatic reset, renumbering,
