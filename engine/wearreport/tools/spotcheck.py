@@ -5,7 +5,7 @@
       [--view files|window] [--judgements PATH] [--timeout SECONDS] [--dry-run]
       [--judge NAME --judge-max-requests N] [--record-boxes] [--attributes]
       [--confirm-stop] [--allow-dark] [--source london|austin|calgary] [--bbox S,W,N,E]
-      [--record-camera-yield]
+      [--record-camera-yield] [--probe DIR]
 
 Lists the cameras (`wearreport.registry`), fetches one sweep in memory
 (`wearreport.fetch`), runs the detector with its default thresholds, and samples up to N
@@ -166,7 +166,7 @@ import numpy.typing as npt
 from wearreport import detect, fetch, registry
 from wearreport._cv import cv2, encode_jpeg
 from wearreport.settings import SettingsError, load_settings
-from wearreport.tools import judge_hosted, pilot_heights
+from wearreport.tools import judge_hosted, pilot_heights, probe
 
 if sys.platform == "win32":
     import ctypes
@@ -2891,6 +2891,13 @@ def build_parser() -> argparse.ArgumentParser:
         "shown, how many were shown, rejected and judgeable on the outer layer (counts only)",
     )
     ap.add_argument(
+        "--probe",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="with --attributes: local prior-session linear scores and cumulative moments in DIR",
+    )
+    ap.add_argument(
         "--bbox",
         type=pilot_heights.parse_bbox,
         default=None,
@@ -2907,6 +2914,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     argparse's own."""
     ap = build_parser()
     args = ap.parse_args(argv)
+    if args.probe is not None and not args.attributes:
+        ap.error("--probe works in attribute sessions only; add --attributes")
     if args.source == "austin" and not args.attributes:
         ap.error(AUSTIN_ATTRIBUTES_ONLY)
     if args.source == "calgary" and not args.attributes:
@@ -3021,6 +3030,30 @@ def _print_numbering(workdir: Path, items: Sequence[ReviewItem]) -> None:
     print(f"The numbering and a judgements template are in {NUMBERING_FILE} there.", flush=True)
 
 
+@contextlib.contextmanager
+def _active_window_guard(
+    reviewer: Reviewer | AttributeReviewer, guard: _SignalGuard
+) -> Iterator[None]:
+    """Bind an injected window's teardown to this collection, then restore it."""
+    if not isinstance(reviewer, WindowReviewer):
+        yield
+        return
+    missing = object()
+    previous = getattr(reviewer, "guard", missing)
+    if previous is not missing and previous is not None:
+        yield
+        return
+    try:
+        reviewer.guard = guard
+        yield
+    finally:
+        if previous is missing:
+            with contextlib.suppress(AttributeError):
+                del reviewer.guard
+        else:
+            reviewer.guard = None
+
+
 def _collect(
     items: Sequence[ReviewItem],
     mode: Mode,
@@ -3032,7 +3065,8 @@ def _collect(
     deadline = time.monotonic() + timeout_s
     guard.alarm(timeout_s)
     try:
-        judgements = reviewer.judge(items, mode, deadline)
+        with _active_window_guard(reviewer, guard):
+            judgements = reviewer.judge(items, mode, deadline)
     finally:
         guard.alarm(0)
     try:
@@ -3051,7 +3085,8 @@ def _collect_attributes(
     deadline = time.monotonic() + timeout_s
     guard.alarm(timeout_s)
     try:
-        answers = reviewer.attributes(items, deadline)
+        with _active_window_guard(reviewer, guard):
+            answers = reviewer.attributes(items, deadline)
     finally:
         guard.alarm(0)
     try:
@@ -3390,6 +3425,12 @@ def _check(
 ATTRIBUTE_TEMPLATE_ENTRY: dict[str, object] = dict.fromkeys(ATTRIBUTE_NAMES, "")
 
 
+def _probe_notice(trial: probe.ProbePass | None) -> None:
+    reason = None if trial is None else trial.take_reason()
+    if reason is not None:
+        print(f"spotcheck: probe stopped ({reason}); human labels continue", file=sys.stderr)
+
+
 def _attribute_session(
     args: argparse.Namespace,
     pipeline: Pipeline | None,
@@ -3402,6 +3443,33 @@ def _attribute_session(
     austin: AustinEndpoints | None = None,
     opener: DetectorOpener | None = None,
     calgary: CalgaryEndpoints | None = None,
+) -> int:
+    directory: Path | None = getattr(args, "probe", None)
+    if directory is None:
+        return _label_attribute_session(
+            args, pipeline, reviewer, day, guard, view, judge, clock, austin, opener, calgary
+        )
+    out_dir = _prepare(args)
+    with probe.ProbePass(directory, out_dir, args.source) as trial:
+        _probe_notice(trial)
+        return _label_attribute_session(
+            args, pipeline, reviewer, day, guard, view, judge, clock, austin, opener, calgary, trial
+        )
+
+
+def _label_attribute_session(
+    args: argparse.Namespace,
+    pipeline: Pipeline | None,
+    reviewer: Reviewer | AttributeReviewer | None,
+    day: datetime.date,
+    guard: _SignalGuard,
+    view: View,
+    judge: judge_hosted.LiveAttributeJudge | None,
+    clock: Callable[[], datetime.datetime],
+    austin: AustinEndpoints | None = None,
+    opener: DetectorOpener | None = None,
+    calgary: CalgaryEndpoints | None = None,
+    trial: probe.ProbePass | None = None,
 ) -> int:
     """Label the near-field crops of one sweep, then (with a judge) ask the model the same
     questions about the crops the reviewer did not reject; write the attribute file. With
@@ -3437,6 +3505,9 @@ def _attribute_session(
     cameras = box_cameras(samples) if record_yield else None
     items = render(samples, "crops")
     del samples  # the frames are not needed any more
+    if trial is not None:
+        trial.prepare([item.image for item in items])
+        _probe_notice(trial)
     _progress(f"opening the review: {len(items)} crop(s)")
     answers: dict[int, str | None] = {}
     if items:
@@ -3449,6 +3520,9 @@ def _attribute_session(
             ATTRIBUTE_TEMPLATE_ENTRY,
             functools.partial(_collect_attributes, items, labeller, args.timeout, guard),
         )
+    if trial is not None:
+        trial.select([answers[item.number] for item in items])
+        _probe_notice(trial)
     yields = None
     if cameras is not None:
         yields = camera_yield(items, answers, cameras)
@@ -3482,8 +3556,22 @@ def _attribute_session(
     if yields is not None:
         record["camera_yield"] = yields  # after `crops`; a source still comes last
     record = sourced_record(record, source, started_at)
-    del items
+    if trial is not None:
+        record["probe_run"] = trial.metadata()
     path = write_attributes(record, out_dir, day, source)
+    if trial is not None:
+        kept_items = [item for item in items if answers[item.number] is not None]
+        order = sorted(
+            range(len(kept_items)),
+            key=lambda i: (
+                heights[kept_items[i].boxes[0]],
+                answers[kept_items[i].number] or "",
+                models[i] if i < len(models) else "",
+            ),
+        )
+        trial.finish(path, record, [answers[item.number] for item in kept_items], order)
+        _probe_notice(trial)
+    del items
     print(
         f"Attribute labels written to {path}: {record['crops_shown']} crop(s) shown, "
         f"{record['crops_rejected']} rejected"
