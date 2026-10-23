@@ -37,7 +37,8 @@ weekday. `-Days` accepts 1 through 14. Omitting `-StartDate` uses the real curre
 date in `-Zone`. A start must precede its exclusive end; split an overnight window
 into separate plans. A timezone is required; no machine-location assumption is
 made. `-Python C:\path\to\python.exe` explicitly selects an already prepared Python;
-otherwise the entry uses this repository's `.venv\Scripts\python.exe`. It never
+otherwise the entry uses this repository's `.venv\Scripts\python.exe`. Offline
+commands require Python 3.12 and reject other versions with preparation guidance. It never
 silently searches for or installs another interpreter.
 
 The Python module also works directly in an existing local environment:
@@ -52,6 +53,15 @@ including daylight-saving transitions, then filtered by the display calendar dat
 weekday, and online window. Each row includes source-local, display-local, and UTC
 timestamps; display date and display time are separate fields. The source dates
 can differ from the display dates.
+
+Both display and source zones load explicitly from the installed `tzdata` package
+pinned by `uv.lock`, rather than the host operating system's database. JSON reports
+the package version and source, and preflight verifies the installed version
+against the lock. The current lock uses `tzdata` 2026.5 / IANA 2026e. Its
+[official release notes](https://github.com/eggert/tz/blob/2026e/NEWS) record Alberta's
+permanent UTC-06 rule from June 18, 2026: Calgary does not fall back on November 1.
+The March 7/8, 2026 transition still changes Calgary noon from 19:00 to 18:00 UTC.
+No fixed offsets or machine-local timezone aliases are substituted.
 
 Calgary source-local 12:00 coverage is reported separately, including uncovered
 slots and their reasons. This is an availability comparison. It does not establish

@@ -11,11 +11,10 @@ import datetime as dt
 import json
 import re
 import sys
-import tomllib
 from collections.abc import Sequence
-from importlib import metadata
+from importlib import metadata, resources
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 LONDON_HOURS = (10, 12, 14)
@@ -26,14 +25,29 @@ class PlanError(Exception):
 
 
 def _zone(value: str) -> ZoneInfo:
-    if len(value) > 100 or not re.fullmatch(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*", value):
+    if (
+        len(value) > 100
+        or value in {"localtime", "posixrules"}
+        or not re.fullmatch(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*", value)
+    ):
         raise argparse.ArgumentTypeError("use an explicit IANA zone, such as Europe/London")
     try:
-        return ZoneInfo(value)
-    except (ValueError, ZoneInfoNotFoundError):
+        # Load both display and source zones from the project's installed dependency.
+        # The host database can be older and have different prospective legal rules.
+        resource = resources.files("tzdata.zoneinfo").joinpath(*value.split("/"))
+        with resource.open("rb") as stream:
+            return ZoneInfo.from_file(stream, key=value)
+    except (ModuleNotFoundError, OSError, ValueError):
         raise argparse.ArgumentTypeError(
             "unknown IANA zone; check its spelling and the local tzdata installation"
         ) from None
+
+
+def _tzdata_version() -> str:
+    try:
+        return metadata.version("tzdata")
+    except metadata.PackageNotFoundError:
+        raise PlanError("tzdata metadata is missing; complete the documented local setup") from None
 
 
 def _date(value: str) -> dt.date:
@@ -123,6 +137,11 @@ def build_plan(
     london: list[dict[str, object]] = []
     calgary: list[dict[str, object]] = []
     try:
+        # Normalize callers' ZoneInfo objects too; their keys may originate on a host
+        # with different data. Never mutate the process-wide zoneinfo search path.
+        zone = _zone(zone.key)
+        london_zone = _zone("Europe/London")
+        calgary_zone = _zone("America/Edmonton")
         end_date = start_date + dt.timedelta(days=days)
         # Include neighbouring source dates: a source's noon can fall on a different
         # display date. Filtering always uses the converted display date and weekday.
@@ -130,23 +149,25 @@ def build_plan(
         for offset in range(days + 4):
             day = source_start + dt.timedelta(days=offset)
             for source_zone, hours, target in (
-                ("Europe/London", LONDON_HOURS, london),
-                ("America/Edmonton", (12,), calgary),
+                (london_zone, LONDON_HOURS, london),
+                (calgary_zone, (12,), calgary),
             ):
                 for hour in hours:
-                    moment = dt.datetime.combine(day, dt.time(hour), ZoneInfo(source_zone))
+                    moment = dt.datetime.combine(day, dt.time(hour), source_zone)
                     display_day = moment.astimezone(zone).date()
                     if start_date <= display_day < end_date:
                         row = _slot(moment, zone, online_start, online_end, weekdays)
                         if target is calgary or row["covered"]:
                             target.append(row)
-    except (ValueError, OverflowError, ZoneInfoNotFoundError):
+    except (ValueError, OverflowError, argparse.ArgumentTypeError):
         raise PlanError(
             "date range cannot be converted; use 1900..9998 and installed tzdata"
         ) from None
     return {
         "kind": "prospective_opportunities",
         "display_zone": zone.key,
+        "timezone_source": "tzdata package",
+        "timezone_version": _tzdata_version(),
         "start_date": start_date.isoformat(),
         "days": days,
         "online_start": _clock(online_start),
@@ -167,8 +188,11 @@ def preflight(zone: ZoneInfo) -> dict[str, object]:
         raise PlanError(
             "Python 3.12 is required; select the prepared repository Python with -Python"
         )
+    import tomllib
+
     try:
-        lock = (root / "uv.lock").read_bytes()
+        with (root / "uv.lock").open("rb") as stream:
+            lock = stream.read(512 * 1024 + 1)
         if len(lock) > 512 * 1024:
             raise ValueError
         packages = tomllib.loads(lock.decode("utf-8"))["package"]
@@ -197,6 +221,8 @@ def preflight(zone: ZoneInfo) -> dict[str, object]:
         "module": str(Path(__file__).resolve()),
         "lock": str(root / "uv.lock"),
         "display_zone": zone.key,
+        "timezone_source": "tzdata package",
+        "timezone_version": _tzdata_version(),
         "versions": versions,
         "notice": "Local files and versions only; no daylight, provider, or capture check was run.",
     }
@@ -227,6 +253,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if sys.version_info[:2] != (3, 12):
+        print(
+            "local_label_plan: error: select Python 3.12 from the prepared local environment",
+            file=sys.stderr,
+        )
+        return 2
     parser = build_parser()
     args, unknown = parser.parse_known_args(argv)
     if unknown:

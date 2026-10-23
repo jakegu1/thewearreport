@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+from importlib import resources
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -40,3 +41,36 @@ def test_preflight_rejects_an_unsupported_python_without_reading_lock(
     monkeypatch.setattr(sys, "version_info", (3, 11))
     with pytest.raises(planner.PlanError, match=r"Python 3\.12"):
         planner.preflight(ZoneInfo("UTC"))
+
+
+def test_source_and_display_use_packaged_rules_even_with_a_different_host_zone() -> None:
+    # A host-derived object with this key need not have the installed package's rules.
+    with resources.files("tzdata.zoneinfo").joinpath("UTC").open("rb") as stream:
+        different_host_zone = ZoneInfo.from_file(stream, key="America/Edmonton")
+    data = planner.build_plan(
+        different_host_zone, dt.date(2026, 11, 1), 1, 0, 1440, planner.WEEKDAYS
+    )
+    london = data["london_opportunities"]
+    calgary = data["calgary_noon_coverage"]
+    assert isinstance(london, list) and isinstance(calgary, list)
+    assert [row["display_time"] for row in london] == ["04:00", "06:00", "08:00"]
+    assert calgary[0]["utc"] == "2026-11-01T18:00+00:00"
+    assert calgary[0]["display_time"] == "12:00"
+    assert data["timezone_source"] == "tzdata package" and data["timezone_version"] == "2026.5"
+
+
+@pytest.mark.parametrize("key", ["localtime", "posixrules", "../UTC", "UTC/../../localtime"])
+def test_host_only_and_path_keys_are_rejected(key: str, capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        planner.main(["--zone", key])
+    assert exc.value.code == 2
+    assert "explicit IANA" in capsys.readouterr().err
+
+
+def test_unsupported_cli_python_fails_before_loading_any_zone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "version_info", (3, 10))
+    assert planner.main(["--zone", "UTC", "--preflight"]) == 2
+    output = capsys.readouterr()
+    assert "Python 3.12" in output.err and "Traceback" not in output.err
