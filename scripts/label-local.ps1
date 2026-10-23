@@ -63,6 +63,14 @@ try {
     Set-Location -LiteralPath $Repo
     $Launcher = Join-Path $Repo 'label.cmd'
     if ($StartLondon) {
+        # The unchanged legacy batch launcher introduces another cmd parsing boundary.
+        # Refuse shell-sensitive paths before handing any argument to that process.
+        $UnsupportedPath = '[&|<>^%!()"\x00-\x1f\x7f]'
+        if ($Repo -match $UnsupportedPath -or $Launcher -match $UnsupportedPath -or
+            ($OutDir -and $OutDir -match $UnsupportedPath)) {
+            Write-Host 'Unsupported path. Use project and output directories without shell metacharacters (& | < > ^ % ! parentheses or double quotes) or control characters.'
+            exit 2
+        }
         if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) {
             Write-Host "Missing label.cmd at $Launcher. Restore the repository entry."
             exit 1

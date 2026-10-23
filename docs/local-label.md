@@ -90,6 +90,13 @@ environment preparation, daylight checks, London time gates, review window,
 clipboard behavior, and output location. The new entry preserves its output and
 actual exit code. It accepts no test clock or bypass options in this mode.
 
+For `-StartLondon`, the project path, derived launcher path, and any explicit output
+path must contain no shell metacharacters (`& | < > ^ % ! ( )`), double quotes, or
+control characters. The entry refuses unsupported paths before starting a child
+and asks you to use project/output directories without those characters. Spaces
+and Unicode directory names are supported. This restriction keeps the unchanged
+legacy batch launcher's extra command-parsing boundary safe.
+
 Keep a human present throughout review. This entry is not an unattended controller,
 uploader, image queue, or scheduler. A prospective calendar row does not grant
 permission to collect, establish shared daily counts, or prove that collection ran.

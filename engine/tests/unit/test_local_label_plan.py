@@ -82,20 +82,17 @@ def test_unsupported_cli_python_fails_before_loading_any_zone(
     assert "Python 3.12" in output.err and "Traceback" not in output.err
 
 
-@acceptance.NATIVE
-@pytest.mark.parametrize("batch", [False, True])
-def test_native_output_path_metacharacter_round_trips_without_an_extra_command(
-    native: acceptance.NativeEntry, batch: bool
-) -> None:
-    target = r"C:\labels&ver"
+def _native_start(
+    native: acceptance.NativeEntry, batch: bool, target: str | None = None
+) -> subprocess.CompletedProcess[str]:
     if batch:
         # Quote the user's argument at the outer cmd boundary. This test probes the
         # product's later PowerShell-to-label.cmd boundary, not an unquoted shell input.
         cmd = shutil.which("cmd.exe") or "cmd.exe"
-        command = (
-            f'"{cmd}" /d /s /c ""{native.repo / acceptance.ENTRY.name}" '
-            f'-StartLondon -OutDir "{target}""'
-        )
+        command = f'"{cmd}" /d /s /c ""{native.repo / acceptance.ENTRY.name}" -StartLondon'
+        if target is not None:
+            command += f' -OutDir "{target}"'
+        command += '"'
         result = subprocess.run(
             command,
             cwd=native.cwd,
@@ -108,14 +105,37 @@ def test_native_output_path_metacharacter_round_trips_without_an_extra_command(
             check=False,
         )
         print(result.stdout + result.stderr)
-    else:
-        result = native.run("-StartLondon", "-OutDir", target)
-    assert result.returncode == 37
+        return result
+    args = ["-StartLondon"]
+    if target is not None:
+        args += ["-OutDir", target]
+    return native.run(*args)
+
+
+@acceptance.NATIVE
+@pytest.mark.parametrize("batch", [False, True])
+def test_native_unsupported_output_path_refuses_without_a_child_or_extra_command(
+    native: acceptance.NativeEntry, batch: bool
+) -> None:
+    result = _native_start(native, batch, r"C:\labels&ver")
+    assert result.returncode != 0
+    assert "Use project and output directories" in result.stdout
     assert "Microsoft Windows" not in result.stdout
-    assert native.calls() == [
-        {
-            "kind": "label",
-            "cwd": str(native.repo),
-            "argv": ["-Source", "london", "-MaxPasses", "1", "-NoJudge", "-OutDir", target],
-        }
-    ]
+    assert len(result.stdout + result.stderr) < 2000
+    assert native.calls() == []
+
+
+@acceptance.NATIVE
+@pytest.mark.parametrize("batch", [False, True])
+def test_native_unsupported_project_path_refuses_before_default_start(
+    native: acceptance.NativeEntry, batch: bool
+) -> None:
+    relocated = native.repo.with_name("repo&ver")
+    native.repo.rename(relocated)
+    native.repo = relocated
+    result = _native_start(native, batch)
+    assert result.returncode != 0
+    assert "Use project and output directories" in result.stdout
+    assert "Microsoft Windows" not in result.stdout
+    assert len(result.stdout + result.stderr) < 2000
+    assert native.calls() == []
