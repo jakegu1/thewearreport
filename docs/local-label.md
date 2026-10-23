@@ -97,6 +97,12 @@ Output files retain the existing numeric-only attribute format. T-093 planned
 batching can use its own module after that change is merged; this entry has no
 dependency on that module and does not perform batching or upload.
 
+The read-only native Windows workflow always runs the T-094 planner and copied-entry
+tests. It also runs T-093 intake acceptance and unit tests when both test files are
+present in the checkout. Otherwise a separate step explicitly reports that intake
+tests were not executed. This conditional step is not evidence of native intake
+coverage until an actual run executes those tests successfully.
+
 ## Removal
 
 Delete only the added entry files (`label-local.cmd`, `scripts/label-local.ps1`, and

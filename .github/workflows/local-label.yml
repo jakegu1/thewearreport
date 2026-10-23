@@ -36,3 +36,16 @@ jobs:
           uv run --no-sync pytest -v -rsP --capture=sys
           engine/tests/acceptance/test_t_094.py
           engine/tests/unit/test_local_label_plan.py
+      - name: Offline local intake integration when both test files are present
+        if: >-
+          ${{ hashFiles('engine/tests/acceptance/test_t_093.py') != '' &&
+              hashFiles('engine/tests/unit/test_label_intake.py') != '' }}
+        run: >-
+          uv run --no-sync pytest -v -rsP --capture=sys
+          engine/tests/acceptance/test_t_093.py
+          engine/tests/unit/test_label_intake.py
+      - name: Report absent local intake integration tests
+        if: >-
+          ${{ hashFiles('engine/tests/acceptance/test_t_093.py') == '' ||
+              hashFiles('engine/tests/unit/test_label_intake.py') == '' }}
+        run: Write-Host 'T-093 integration test files are not both present; intake tests were not executed.'
