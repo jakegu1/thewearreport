@@ -1,0 +1,38 @@
+name: local-label
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-label-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-label:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+      - name: Install locked local dependencies without llama-cpp-python
+        run: uv sync --locked --no-install-package llama-cpp-python
+      - name: Offline planner and harmless native entry acceptance
+        run: >-
+          uv run --no-sync pytest -v -rsP --capture=sys
+          engine/tests/acceptance/test_t_094.py
+          engine/tests/unit/test_local_label_plan.py
