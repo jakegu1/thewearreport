@@ -9,7 +9,8 @@ uv run --locked python -m wearreport.tools.label_intake \
 ```
 
 Choose an output outside every Git repository and worktree. The input and output
-must be separate, with neither inside the other. Output symlinks, including
+must be separate, with neither inside the other. A directly symlinked input
+directory is refused. Output symlinks, including
 symlinked parent directories, are refused. A `.git` directory or file anywhere
 above the destination prevents intake. Keep this local output out of version
 control.

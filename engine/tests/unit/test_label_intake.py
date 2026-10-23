@@ -123,6 +123,17 @@ def test_existing_fifo_is_refused_without_opening(tmp_path: Path) -> None:
         label_intake.intake(incoming, tmp_path / "output")
 
 
+def test_direct_input_directory_symlink_is_refused(tmp_path: Path) -> None:
+    incoming = _incoming(tmp_path)
+    original = (incoming / "historical-2.json").read_bytes()
+    linked = tmp_path / "linked-input"
+    linked.symlink_to(incoming, target_is_directory=True)
+    with pytest.raises(label_intake.IntakeError, match="input directory"):
+        label_intake.intake(linked, tmp_path / "output")
+    assert not (tmp_path / "output").exists()
+    assert (incoming / "historical-2.json").read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "name",
     [

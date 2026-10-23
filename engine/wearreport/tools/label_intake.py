@@ -61,6 +61,8 @@ def _safe_name(name: str) -> bool:
 def _paths(incoming: Path, output: Path) -> tuple[Path, Path]:
     incoming = incoming.absolute()
     output = output.absolute()
+    if incoming.is_symlink():
+        raise IntakeError("input directory must not be a symbolic link")
     # Check lexical components as well as the resolved destination. Never traverse
     # an existing output symlink, including an otherwise identical output.
     if any(p.is_symlink() for p in (output, *output.parents)):
