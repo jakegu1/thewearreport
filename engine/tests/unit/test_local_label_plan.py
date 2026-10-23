@@ -46,7 +46,7 @@ def test_preflight_rejects_an_unsupported_python_without_reading_lock(
 def test_source_and_display_use_packaged_rules_even_with_a_different_host_zone() -> None:
     # A host-derived object with this key need not have the installed package's rules.
     with resources.files("tzdata.zoneinfo").joinpath("UTC").open("rb") as stream:
-        different_host_zone = ZoneInfo.from_file(stream, key="America/Edmonton")
+        different_host_zone = ZoneInfo.from_file(stream, "America/Edmonton")
     data = planner.build_plan(
         different_host_zone, dt.date(2026, 11, 1), 1, 0, 1440, planner.WEEKDAYS
     )
