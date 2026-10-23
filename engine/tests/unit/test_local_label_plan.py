@@ -13,7 +13,7 @@ from wearreport.tools import local_label_plan as planner
 
 def test_historical_offsets_preserve_the_actual_instant() -> None:
     data = planner.build_plan(
-        ZoneInfo("Europe/Amsterdam"), dt.date(1900, 1, 10), 1, 0, 1440, planner.WEEKDAYS
+        ZoneInfo("Africa/Monrovia"), dt.date(1900, 1, 10), 1, 0, 1440, planner.WEEKDAYS
     )
     for name in ("london_opportunities", "calgary_noon_coverage"):
         rows = data[name]
