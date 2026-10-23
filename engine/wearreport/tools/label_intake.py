@@ -67,7 +67,11 @@ def _paths(incoming: Path, output: Path) -> tuple[Path, Path]:
     # an existing output symlink, including an otherwise identical output.
     if any(p.is_symlink() for p in (output, *output.parents)):
         raise IntakeError("output must not traverse symbolic links")
-    incoming, output = incoming.resolve(strict=True), output.resolve()
+    try:
+        incoming, output = incoming.resolve(strict=True), output.resolve()
+    except RuntimeError:
+        # Python 3.12 reports symlink loops as RuntimeError with the raw path.
+        raise IntakeError("cannot resolve local paths") from None
     if not incoming.is_dir():
         raise IntakeError("input must be a directory")
     if incoming == output or incoming in output.parents or output in incoming.parents:

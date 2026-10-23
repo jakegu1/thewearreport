@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -132,6 +134,37 @@ def test_direct_input_directory_symlink_is_refused(tmp_path: Path) -> None:
         label_intake.intake(linked, tmp_path / "output")
     assert not (tmp_path / "output").exists()
     assert (incoming / "historical-2.json").read_bytes() == original
+
+
+def test_input_ancestor_symlink_loop_has_bounded_safe_api_and_cli_errors(tmp_path: Path) -> None:
+    marker = "synthetic-path-marker"
+    loop = tmp_path / marker
+    loop.symlink_to(loop.name, target_is_directory=True)
+    incoming, output = loop / "incoming", tmp_path / "output"
+    with pytest.raises(label_intake.IntakeError) as error:
+        label_intake.intake(incoming, output)
+    assert marker not in str(error.value)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "wearreport.tools.label_intake",
+            "--input",
+            str(incoming),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert len(result.stderr) < 200
+    assert marker not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(
