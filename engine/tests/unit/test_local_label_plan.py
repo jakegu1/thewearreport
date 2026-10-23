@@ -1,15 +1,21 @@
-"""Additional offline input and timestamp regression checks."""
+"""Additional offline input, timestamp, and native boundary regression checks."""
 
 from __future__ import annotations
 
 import datetime as dt
+import os
+import shutil
+import subprocess
 import sys
 from importlib import resources
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from tests.acceptance import test_t_094 as acceptance
 from wearreport.tools import local_label_plan as planner
+
+pytest_plugins = ["tests.acceptance.test_t_094"]
 
 
 def test_historical_offsets_preserve_the_actual_instant() -> None:
@@ -74,3 +80,42 @@ def test_unsupported_cli_python_fails_before_loading_any_zone(
     assert planner.main(["--zone", "UTC", "--preflight"]) == 2
     output = capsys.readouterr()
     assert "Python 3.12" in output.err and "Traceback" not in output.err
+
+
+@acceptance.NATIVE
+@pytest.mark.parametrize("batch", [False, True])
+def test_native_output_path_metacharacter_round_trips_without_an_extra_command(
+    native: acceptance.NativeEntry, batch: bool
+) -> None:
+    target = r"C:\labels&ver"
+    if batch:
+        # Quote the user's argument at the outer cmd boundary. This test probes the
+        # product's later PowerShell-to-label.cmd boundary, not an unquoted shell input.
+        cmd = shutil.which("cmd.exe") or "cmd.exe"
+        command = (
+            f'"{cmd}" /d /s /c ""{native.repo / acceptance.ENTRY.name}" '
+            f'-StartLondon -OutDir "{target}""'
+        )
+        result = subprocess.run(
+            command,
+            cwd=native.cwd,
+            env=dict(os.environ, T094_LOG=str(native.log), T094_CHILD_EXIT="37"),
+            input="\n",
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        print(result.stdout + result.stderr)
+    else:
+        result = native.run("-StartLondon", "-OutDir", target)
+    assert result.returncode == 37
+    assert "Microsoft Windows" not in result.stdout
+    assert native.calls() == [
+        {
+            "kind": "label",
+            "cwd": str(native.repo),
+            "argv": ["-Source", "london", "-MaxPasses", "1", "-NoJudge", "-OutDir", target],
+        }
+    ]
