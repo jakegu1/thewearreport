@@ -72,11 +72,13 @@ def rows(data: dict[str, object], name: str) -> list[dict[str, object]]:
     ("day", "london_utc", "calgary_utc"),
     [
         ("2026-07-15", "09:00+00:00", "18:00+00:00"),
-        ("2026-12-15", "10:00+00:00", "19:00+00:00"),
+        ("2026-12-15", "10:00+00:00", "18:00+00:00"),
         ("2026-10-24", "09:00+00:00", "18:00+00:00"),
         ("2026-10-25", "10:00+00:00", "18:00+00:00"),
         ("2026-10-31", "10:00+00:00", "18:00+00:00"),
-        ("2026-11-01", "10:00+00:00", "19:00+00:00"),
+        ("2026-11-01", "10:00+00:00", "18:00+00:00"),
+        ("2026-03-07", "10:00+00:00", "19:00+00:00"),
+        ("2026-03-08", "10:00+00:00", "18:00+00:00"),
     ],
 )
 def test_dst_source_and_display_offsets(day: str, london_utc: str, calgary_utc: str) -> None:
@@ -105,7 +107,7 @@ def test_window_filters_london_and_reports_both_calgary_coverage_states() -> Non
         "--online-start",
         "12:00",
         "--online-end",
-        "19:00",
+        "18:00",
         "--weekdays",
         "sun",
     )
@@ -137,8 +139,8 @@ def test_midnight_endpoint_display_weekday_and_real_date_shift() -> None:
     london = rows(data, "london_opportunities")
     assert [row["display_time"] for row in london] == ["19:00", "21:00", "23:00"]
     noon = rows(data, "calgary_noon_coverage")[0]
-    assert noon["source_local"] == "2026-11-01T12:00-07:00"
-    assert noon["display_date"] == "2026-11-02" and noon["display_time"] == "04:00"
+    assert noon["source_local"] == "2026-11-01T12:00-06:00"
+    assert noon["display_date"] == "2026-11-02" and noon["display_time"] == "03:00"
     assert noon["covered"] is True
     excluded = plan(
         "--zone",
