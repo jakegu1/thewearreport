@@ -1,8 +1,8 @@
 {
   "schema": "status.v1",
-  "generated_at": "2026-10-29T15:54:22Z",
-  "last_sweep_id": "20261029T1548Z",
-  "last_sweep_at": "2026-10-29T15:48:29Z",
+  "generated_at": "2026-10-29T16:13:53Z",
+  "last_sweep_id": "20261029T1608Z",
+  "last_sweep_at": "2026-10-29T16:08:24Z",
   "sweeps_24h": 42,
   "successful_sweeps_24h": 42,
   "success_rate_24h": 1.0,
