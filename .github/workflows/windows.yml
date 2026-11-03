@@ -29,6 +29,7 @@ jobs:
     env:
       # Model- and Tk-dependent tests fail, instead of skipping, when either is missing.
       WEARREPORT_REQUIRE_MODEL: "1"
+      WEARREPORT_REQUIRE_PROBE_MODEL: "1"
       WEARREPORT_REQUIRE_TK: "1"
     defaults:
       run:
@@ -45,6 +46,8 @@ jobs:
         run: uv sync --locked --no-install-package llama-cpp-python
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_model.ps1
+      - name: Fetch the SigLIP 2 probe encoder (SHA-256 verified)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch_probe_model.ps1
       - name: Spot-check unit and acceptance tests
         # --capture=sys: pytest's default capture swaps the process's standard handles
         # for every test and closes them after it. Tcl keeps the standard channels it
@@ -70,6 +73,7 @@ jobs:
           engine/tests/acceptance/test_t_073.py
           engine/tests/acceptance/test_t_080.py
           engine/tests/acceptance/test_t_087.py
+          engine/tests/acceptance/test_t_081.py
           engine/tests/unit/test_label_window.py
       - name: Dry-run spot-check through the window reviewer
         run: >-
