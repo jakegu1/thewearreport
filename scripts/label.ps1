@@ -339,6 +339,29 @@ $City = [string] $choice.city
 $CityName = $CityNames[$City]
 Write-Host "City: $CityName."
 
+# Try the pinned local encoder at most once, before the passes. Hide downloader output;
+# a failed flagged pass reports its own fixed diagnostic and still saves human labels.
+$ProbeDir = Join-Path $OutDir 'probe'
+$ProbeModel = Join-Path (Join-Path $Repo '.models') 'siglip2-base-patch16-224-int8.onnx'
+if (-not (Test-Path -LiteralPath $ProbeModel -PathType Leaf)) {
+    $fetchOk = $false
+    $previous = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $fetcher = Join-Path $PSScriptRoot 'fetch_probe_model.ps1'
+        if (Test-Path -LiteralPath $fetcher -PathType Leaf) {
+            $global:LASTEXITCODE = 1
+            $fetchOutput = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fetcher 2>&1)
+            $fetchOk = ($LASTEXITCODE -eq 0)
+        }
+    } catch {
+        $fetchOk = $false
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if (-not $fetchOk) { Write-Host 'Probe encoder: fetch failed; labelling continues.' }
+}
+
 # 3. The judge. ------------------------------------------------------------------------------
 
 function Enable-Judge {
@@ -398,7 +421,7 @@ function Remove-JudgementsFile {
 function Get-PassCommand {
     if ($Spotcheck) { $command = @($Spotcheck) } else { $command = @('-m', 'wearreport.tools.spotcheck') }
     $command += $PassArguments
-    $command += @('--out-dir', $OutDir, '--source', $City)
+    $command += @('--out-dir', $OutDir, '--source', $City, '--probe', $ProbeDir)
     if ($DryRun) {
         $command += @('--dry-run', '--judgements', $JudgementsFile)
     } else {

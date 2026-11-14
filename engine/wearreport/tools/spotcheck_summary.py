@@ -87,6 +87,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import NormalDist
 
+from wearreport.tools import probe
+
 DEFAULT_DIR = "spotchecks"
 MAX_FILE_BYTES = 1 << 20
 MAX_COUNT = 10**9
@@ -805,6 +807,8 @@ def parse_labelling(raw: bytes) -> Labelling:
         source = data["source"]
         fields.discard("source")
     fields.discard(CAMERA_YIELD)
+    fields.discard("probe")
+    fields.discard("probe_run")
     if fields != ATTRIBUTE_FIELDS:
         raise ValueError("its fields are not " + ", ".join(sorted(ATTRIBUTE_FIELDS)))
     day = data["date"]
@@ -836,6 +840,10 @@ def parse_labelling(raw: bytes) -> Labelling:
     if rejected > shown or len(crops) != shown - rejected:
         raise ValueError("crops_shown, crops_rejected and crops do not agree")
     parsed = tuple(_crop(crop, judge is not None, min_height) for crop in crops)
+    try:
+        probe.validate_label_metadata(data)
+    except probe.ProbeError:
+        raise ValueError("probe or probe_run is malformed") from None
     if CAMERA_YIELD in data:
         judgeable = sum(1 for crop in parsed if crop[1][0] in "yn")
         _check_camera_yield(data[CAMERA_YIELD], (shown, rejected, judgeable))

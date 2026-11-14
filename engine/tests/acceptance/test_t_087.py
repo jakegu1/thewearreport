@@ -36,7 +36,7 @@ WINDOWS_ONLY = pytest.mark.skipif(
 LEGACY_HASHES = {
     "label.cmd": "0fa34d0c1eb33c8951a5a96cfb304fd9c7424dc8167661f0cf02df05c474d748",
     "label-london.cmd": "bb9dad5c0194aa49d10627cfb096515ef191bf536ee3a7b1a9c41a8d46a9ad24",
-    "scripts/label.ps1": "a1ce92a1fa9a2e58c9e18f4773bf28cffbd4a85f5ccb893d1b28e55318c5c144",
+    "scripts/label.ps1": "2bbc34047f77ec1bb96e0dbeb632ff5ffa7238d1b186cc95882db154258ce0cf",
     "engine/wearreport/tools/label_window.py": (
         "c99079c6f49ddf1680277d67e3b463a936ff20ca0700bd861373291ec6b63c33"
     ),
@@ -93,6 +93,16 @@ def test_windows_workflow_only_adds_the_new_launcher_test_path() -> None:
     added = "          engine/tests/acceptance/test_t_087.py\n"
     assert text.count(added) == 1
     before = text.replace(added, "")
+    probe_additions = (
+        '      WEARREPORT_REQUIRE_PROBE_MODEL: "1"\n',
+        "      - name: Fetch the SigLIP 2 probe encoder (SHA-256 verified)\n"
+        "        run: powershell -NoProfile -ExecutionPolicy Bypass "
+        "-File scripts/fetch_probe_model.ps1\n",
+        "          engine/tests/acceptance/test_t_081.py\n",
+    )
+    for probe_added in probe_additions:
+        assert text.count(probe_added) == 1
+        before = before.replace(probe_added, "")
     assert hashlib.sha256(before.encode("ascii")).hexdigest() == (
         "6a5450dec6019e909c0833f474401097febe77a2718ae6aa614440c5c0a55f64"
     )

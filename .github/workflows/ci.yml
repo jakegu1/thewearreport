@@ -22,6 +22,7 @@ jobs:
     env:
       # Model-dependent tests fail, instead of skipping, when the model is missing.
       WEARREPORT_REQUIRE_MODEL: "1"
+      WEARREPORT_REQUIRE_PROBE_MODEL: "1"
       # The workflow lint test fails, instead of skipping, when actionlint is missing.
       WEARREPORT_REQUIRE_ACTIONLINT: "1"
     steps:
@@ -36,6 +37,8 @@ jobs:
         run: uv sync --locked
       - name: Fetch the YOLOX-s and YOLOX-m models (SHA-256 verified)
         run: sh scripts/fetch_model.sh --with-m
+      - name: Fetch the SigLIP 2 probe encoder (SHA-256 verified)
+        run: sh scripts/fetch_probe_model.sh
       - name: Install actionlint (SHA-256 verified)
         run: sh scripts/install_actionlint.sh
       - name: actionlint (every workflow)
