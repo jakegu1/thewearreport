@@ -1,8 +1,8 @@
 {
   "schema": "status.v1",
-  "generated_at": "2026-11-16T15:52:27Z",
-  "last_sweep_id": "20261116T1547Z",
-  "last_sweep_at": "2026-11-16T15:47:35Z",
+  "generated_at": "2026-11-16T16:11:16Z",
+  "last_sweep_id": "20261116T1607Z",
+  "last_sweep_at": "2026-11-16T16:07:32Z",
   "sweeps_24h": 41,
   "successful_sweeps_24h": 26,
   "success_rate_24h": 0.6341463414634146,
@@ -11,7 +11,7 @@
   "median_persons_daytime_24h": 594.5,
   "median_rule": "median persons_total over successful sweeps started in London daytime",
   "daytime": "07:00-21:00 Europe/London",
-  "consecutive_failures": 15,
+  "consecutive_failures": 0,
   "records_invalid": 0,
   "attribution": [
     "Powered by TfL Open Data",
